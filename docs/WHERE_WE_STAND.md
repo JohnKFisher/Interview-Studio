@@ -6,6 +6,7 @@ Current version/build:
 Overall status:
 - Phase 1 Assembly Studio is now implemented as a working internal macOS app plus a shared core library and CLI.
 - The app can import a manifest-backed project folder, build a deterministic render plan, surface issues/confidence, and export a real final movie.
+- The current phase is assembly-from-manifest only; creating source clips or building the manifest inside the app is future work.
 
 What works now:
 - Typed parsing of `final_manifest.json`, including flexible numeric/string decoding and path resolution for `output_file` plus `output_path` fallback.
@@ -25,8 +26,12 @@ What is partial:
 - The renderer is correct but slow on card generation because SDR-to-HLG 4K conversion is expensive in software.
 - Plex metadata defaults are intentionally focused and simple rather than a full metadata editor.
 - The bundled app still uses source-controlled version values hardcoded in the build script instead of a more mature version/build file workflow.
+- The repo currently represents the back half of the intended workflow: assembly and export after clips and manifest data already exist.
 
 What is not implemented yet:
+- In-app creation of source clips.
+- In-app tools to add clips to a project over time.
+- In-app manifest authoring or manifest extension workflows.
 - Timeline UI.
 - Phase 2 scrubbing/trimming or clip-factory tooling.
 - Per-clip exclusion controls.
@@ -34,6 +39,7 @@ What is not implemented yet:
 
 Known limitations and trust warnings:
 - Phase 1 supports one person per project only.
+- Phase 1 requires a prepared project folder with `final_manifest.json` and referenced media already in place.
 - HDR export depends on an FFmpeg build with the required filters/codecs available.
 - Existing projects now default to Plex companion export on, which means export will block until the required Plex fields are filled or the feature is turned off for that project.
 - The current UI is intentionally conservative after a more ambitious SwiftUI screen triggered compiler instability during this pass.
@@ -50,6 +56,7 @@ Important operational risks:
 - The new Plex companion path depends on remux-compatible final audio/video streams and standard MP4 tag behavior; smoke verification covers the current implementation, but broader real-library validation is still prudent.
 
 Recommended next priorities:
+- Start designing the next phase that creates/adds clips and grows the manifest inside the app instead of assuming a fully prepared input folder.
 - Improve render throughput, especially for synthetic card segments and SDR-to-HLG normalization.
 - Expand the in-app Assembly Studio workflow with player-style QA, progress details, and deeper boundary review.
 - Move version/build values into dedicated source-controlled version files.
