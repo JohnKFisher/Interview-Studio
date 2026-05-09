@@ -20,3 +20,13 @@ If the project depends on external binaries, bundled tools, hardware codecs, GPU
 - Record provenance and licensing requirements in repo docs when redistribution is involved.
 - Fail early with actionable guidance when a required tool or capability is missing.
 - Do not silently substitute a different backend unless that fallback is already approved and clearly surfaced.
+
+## Command Discipline
+
+Prefer structured APIs over shell commands.
+
+When shell commands are necessary:
+- avoid interpolation,
+- cap unknown output,
+- exclude generated/vendor/build/cache folders unless relevant,
+- and do not rerun the same command unless inputs, code, or hypothesis changed.

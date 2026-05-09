@@ -396,12 +396,55 @@ public struct RenderPlanSummary: Codable, Hashable, Sendable {
     }
 }
 
+public struct RenderChapter: Codable, Hashable, Sendable, Identifiable {
+    public var id: String { title + "@" + String(startUS) }
+    public var title: String
+    public var startUS: Int64
+    public var endUS: Int64
+
+    public init(title: String, startUS: Int64, endUS: Int64) {
+        self.title = title
+        self.startUS = startUS
+        self.endUS = endUS
+    }
+}
+
+public struct PlexMetadataPlan: Codable, Hashable, Sendable {
+    public var show: String
+    public var seasonNumber: Int
+    public var episodeNumber: Int
+    public var episodeTitle: String
+    public var summary: String
+    public var chapters: [RenderChapter]
+
+    public init(
+        show: String,
+        seasonNumber: Int,
+        episodeNumber: Int,
+        episodeTitle: String,
+        summary: String,
+        chapters: [RenderChapter]
+    ) {
+        self.show = show
+        self.seasonNumber = seasonNumber
+        self.episodeNumber = episodeNumber
+        self.episodeTitle = episodeTitle
+        self.summary = summary
+        self.chapters = chapters
+    }
+
+    public var episodeID: String {
+        String(format: "S%02dE%02d", seasonNumber, episodeNumber)
+    }
+}
+
 public struct RenderPlan: Codable, Hashable, Sendable {
     public var schemaVersion: String
     public var appName: String
     public var project: RenderPlanProjectInfo
     public var exportProfile: ExportProfile
     public var settings: RenderSettings
+    public var plexMetadata: PlexMetadataPlan?
     public var sequence: [RenderSequenceNode]
     public var boundaries: [BoundaryTransition]
     public var issues: [AssemblyIssue]
@@ -413,6 +456,7 @@ public struct RenderPlan: Codable, Hashable, Sendable {
         project: RenderPlanProjectInfo,
         exportProfile: ExportProfile,
         settings: RenderSettings,
+        plexMetadata: PlexMetadataPlan?,
         sequence: [RenderSequenceNode],
         boundaries: [BoundaryTransition],
         issues: [AssemblyIssue],
@@ -423,6 +467,7 @@ public struct RenderPlan: Codable, Hashable, Sendable {
         self.project = project
         self.exportProfile = exportProfile
         self.settings = settings
+        self.plexMetadata = plexMetadata
         self.sequence = sequence
         self.boundaries = boundaries
         self.issues = issues

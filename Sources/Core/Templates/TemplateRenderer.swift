@@ -24,7 +24,7 @@ public enum TemplateRendererError: LocalizedError {
     }
 }
 
-public struct TemplateRenderer {
+public struct TemplateRenderer: Sendable {
     public init() {}
 
     public func renderCardImage(

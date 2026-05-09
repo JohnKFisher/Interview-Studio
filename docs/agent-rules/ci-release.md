@@ -158,6 +158,7 @@ Before closing CI/release work, verify:
 - the new GitHub Actions run has started
 - if a previous remote failure existed, inspect the actual failing job log and fix the root cause
 - if packaging/signing changed, update README and status docs to describe real end-user behavior honestly
+- For CI failures, inspect the failing job/step log first. Do not rewrite workflows or rerun CI until the failure mode is identified from the smallest relevant log section.
 
 ## Required final report for CI / release work
 

@@ -1,5 +1,30 @@
 import Foundation
 
+public struct PlexMetadataInput: Codable, Hashable, Sendable {
+    public var isEnabled: Bool
+    public var show: String
+    public var season: String
+    public var episode: String
+    public var episodeTitle: String
+    public var summary: String
+
+    public init(
+        isEnabled: Bool = true,
+        show: String = "",
+        season: String = "",
+        episode: String = "",
+        episodeTitle: String = "",
+        summary: String = ""
+    ) {
+        self.isEnabled = isEnabled
+        self.show = show
+        self.season = season
+        self.episode = episode
+        self.episodeTitle = episodeTitle
+        self.summary = summary
+    }
+}
+
 public struct ProjectDocument: Codable, Hashable, Sendable {
     public var schemaVersion: String
     public var projectName: String
@@ -9,6 +34,8 @@ public struct ProjectDocument: Codable, Hashable, Sendable {
     public var closingTitle: String
     public var questionOrder: [String]
     public var questionDisplayTexts: [String: String]
+    public var titleCaseQuestions: Bool
+    public var plexMetadata: PlexMetadataInput
     public var renderSettings: RenderSettings
 
     public init(
@@ -20,6 +47,8 @@ public struct ProjectDocument: Codable, Hashable, Sendable {
         closingTitle: String,
         questionOrder: [String],
         questionDisplayTexts: [String: String],
+        titleCaseQuestions: Bool = true,
+        plexMetadata: PlexMetadataInput = .init(),
         renderSettings: RenderSettings
     ) {
         self.schemaVersion = schemaVersion
@@ -30,7 +59,38 @@ public struct ProjectDocument: Codable, Hashable, Sendable {
         self.closingTitle = closingTitle
         self.questionOrder = questionOrder
         self.questionDisplayTexts = questionDisplayTexts
+        self.titleCaseQuestions = titleCaseQuestions
+        self.plexMetadata = plexMetadata
         self.renderSettings = renderSettings
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case schemaVersion
+        case projectName
+        case personName
+        case manifestFilename
+        case openingTitle
+        case closingTitle
+        case questionOrder
+        case questionDisplayTexts
+        case titleCaseQuestions
+        case plexMetadata
+        case renderSettings
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        schemaVersion = try container.decodeIfPresent(String.self, forKey: .schemaVersion) ?? "1.0"
+        projectName = try container.decode(String.self, forKey: .projectName)
+        personName = try container.decode(String.self, forKey: .personName)
+        manifestFilename = try container.decode(String.self, forKey: .manifestFilename)
+        openingTitle = try container.decode(String.self, forKey: .openingTitle)
+        closingTitle = try container.decode(String.self, forKey: .closingTitle)
+        questionOrder = try container.decode([String].self, forKey: .questionOrder)
+        questionDisplayTexts = try container.decode([String: String].self, forKey: .questionDisplayTexts)
+        titleCaseQuestions = try container.decodeIfPresent(Bool.self, forKey: .titleCaseQuestions) ?? true
+        plexMetadata = try container.decodeIfPresent(PlexMetadataInput.self, forKey: .plexMetadata) ?? .init()
+        renderSettings = try container.decodeIfPresent(RenderSettings.self, forKey: .renderSettings) ?? .default
     }
 
     public static func sidecarURL(for manifestURL: URL) -> URL {
@@ -60,6 +120,8 @@ public struct ProjectDocument: Codable, Hashable, Sendable {
             closingTitle: "Happy Birthday, \(project.personName)!",
             questionOrder: project.questions.map(\.questionKey),
             questionDisplayTexts: questionTexts,
+            titleCaseQuestions: true,
+            plexMetadata: .init(),
             renderSettings: .default
         )
     }

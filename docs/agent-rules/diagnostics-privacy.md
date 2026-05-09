@@ -1,9 +1,7 @@
 # Diagnostics and Privacy Rules
 
-Read this file when the task touches diagnostics, logging, crash handling, persistent logs, redaction, or user-sensitive debug output.
+Read when the task touches diagnostics, logging, crash handling, persistent logs, redaction, or user-sensitive debug output.
 
-## Diagnostics and Privacy
-
-- Persistent logs should be opt-in, local, and redacted/minimized.
-- Do not include filenames, paths, metadata, or identifiers unless necessary for diagnosis.
-- Never commit sensitive logs, sample user data, or crash artifacts without explicit approval.
+- Persistent logs should be local, minimal, redacted, and opt-in unless explicitly approved otherwise.
+- Do not expose filenames, paths, identifiers, metadata, or user data unless necessary for diagnosis.
+- Never commit sensitive logs, crash artifacts, or sample user data without approval.

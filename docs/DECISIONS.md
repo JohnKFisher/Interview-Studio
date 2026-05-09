@@ -20,3 +20,12 @@ The main Assembly Studio window now stays focused on controls, compact status, a
 
 ## 2026-05-06 - Prefer conservative transition audio over leaked handle speech
 Answer-to-answer transitions now analyze nearby audio and handle quality, keep normal crossfades only when the seam looks safe, and otherwise switch to quiet-window bridging or a muted fallback. This was chosen because avoiding stray interviewer/next-question speech is more important than preserving every soft handle crossfade. Status: approved.
+
+## 2026-05-07 - Keep the HDR MOV master and add a Plex MP4 companion
+Phase 1 still renders the approved HDR `MOV` master first, then optionally packages a second Plex-friendly `MP4` companion by remuxing the finished master with TV-style metadata and per-question chapters. This was chosen so Plex support does not redefine or risk the protected master export contract. Status: approved.
+
+## 2026-05-07 - Default Title Case and default-on Plex metadata for sidecar-backed projects
+Question title casing is now a display/render treatment stored in the sidecar and defaults on for both new and older projects, while Plex companion export also defaults on and blocks export until its required metadata fields are filled or the feature is turned off. This was chosen to make the new presentation and library behavior explicit in-project instead of hidden in transient UI state. Status: approved.
+
+## 2026-05-07 - Use temp storage for success-path render work and persist diagnostics only on failure or opt-in
+Renderer intermediates now live in an app-scoped system temp folder and are cleaned up on success or cancel, while persistent diagnostics are kept only for failures or when the user explicitly asks to preserve a successful run. This was chosen to stop filling Application Support with throwaway work products while keeping useful failure evidence. Status: approved.

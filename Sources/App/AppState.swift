@@ -4,6 +4,11 @@ import Foundation
 
 @MainActor
 final class AppState: ObservableObject {
+    private enum AppPreferenceKey {
+        static let lastPlexShow = "lastPlexShow"
+        static let lastPlexSeason = "lastPlexSeason"
+    }
+
     @Published var selectedProjectFolder: URL?
     @Published var loadedProject: LoadedManifestProject?
     @Published var projectDocument: ProjectDocument?
@@ -12,13 +17,17 @@ final class AppState: ObservableObject {
     @Published var isRendering = false
     @Published var renderProgress = ""
     @Published var lastRenderURL: URL?
+    @Published var lastPlexOutputURL: URL?
     @Published var lastDiagnosticsURL: URL?
+    @Published var keepSuccessfulDiagnostics = false
     @Published var previewFrames: [PreviewFrameModel] = []
 
     private let builder = QuestionGroupBuilder()
     private let planBuilder = RenderPlanBuilder()
     private let renderer = Renderer()
     private let previewRenderer = AppPreviewRenderer()
+    private var previewTask: Task<Void, Never>?
+    private var previewGeneration = 0
 
     func chooseProjectFolder() {
         let panel = NSOpenPanel()
@@ -38,9 +47,9 @@ final class AppState: ObservableObject {
             let sidecarURL = ProjectDocument.sidecarURL(for: manifestURL)
             let document: ProjectDocument
             if let existing = try? JSONDecoder().decode(ProjectDocument.self, from: Data(contentsOf: sidecarURL)) {
-                document = existing.merged(with: loaded)
+                document = hydratedDocumentDefaults(existing.merged(with: loaded), loadedProject: loaded)
             } else {
-                document = ProjectDocument.makeDefault(for: loaded)
+                document = hydratedDocumentDefaults(ProjectDocument.makeDefault(for: loaded), loadedProject: loaded)
             }
 
             selectedProjectFolder = folderURL
@@ -60,6 +69,11 @@ final class AppState: ObservableObject {
 
     func updateClosingTitle(_ value: String) {
         projectDocument?.closingTitle = value
+        rebuildPlanAndPersist()
+    }
+
+    func setTitleCaseQuestions(_ enabled: Bool) {
+        projectDocument?.titleCaseQuestions = enabled
         rebuildPlanAndPersist()
     }
 
@@ -102,6 +116,38 @@ final class AppState: ObservableObject {
         rebuildPlanAndPersist()
     }
 
+    func setPlexCompanionEnabled(_ enabled: Bool) {
+        projectDocument?.plexMetadata.isEnabled = enabled
+        rebuildPlanAndPersist()
+    }
+
+    func updatePlexShow(_ value: String) {
+        projectDocument?.plexMetadata.show = value
+        persistPlexDefaults(show: value, season: projectDocument?.plexMetadata.season ?? "")
+        rebuildPlanAndPersist()
+    }
+
+    func updatePlexSeason(_ value: String) {
+        projectDocument?.plexMetadata.season = value
+        persistPlexDefaults(show: projectDocument?.plexMetadata.show ?? "", season: value)
+        rebuildPlanAndPersist()
+    }
+
+    func updatePlexEpisode(_ value: String) {
+        projectDocument?.plexMetadata.episode = value
+        rebuildPlanAndPersist()
+    }
+
+    func updatePlexEpisodeTitle(_ value: String) {
+        projectDocument?.plexMetadata.episodeTitle = value
+        rebuildPlanAndPersist()
+    }
+
+    func updatePlexSummary(_ value: String) {
+        projectDocument?.plexMetadata.summary = value
+        rebuildPlanAndPersist()
+    }
+
     func setTransitionFrames(_ frames: Int) {
         projectDocument?.renderSettings.answerTransition.durationFrames = min(max(frames, 0), 24)
         rebuildPlanAndPersist()
@@ -110,6 +156,11 @@ final class AppState: ObservableObject {
     func revealLastRender() {
         guard let lastRenderURL else { return }
         NSWorkspace.shared.activateFileViewerSelecting([lastRenderURL])
+    }
+
+    func revealLastPlexRender() {
+        guard let lastPlexOutputURL else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([lastPlexOutputURL])
     }
 
     func revealDiagnostics() {
@@ -125,15 +176,20 @@ final class AppState: ObservableObject {
 
         Task {
             do {
-                let result = try await renderer.render(plan: renderPlan) { [weak self] state in
+                let result = try await renderer.render(plan: renderPlan, keepSuccessfulDiagnostics: keepSuccessfulDiagnostics) { [weak self] state in
                     Task { @MainActor in
                         self?.renderProgress = "\(state.phase.capitalized): \(state.detail)"
                     }
                 }
                 await MainActor.run {
                     self.lastRenderURL = result.outputURL
+                    self.lastPlexOutputURL = result.plexOutputURL
                     self.lastDiagnosticsURL = result.diagnosticsURL
-                    self.renderProgress = "Finished: \(result.outputURL.lastPathComponent)"
+                    if let plexOutputURL = result.plexOutputURL {
+                        self.renderProgress = "Finished: \(result.outputURL.lastPathComponent) and \(plexOutputURL.lastPathComponent)"
+                    } else {
+                        self.renderProgress = "Finished: \(result.outputURL.lastPathComponent)"
+                    }
                     self.isRendering = false
                 }
             } catch is CancellationError {
@@ -143,6 +199,10 @@ final class AppState: ObservableObject {
                 }
             } catch {
                 await MainActor.run {
+                    if let rendererError = error as? RendererError,
+                       case .renderFailed(_, let diagnosticsURL) = rendererError {
+                        self.lastDiagnosticsURL = diagnosticsURL
+                    }
                     self.errorMessage = error.localizedDescription
                     self.renderProgress = "Render failed."
                     self.isRendering = false
@@ -187,9 +247,94 @@ final class AppState: ObservableObject {
 
     private func refreshPreviews() {
         guard let renderPlan else {
+            previewTask?.cancel()
             previewFrames = []
             return
         }
-        previewFrames = previewRenderer.buildFrames(plan: renderPlan)
+
+        previewTask?.cancel()
+        previewGeneration += 1
+        let generation = previewGeneration
+        previewFrames = previewRenderer.seededFrames(for: renderPlan, existing: previewFrames)
+        let frameIDs = previewFrames.map(\.id)
+
+        previewTask = Task { [previewRenderer] in
+            for frameID in frameIDs {
+                if Task.isCancelled { return }
+                do {
+                    let renderedFrame = try await previewRenderer.renderFrame(id: frameID, plan: renderPlan)
+                    await MainActor.run {
+                        guard generation == self.previewGeneration else { return }
+                        self.replacePreviewFrame(renderedFrame)
+                    }
+                } catch {
+                    await MainActor.run {
+                        guard generation == self.previewGeneration else { return }
+                        self.markPreviewFrameFailed(id: frameID, message: error.localizedDescription)
+                    }
+                }
+                await Task.yield()
+            }
+        }
+    }
+
+    private func replacePreviewFrame(_ frame: PreviewFrameModel) {
+        guard let index = previewFrames.firstIndex(where: { $0.id == frame.id }) else { return }
+        previewFrames[index] = frame
+    }
+
+    private func markPreviewFrameFailed(id: String, message: String) {
+        guard let index = previewFrames.firstIndex(where: { $0.id == id }) else { return }
+        let frame = previewFrames[index]
+        previewFrames[index] = PreviewFrameModel(
+            id: frame.id,
+            title: frame.title,
+            subtitle: frame.subtitle,
+            image: frame.image,
+            status: .failed(message)
+        )
+    }
+
+    private func hydratedDocumentDefaults(_ document: ProjectDocument, loadedProject: LoadedManifestProject) -> ProjectDocument {
+        var copy = document
+        if copy.plexMetadata.show.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            copy.plexMetadata.show = UserDefaults.standard.string(forKey: AppPreferenceKey.lastPlexShow) ?? ""
+        }
+        if copy.plexMetadata.season.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            copy.plexMetadata.season = UserDefaults.standard.string(forKey: AppPreferenceKey.lastPlexSeason) ?? ""
+        }
+        if copy.plexMetadata.episodeTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            copy.plexMetadata.episodeTitle = defaultPlexEpisodeTitle(for: copy)
+        }
+        if copy.plexMetadata.summary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            copy.plexMetadata.summary = defaultPlexSummary(for: copy, loadedProject: loadedProject)
+        }
+        if copy.plexMetadata.show.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            copy.plexMetadata.show = loadedProject.personName
+        }
+        return copy
+    }
+
+    private func defaultPlexEpisodeTitle(for document: ProjectDocument) -> String {
+        let openingTitle = document.openingTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !openingTitle.isEmpty {
+            return openingTitle
+        }
+        return document.projectName
+    }
+
+    private func defaultPlexSummary(for document: ProjectDocument, loadedProject: LoadedManifestProject) -> String {
+        "\(document.projectName) is a yearly interview compilation for \(loadedProject.personName), assembled in Yearly Interview Studio."
+    }
+
+    private func persistPlexDefaults(show: String, season: String) {
+        let trimmedShow = show.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedSeason = season.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedShow.isEmpty {
+            UserDefaults.standard.set(trimmedShow, forKey: AppPreferenceKey.lastPlexShow)
+        }
+        if !trimmedSeason.isEmpty {
+            UserDefaults.standard.set(trimmedSeason, forKey: AppPreferenceKey.lastPlexSeason)
+        }
     }
 }

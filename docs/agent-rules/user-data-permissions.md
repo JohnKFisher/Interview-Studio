@@ -9,6 +9,7 @@ Read this file when the task touches user data such as local files, cloud files,
 - Add guardrails against unintended scope.
 - Never implement deletion or destructive changes unless I explicitly ask.
 - Prefer reversible alternatives.
+- For bulk operations, preview scope with counts before inspecting or processing every item.
 
 ## Files and Paths
 
@@ -36,3 +37,4 @@ For app permissions, entitlements, sandbox settings, signing settings, privacy s
 - Prefer explicit scope display and confirmation for large or risky operations.
 - Guard against accidental all-library/all-folder/all-account actions.
 - Prefer reversible alternatives over destructive in-place changes.
+

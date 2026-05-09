@@ -6,16 +6,19 @@ APP_NAME="YearlyInterviewStudioApp"
 BUNDLE_NAME="Yearly Interview Studio"
 BUNDLE_ID="com.jkfisher.yearlyinterviewstudio"
 MIN_SYSTEM_VERSION="14.0"
+MARKETING_VERSION="0.1.2"
+BUILD_NUMBER="3"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DIST_DIR="$ROOT_DIR/dist"
-SCRATCH_PATH="$ROOT_DIR/.build-codex"
+SCRATCH_PATH="${TMPDIR:-/tmp}/interview-studio-build-$RANDOM"
 APP_BUNDLE="$DIST_DIR/$BUNDLE_NAME.app"
 APP_CONTENTS="$APP_BUNDLE/Contents"
 APP_MACOS="$APP_CONTENTS/MacOS"
 APP_RESOURCES="$APP_CONTENTS/Resources"
 APP_BINARY="$APP_MACOS/$APP_NAME"
 INFO_PLIST="$APP_CONTENTS/Info.plist"
+ICON_SOURCE="$ROOT_DIR/Sources/App/Resources/AppIcon.icns"
 
 SYSTEM_FFMPEG="$(command -v ffmpeg || true)"
 SYSTEM_FFPROBE="$(command -v ffprobe || true)"
@@ -41,7 +44,11 @@ if [[ -n "$SYSTEM_FFPROBE" ]]; then
   chmod +x "$APP_RESOURCES/BundledTools/ffprobe"
 fi
 
-/usr/bin/env python3 - <<'PY' "$INFO_PLIST" "$APP_NAME" "$BUNDLE_ID" "$BUNDLE_NAME" "$MIN_SYSTEM_VERSION"
+if [[ -f "$ICON_SOURCE" ]]; then
+  cp "$ICON_SOURCE" "$APP_RESOURCES/AppIcon.icns"
+fi
+
+/usr/bin/env python3 - <<'PY' "$INFO_PLIST" "$APP_NAME" "$BUNDLE_ID" "$BUNDLE_NAME" "$MIN_SYSTEM_VERSION" "$MARKETING_VERSION" "$BUILD_NUMBER"
 from pathlib import Path
 import plistlib
 import sys
@@ -53,11 +60,12 @@ with path.open("wb") as handle:
         {
             "CFBundleDisplayName": sys.argv[4],
             "CFBundleExecutable": sys.argv[2],
+            "CFBundleIconFile": "AppIcon",
             "CFBundleIdentifier": sys.argv[3],
             "CFBundleName": sys.argv[4],
             "CFBundlePackageType": "APPL",
-            "CFBundleShortVersionString": "0.1.1",
-            "CFBundleVersion": "2",
+            "CFBundleShortVersionString": sys.argv[6],
+            "CFBundleVersion": sys.argv[7],
             "LSMinimumSystemVersion": sys.argv[5],
             "NSHighResolutionCapable": True,
             "NSPrincipalClass": "NSApplication",

@@ -19,11 +19,16 @@ struct YearlyInterviewStudioCLI {
         let plan = RenderPlanBuilder().build(project: loaded, document: document)
         let renderer = Renderer()
 
-        let result = try await renderer.render(plan: plan, diagnosticsRoot: diagnosticsRoot, outputRoot: outputRoot) { state in
+        let result = try await renderer.render(plan: plan, diagnosticsRoot: diagnosticsRoot, outputRoot: outputRoot, keepSuccessfulDiagnostics: true) { state in
             print("[\(state.phase)] \(state.detail)")
         }
 
         print("render_output=\(result.outputURL.path)")
-        print("diagnostics=\(result.diagnosticsURL.path)")
+        if let plexOutputURL = result.plexOutputURL {
+            print("plex_output=\(plexOutputURL.path)")
+        }
+        if let diagnosticsURL = result.diagnosticsURL {
+            print("diagnostics=\(diagnosticsURL.path)")
+        }
     }
 }

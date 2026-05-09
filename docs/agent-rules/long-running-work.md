@@ -37,3 +37,9 @@ If the project integrates multiple sources, synced storage, or scheduled/time-ba
 - Record enough execution state to determine whether an action already ran and what path it took.
 - Distinguish clearly between unavailable, stale, empty, unauthorized, and not-yet-configured states.
 - Prefer graceful degradation over collapse when integrity is not compromised.
+
+## Runtime Discipline
+
+- Before starting expensive work, preflight inputs, output paths, required tools, and obvious blockers.
+- Do not repeatedly poll, retry, or wait without bounded limits and changed evidence.
+- After a failure, inspect the smallest useful failure output first, then choose the next step.

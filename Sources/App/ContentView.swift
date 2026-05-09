@@ -32,6 +32,7 @@ struct ContentView: View {
                 if let renderPlan = appState.renderPlan,
                    let projectDocument = appState.projectDocument {
                     assemblyControls(projectDocument: projectDocument)
+                    plexMetadataSection(projectDocument: projectDocument)
                     previewSection()
                     questionOrder(projectDocument: projectDocument)
                     renderStatus(renderPlan: renderPlan)
@@ -118,6 +119,23 @@ struct ContentView: View {
                     )
                 }
 
+                HStack(spacing: 20) {
+                    Toggle(
+                        "Title Case Questions",
+                        isOn: Binding(
+                            get: { projectDocument.titleCaseQuestions },
+                            set: { appState.setTitleCaseQuestions($0) }
+                        )
+                    )
+                    Toggle(
+                        "Generate Plex Companion",
+                        isOn: Binding(
+                            get: { projectDocument.plexMetadata.isEnabled },
+                            set: { appState.setPlexCompanionEnabled($0) }
+                        )
+                    )
+                }
+
                 Stepper(
                     "Answer Transition: \(projectDocument.renderSettings.answerTransition.durationFrames) frames",
                     value: Binding(
@@ -127,6 +145,63 @@ struct ContentView: View {
                     in: 0 ... 24
                 )
             }
+        }
+    }
+
+    private func plexMetadataSection(projectDocument: ProjectDocument) -> some View {
+        GroupBox("Plex Metadata") {
+            VStack(alignment: .leading, spacing: 12) {
+                Text("The export still produces the HDR MOV master first. When enabled, it also packages a TV-style Plex MP4 companion with chapters.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+
+                HStack(spacing: 16) {
+                    TextField(
+                        "Show",
+                        text: Binding(
+                            get: { projectDocument.plexMetadata.show },
+                            set: { appState.updatePlexShow($0) }
+                        )
+                    )
+
+                    TextField(
+                        "Season",
+                        text: Binding(
+                            get: { projectDocument.plexMetadata.season },
+                            set: { appState.updatePlexSeason($0) }
+                        )
+                    )
+                    .frame(width: 120)
+
+                    TextField(
+                        "Episode",
+                        text: Binding(
+                            get: { projectDocument.plexMetadata.episode },
+                            set: { appState.updatePlexEpisode($0) }
+                        )
+                    )
+                    .frame(width: 120)
+                }
+
+                TextField(
+                    "Episode Title",
+                    text: Binding(
+                        get: { projectDocument.plexMetadata.episodeTitle },
+                        set: { appState.updatePlexEpisodeTitle($0) }
+                    )
+                )
+
+                TextField(
+                    "Summary",
+                    text: Binding(
+                        get: { projectDocument.plexMetadata.summary },
+                        set: { appState.updatePlexSummary($0) }
+                    ),
+                    axis: .vertical
+                )
+                .lineLimit(3 ... 5)
+            }
+            .disabled(!projectDocument.plexMetadata.isEnabled)
         }
     }
 
@@ -223,11 +298,18 @@ struct ContentView: View {
                 }
                 .disabled(appState.lastRenderURL == nil)
 
+                Button("Reveal Plex Companion") {
+                    appState.revealLastPlexRender()
+                }
+                .disabled(appState.lastPlexOutputURL == nil)
+
                 Button("Reveal Diagnostics") {
                     appState.revealDiagnostics()
                 }
                 .disabled(appState.lastDiagnosticsURL == nil)
             }
+
+            Toggle("Keep diagnostics for this render", isOn: $appState.keepSuccessfulDiagnostics)
 
             if appState.isRendering {
                 ProgressView()
@@ -245,15 +327,20 @@ private struct PreviewFrameCard: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Image(nsImage: frame.image)
-                .resizable()
-                .aspectRatio(contentMode: .fit)
-                .frame(width: 320, height: 180)
-                .clipShape(RoundedRectangle(cornerRadius: 12))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 12)
-                        .stroke(.quaternary, lineWidth: 1)
-                )
+            ZStack(alignment: .topLeading) {
+                Image(nsImage: frame.image)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(width: 320, height: 180)
+                    .clipShape(RoundedRectangle(cornerRadius: 12))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 12)
+                            .stroke(.quaternary, lineWidth: 1)
+                    )
+
+                statusChip
+                    .padding(10)
+            }
 
             Text(frame.title)
                 .font(.headline)
@@ -263,5 +350,26 @@ private struct PreviewFrameCard: View {
                 .lineLimit(2)
         }
         .frame(width: 320, alignment: .leading)
+    }
+
+    @ViewBuilder
+    private var statusChip: some View {
+        switch frame.status {
+        case .loading:
+            Label("Refreshing", systemImage: "arrow.triangle.2.circlepath")
+                .font(.caption.weight(.semibold))
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .background(.regularMaterial, in: Capsule())
+        case .ready:
+            EmptyView()
+        case .failed:
+            Label("Preview failed", systemImage: "exclamationmark.triangle.fill")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.white)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .background(.red.opacity(0.85), in: Capsule())
+        }
     }
 }

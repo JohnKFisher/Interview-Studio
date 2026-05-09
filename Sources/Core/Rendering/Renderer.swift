@@ -7,7 +7,8 @@ public struct RenderJobState: Sendable {
 
 public struct RenderResult: Sendable {
     public var outputURL: URL
-    public var diagnosticsURL: URL
+    public var plexOutputURL: URL?
+    public var diagnosticsURL: URL?
 }
 
 public enum RendererError: LocalizedError {
@@ -15,6 +16,7 @@ public enum RendererError: LocalizedError {
     case missingSequenceNode(String)
     case ffmpegPreflightFailed(String)
     case outputPathUnavailable
+    case renderFailed(message: String, diagnosticsURL: URL?)
 
     public var errorDescription: String? {
         switch self {
@@ -26,6 +28,8 @@ public enum RendererError: LocalizedError {
             return message
         case .outputPathUnavailable:
             return "The renderer could not determine a final output path."
+        case .renderFailed(let message, _):
+            return message
         }
     }
 }
@@ -42,6 +46,7 @@ public final class Renderer: @unchecked Sendable {
         plan: RenderPlan,
         diagnosticsRoot: URL? = nil,
         outputRoot: URL? = nil,
+        keepSuccessfulDiagnostics: Bool = false,
         progress: @escaping @Sendable (RenderJobState) -> Void
     ) async throws -> RenderResult {
         let blockingIssues = plan.issues.filter { $0.severity == .blocker }
@@ -49,133 +54,157 @@ public final class Renderer: @unchecked Sendable {
             throw RendererError.exportBlocked(blockingIssues)
         }
 
-        let diagnosticsURL = try makeDiagnosticsDirectory(baseURL: diagnosticsRoot)
-        let commandLogURL = diagnosticsURL.appendingPathComponent("ffmpeg_commands.txt")
-        let workURL = diagnosticsURL.appendingPathComponent("work", isDirectory: true)
-        let assetsURL = workURL.appendingPathComponent("assets", isDirectory: true)
-        let segmentsURL = workURL.appendingPathComponent("segments", isDirectory: true)
-        try FileManager.default.createDirectory(at: assetsURL, withIntermediateDirectories: true)
-        try FileManager.default.createDirectory(at: segmentsURL, withIntermediateDirectories: true)
+        let workspace = try makeWorkspace(baseURL: diagnosticsRoot)
+        do {
+            let planData = try JSONEncoder.pretty.encode(plan)
+            try planData.write(to: workspace.tempRootURL.appendingPathComponent("render_plan.json"))
 
-        let planData = try JSONEncoder.pretty.encode(plan)
-        try planData.write(to: diagnosticsURL.appendingPathComponent("render_plan.json"))
+            progress(.init(phase: "preflight", detail: "Locating ffmpeg and verifying required filters/codecs."))
+            let binaries = try locator.locate()
+            let preflightResult = try preflight.run(using: binaries)
+            guard preflightResult.capabilities.isSufficientForPhaseOne else {
+                throw RendererError.ffmpegPreflightFailed("The selected ffmpeg build is missing one or more required Phase 1 capabilities (zscale, xfade, acrossfade, overlay, libx265).")
+            }
 
-        progress(.init(phase: "preflight", detail: "Locating ffmpeg and verifying required filters/codecs."))
-        let binaries = try locator.locate()
-        let preflightResult = try preflight.run(using: binaries)
-        guard preflightResult.capabilities.isSufficientForPhaseOne else {
-            throw RendererError.ffmpegPreflightFailed("The selected ffmpeg build is missing one or more required Phase 1 capabilities (zscale, xfade, acrossfade, overlay, libx265).")
-        }
+            let answerNodes = plan.sequence.filter { $0.type == .answerClip }
+            var inspections: [String: MediaInspectionResult] = [:]
+            progress(.init(phase: "inspect", detail: "Inspecting source media and validating HDR readiness."))
+            for node in answerNodes {
+                try Task.checkCancellation()
+                guard let clipRef = node.clipRef else { continue }
+                let inspection = try inspector.inspect(url: URL(fileURLWithPath: clipRef.resolvedPath), using: binaries)
+                inspections[node.nodeID] = inspection
+            }
 
-        let answerNodes = plan.sequence.filter { $0.type == .answerClip }
-        var inspections: [String: MediaInspectionResult] = [:]
-        progress(.init(phase: "inspect", detail: "Inspecting source media and validating HDR readiness."))
-        for node in answerNodes {
-            try Task.checkCancellation()
-            guard let clipRef = node.clipRef else { continue }
-            let inspection = try inspector.inspect(url: URL(fileURLWithPath: clipRef.resolvedPath), using: binaries)
-            inspections[node.nodeID] = inspection
-        }
+            let cardSet = BuiltInTemplates.cardSet(id: plan.settings.selectedCardSetID)
+            let overlayStyle = BuiltInTemplates.overlayStyle(id: plan.settings.selectedOverlayStyleID)
+            let nodeLookup = Dictionary(uniqueKeysWithValues: plan.sequence.map { ($0.nodeID, $0) })
 
-        let cardSet = BuiltInTemplates.cardSet(id: plan.settings.selectedCardSetID)
-        let overlayStyle = BuiltInTemplates.overlayStyle(id: plan.settings.selectedOverlayStyleID)
-        let nodeLookup = Dictionary(uniqueKeysWithValues: plan.sequence.map { ($0.nodeID, $0) })
+            progress(.init(phase: "templates", detail: "Rendering native card and overlay assets."))
+            let cardAssetPaths = try renderCardAssets(plan: plan, cardSet: cardSet, overlayStyle: overlayStyle, assetsURL: workspace.assetsURL)
 
-        progress(.init(phase: "templates", detail: "Rendering native card and overlay assets."))
-        let cardAssetPaths = try renderCardAssets(plan: plan, cardSet: cardSet, overlayStyle: overlayStyle, assetsURL: assetsURL)
+            progress(.init(phase: "segments", detail: "Preparing answer segments, cards, and transition clips."))
+            var preparedNodeSegments: [String: URL] = [:]
+            for (index, node) in plan.sequence.enumerated() {
+                try Task.checkCancellation()
+                let previousBoundary = plan.boundaries.first(where: { $0.toNodeID == node.nodeID })
+                let nextBoundary = plan.boundaries.first(where: { $0.fromNodeID == node.nodeID })
+                progress(.init(phase: "segments", detail: "Encoding segment \(index + 1) of \(plan.sequence.count): \(node.nodeID)"))
 
-        progress(.init(phase: "segments", detail: "Preparing answer segments, cards, and transition clips."))
-        var preparedNodeSegments: [String: URL] = [:]
-        for (index, node) in plan.sequence.enumerated() {
-            try Task.checkCancellation()
-            let previousBoundary = plan.boundaries.first(where: { $0.toNodeID == node.nodeID })
-            let nextBoundary = plan.boundaries.first(where: { $0.fromNodeID == node.nodeID })
-            progress(.init(phase: "segments", detail: "Encoding segment \(index + 1) of \(plan.sequence.count): \(node.nodeID)"))
-
-            switch node.type {
-            case .openingCard, .questionCard, .closingCard:
-                let assetURL = cardAssetPaths[node.nodeID]!
-                let outputURL = segmentsURL.appendingPathComponent("\(node.nodeID).mov")
-                try renderCardSegment(
-                    imageURL: assetURL,
-                    node: node,
-                    previousBoundary: previousBoundary,
-                    nextBoundary: nextBoundary,
-                    profile: plan.exportProfile,
-                    binaries: binaries,
-                    outputURL: outputURL,
-                    commandLogURL: commandLogURL
-                )
-                preparedNodeSegments[node.nodeID] = outputURL
-            case .answerClip:
-                let outputURL = segmentsURL.appendingPathComponent("\(node.nodeID)-core.mov")
-                guard let inspection = inspections[node.nodeID] else {
-                    throw RendererError.missingSequenceNode(node.nodeID)
+                switch node.type {
+                case .openingCard, .questionCard, .closingCard:
+                    let assetURL = cardAssetPaths[node.nodeID]!
+                    let outputURL = workspace.segmentsURL.appendingPathComponent("\(node.nodeID).mov")
+                    try renderCardSegment(
+                        imageURL: assetURL,
+                        node: node,
+                        previousBoundary: previousBoundary,
+                        nextBoundary: nextBoundary,
+                        profile: plan.exportProfile,
+                        binaries: binaries,
+                        outputURL: outputURL,
+                        commandLogURL: workspace.commandLogURL
+                    )
+                    preparedNodeSegments[node.nodeID] = outputURL
+                case .answerClip:
+                    let outputURL = workspace.segmentsURL.appendingPathComponent("\(node.nodeID)-core.mov")
+                    guard let inspection = inspections[node.nodeID] else {
+                        throw RendererError.missingSequenceNode(node.nodeID)
+                    }
+                    try renderAnswerCoreSegment(
+                        node: node,
+                        inspection: inspection,
+                        overlayAssetURL: cardAssetPaths["overlay-\(node.nodeID)"],
+                        previousBoundary: previousBoundary,
+                        nextBoundary: nextBoundary,
+                        profile: plan.exportProfile,
+                        binaries: binaries,
+                        outputURL: outputURL,
+                        commandLogURL: workspace.commandLogURL
+                    )
+                    preparedNodeSegments[node.nodeID] = outputURL
                 }
-                try renderAnswerCoreSegment(
-                    node: node,
-                    inspection: inspection,
-                    overlayAssetURL: cardAssetPaths["overlay-\(node.nodeID)"],
-                    previousBoundary: previousBoundary,
-                    nextBoundary: nextBoundary,
+            }
+
+            var transitionSegmentPaths: [String: URL] = [:]
+            let transitionBoundaries = plan.boundaries.filter { $0.boundaryType == "answer_to_answer" && $0.resolved.style == "soft_crossfade" }
+            for (index, boundary) in transitionBoundaries.enumerated() {
+                try Task.checkCancellation()
+                guard let fromNode = nodeLookup[boundary.fromNodeID],
+                      let toNode = nodeLookup[boundary.toNodeID],
+                      let fromInspection = inspections[fromNode.nodeID],
+                      let toInspection = inspections[toNode.nodeID] else {
+                    throw RendererError.missingSequenceNode(boundary.boundaryID)
+                }
+
+                progress(.init(phase: "segments", detail: "Encoding transition \(index + 1) of \(transitionBoundaries.count): \(boundary.boundaryID)"))
+                let outputURL = workspace.segmentsURL.appendingPathComponent("\(boundary.boundaryID).mov")
+                try renderAnswerTransitionSegment(
+                    boundary: boundary,
+                    fromNode: fromNode,
+                    toNode: toNode,
+                    fromInspection: fromInspection,
+                    toInspection: toInspection,
+                    fromOverlayURL: cardAssetPaths["overlay-\(fromNode.nodeID)"],
+                    toOverlayURL: cardAssetPaths["overlay-\(toNode.nodeID)"],
                     profile: plan.exportProfile,
                     binaries: binaries,
                     outputURL: outputURL,
-                    commandLogURL: commandLogURL
+                    commandLogURL: workspace.commandLogURL
                 )
-                preparedNodeSegments[node.nodeID] = outputURL
-            }
-        }
-
-        var transitionSegmentPaths: [String: URL] = [:]
-        let transitionBoundaries = plan.boundaries.filter { $0.boundaryType == "answer_to_answer" && $0.resolved.style == "soft_crossfade" }
-        for (index, boundary) in transitionBoundaries.enumerated() {
-            try Task.checkCancellation()
-            guard let fromNode = nodeLookup[boundary.fromNodeID],
-                  let toNode = nodeLookup[boundary.toNodeID],
-                  let fromInspection = inspections[fromNode.nodeID],
-                  let toInspection = inspections[toNode.nodeID] else {
-                throw RendererError.missingSequenceNode(boundary.boundaryID)
+                transitionSegmentPaths[boundary.boundaryID] = outputURL
             }
 
-            progress(.init(phase: "segments", detail: "Encoding transition \(index + 1) of \(transitionBoundaries.count): \(boundary.boundaryID)"))
-            let outputURL = segmentsURL.appendingPathComponent("\(boundary.boundaryID).mov")
-            try renderAnswerTransitionSegment(
-                boundary: boundary,
-                fromNode: fromNode,
-                toNode: toNode,
-                fromInspection: fromInspection,
-                toInspection: toInspection,
-                fromOverlayURL: cardAssetPaths["overlay-\(fromNode.nodeID)"],
-                toOverlayURL: cardAssetPaths["overlay-\(toNode.nodeID)"],
-                profile: plan.exportProfile,
-                binaries: binaries,
-                outputURL: outputURL,
-                commandLogURL: commandLogURL
+            progress(.init(phase: "assemble", detail: "Concatenating prepared segments into the final movie file."))
+            let finalSegments = orderedFinalSegments(sequence: plan.sequence, boundaries: plan.boundaries, nodeSegments: preparedNodeSegments, transitionSegments: transitionSegmentPaths)
+            let concatBody = finalSegments.map { "file '\($0.path.replacingOccurrences(of: "'", with: "'\\''"))'" }.joined(separator: "\n")
+            try Data(concatBody.utf8).write(to: workspace.concatFileURL)
+
+            let outputURL = try finalOutputURL(for: plan, outputRoot: outputRoot)
+            try FileManager.default.createDirectory(at: outputURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try runner.run(
+                executableURL: binaries.ffmpegURL,
+                arguments: finalAssemblyArguments(
+                    concatFileURL: workspace.concatFileURL,
+                    outputURL: outputURL,
+                    profile: plan.exportProfile
+                ),
+                commandLogURL: workspace.commandLogURL
             )
-            transitionSegmentPaths[boundary.boundaryID] = outputURL
+
+            var plexOutputURL: URL?
+            if let plexMetadata = plan.plexMetadata {
+                progress(.init(phase: "plex", detail: "Packaging Plex-friendly MP4 companion with metadata and chapters."))
+                plexOutputURL = try packagePlexCompanion(
+                    plan: plan,
+                    plexMetadata: plexMetadata,
+                    masterOutputURL: outputURL,
+                    workspace: workspace,
+                    binaries: binaries
+                )
+            }
+
+            let diagnosticsURL = keepSuccessfulDiagnostics ? try persistDiagnostics(from: workspace) : nil
+            try cleanupTemporaryArtifacts(at: workspace.tempRootURL)
+
+            progress(.init(phase: "done", detail: "Finished rendering \(outputURL.lastPathComponent)."))
+            return RenderResult(outputURL: outputURL, plexOutputURL: plexOutputURL, diagnosticsURL: diagnosticsURL)
+        } catch is CancellationError {
+            try? cleanupTemporaryArtifacts(at: workspace.tempRootURL)
+            throw CancellationError()
+        } catch {
+            let diagnosticsURL = try? persistDiagnostics(from: workspace)
+            try? cleanupTemporaryArtifacts(at: workspace.tempRootURL)
+            if let rendererError = error as? RendererError {
+                switch rendererError {
+                case .renderFailed:
+                    throw rendererError
+                default:
+                    throw RendererError.renderFailed(message: rendererError.localizedDescription, diagnosticsURL: diagnosticsURL)
+                }
+            }
+            throw RendererError.renderFailed(message: error.localizedDescription, diagnosticsURL: diagnosticsURL)
         }
-
-        progress(.init(phase: "assemble", detail: "Concatenating prepared segments into the final movie file."))
-        let finalSegments = orderedFinalSegments(sequence: plan.sequence, boundaries: plan.boundaries, nodeSegments: preparedNodeSegments, transitionSegments: transitionSegmentPaths)
-        let concatFileURL = diagnosticsURL.appendingPathComponent("concat.txt")
-        let concatBody = finalSegments.map { "file '\($0.path.replacingOccurrences(of: "'", with: "'\\''"))'" }.joined(separator: "\n")
-        try Data(concatBody.utf8).write(to: concatFileURL)
-
-        let outputURL = try finalOutputURL(for: plan, outputRoot: outputRoot)
-        try FileManager.default.createDirectory(at: outputURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try runner.run(
-            executableURL: binaries.ffmpegURL,
-            arguments: finalAssemblyArguments(
-                concatFileURL: concatFileURL,
-                outputURL: outputURL,
-                profile: plan.exportProfile
-            ),
-            commandLogURL: commandLogURL
-        )
-
-        progress(.init(phase: "done", detail: "Finished rendering \(outputURL.lastPathComponent)."))
-        return RenderResult(outputURL: outputURL, diagnosticsURL: diagnosticsURL)
     }
 
     private func orderedFinalSegments(
@@ -613,6 +642,43 @@ public final class Renderer: @unchecked Sendable {
         return url
     }
 
+    private func makeWorkspace(baseURL: URL?) throws -> RenderWorkspace {
+        let tempBase = FileManager.default.temporaryDirectory
+            .appendingPathComponent("YearlyInterviewStudio-Render-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tempBase, withIntermediateDirectories: true)
+        let persistentBase = baseURL ?? FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/Yearly Interview Studio/Diagnostics", isDirectory: true)
+        let workURL = tempBase.appendingPathComponent("work", isDirectory: true)
+        let assetsURL = workURL.appendingPathComponent("assets", isDirectory: true)
+        let segmentsURL = workURL.appendingPathComponent("segments", isDirectory: true)
+        try FileManager.default.createDirectory(at: assetsURL, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: segmentsURL, withIntermediateDirectories: true)
+        return RenderWorkspace(
+            tempRootURL: tempBase,
+            persistentBaseURL: persistentBase,
+            workURL: workURL,
+            assetsURL: assetsURL,
+            segmentsURL: segmentsURL,
+            commandLogURL: tempBase.appendingPathComponent("ffmpeg_commands.txt"),
+            concatFileURL: tempBase.appendingPathComponent("concat.txt")
+        )
+    }
+
+    private func persistDiagnostics(from workspace: RenderWorkspace) throws -> URL {
+        let destination = try makeDiagnosticsDirectory(baseURL: workspace.persistentBaseURL)
+        let contents = try FileManager.default.contentsOfDirectory(at: workspace.tempRootURL, includingPropertiesForKeys: nil)
+        for item in contents {
+            try FileManager.default.copyItem(at: item, to: destination.appendingPathComponent(item.lastPathComponent, isDirectory: true))
+        }
+        return destination
+    }
+
+    private func cleanupTemporaryArtifacts(at url: URL) throws {
+        if FileManager.default.fileExists(atPath: url.path) {
+            try FileManager.default.removeItem(at: url)
+        }
+    }
+
     private func finalOutputURL(for plan: RenderPlan, outputRoot: URL?) throws -> URL {
         let root = outputRoot ?? FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Movies/Yearly Interview Studio/\(plan.project.projectName)", isDirectory: true)
@@ -626,10 +692,141 @@ public final class Renderer: @unchecked Sendable {
         return root.appendingPathComponent("\(sanitizedBase)-\(stamp).\(plan.exportProfile.containerExtension)")
     }
 
+    private func packagePlexCompanion(
+        plan: RenderPlan,
+        plexMetadata: PlexMetadataPlan,
+        masterOutputURL: URL,
+        workspace: RenderWorkspace,
+        binaries: FFmpegBinarySet
+    ) throws -> URL {
+        let chapterURL = workspace.tempRootURL.appendingPathComponent("plex_chapters.ffmeta")
+        try Data(ffmetadataText(for: plexMetadata.chapters).utf8).write(to: chapterURL)
+
+        let outputURL = try plexOutputURL(for: masterOutputURL, metadata: plexMetadata)
+        try runner.run(
+            executableURL: binaries.ffmpegURL,
+            arguments: plexPackagingArguments(
+                plan: plan,
+                plexMetadata: plexMetadata,
+                masterOutputURL: masterOutputURL,
+                chapterMetadataURL: chapterURL,
+                outputURL: outputURL
+            ),
+            commandLogURL: workspace.commandLogURL
+        )
+        return outputURL
+    }
+
+    private func plexOutputURL(for masterOutputURL: URL, metadata: PlexMetadataPlan) throws -> URL {
+        let baseName = sanitizeFilename("\(metadata.show) - \(metadata.episodeID) - \(metadata.episodeTitle)")
+        let root = masterOutputURL.deletingLastPathComponent()
+        let preferred = root.appendingPathComponent("\(baseName).mp4")
+        if !FileManager.default.fileExists(atPath: preferred.path) {
+            return preferred
+        }
+        let stamp = DateFormatter.outputTimestamp.string(from: Date())
+        return root.appendingPathComponent("\(baseName)-\(stamp).mp4")
+    }
+
+    private func plexPackagingArguments(
+        plan: RenderPlan,
+        plexMetadata: PlexMetadataPlan,
+        masterOutputURL: URL,
+        chapterMetadataURL: URL,
+        outputURL: URL
+    ) -> [String] {
+        var arguments = [
+            "-hide_banner",
+            "-loglevel", "error",
+            "-nostdin",
+            "-y",
+            "-i", masterOutputURL.path,
+            "-f", "ffmetadata",
+            "-i", chapterMetadataURL.path,
+            "-map_metadata", "-1",
+            "-map", "0",
+            "-map_chapters", "1",
+            "-c", "copy",
+            "-tag:v", "hvc1",
+            "-movflags", "+faststart",
+            "-metadata", "title=\(plexMetadata.episodeTitle)",
+            "-metadata", "show=\(plexMetadata.show)",
+            "-metadata", "season_number=\(plexMetadata.seasonNumber)",
+            "-metadata", "episode_sort=\(plexMetadata.episodeNumber)",
+            "-metadata", "episode_id=\(plexMetadata.episodeID)",
+            "-metadata", "date=\(plexMetadata.seasonNumber)",
+            "-metadata", "description=\(plexMetadata.summary)",
+            "-metadata", "synopsis=\(plexMetadata.summary)",
+            "-metadata", "comment=\(plexMetadata.summary)",
+            "-metadata", "genre=Interview",
+            "-metadata", "software=\(plan.appName)",
+            "-metadata", "information=\(plan.exportProfile.profileID) Plex companion from HDR master"
+        ]
+
+        if let creationTime = inferredPlexCreationTime(for: plan) {
+            arguments.append(contentsOf: ["-metadata", "creation_time=\(creationTime)"])
+        }
+
+        arguments.append(outputURL.path)
+        return arguments
+    }
+
+    private func ffmetadataText(for chapters: [RenderChapter]) -> String {
+        var lines = [";FFMETADATA1", ""]
+        for chapter in chapters {
+            lines.append("[CHAPTER]")
+            lines.append("TIMEBASE=1/1000000")
+            lines.append("START=\(chapter.startUS)")
+            lines.append("END=\(chapter.endUS)")
+            lines.append("title=\(escapeFFMetadata(chapter.title))")
+            lines.append("")
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    private func escapeFFMetadata(_ value: String) -> String {
+        value
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: ";", with: "\\;")
+            .replacingOccurrences(of: "#", with: "\\#")
+            .replacingOccurrences(of: "=", with: "\\=")
+            .replacingOccurrences(of: "\n", with: " ")
+    }
+
     private func sanitizeFilename(_ value: String) -> String {
         let invalid = CharacterSet(charactersIn: "/:\\?%*|\"<>")
         return value.components(separatedBy: invalid).joined(separator: "-")
     }
+
+    private func inferredPlexCreationTime(for plan: RenderPlan) -> String? {
+        let fileManager = FileManager.default
+        let latestDate = plan.sequence
+            .compactMap(\.clipRef?.resolvedPath)
+            .compactMap { path -> Date? in
+                guard let attributes = try? fileManager.attributesOfItem(atPath: path),
+                      let modificationDate = attributes[.modificationDate] as? Date else {
+                    return nil
+                }
+                return modificationDate
+            }
+            .max()
+
+        guard let latestDate else { return nil }
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        return formatter.string(from: latestDate)
+    }
+}
+
+private struct RenderWorkspace {
+    let tempRootURL: URL
+    let persistentBaseURL: URL
+    let workURL: URL
+    let assetsURL: URL
+    let segmentsURL: URL
+    let commandLogURL: URL
+    let concatFileURL: URL
 }
 
 private extension JSONEncoder {

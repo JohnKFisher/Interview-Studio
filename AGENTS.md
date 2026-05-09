@@ -6,6 +6,16 @@ Assume I may not deeply review code and may not notice hidden risks in my reques
 If a change is destructive, user-visible, security-sensitive, privacy-sensitive, materially worse for the app’s core job, materially slower/heavier, architecturally surprising, or meaningfully expands scope, stop and ask first.
 Follow everything in this file regardless of which agent is running. Conditional rule files apply when their triggers match the task.
 
+## Project Philosophy
+
+Read `docs/agent-rules/project_philosophy.md` when:
+- making UX, product, or architecture tradeoffs,
+- proposing significant behavioral changes,
+- evaluating multiple valid approaches,
+- or when broader project philosophy materially affects the decision.
+
+For localized, low-risk implementation tasks, do not load it unless needed.
+
 ## Rule Hierarchy
 
 Apply instructions in this order:
@@ -17,24 +27,20 @@ Apply instructions in this order:
 
 If there is a conflict, the higher-priority rule wins unless I explicitly override it.
 
-## Who I Am
-
-Solo developer building personal-use apps. Optimize for usefulness, clarity, reliability, and low friction over impressiveness. Not building for a broad market. Favor practical daily usability over feature count. Favor understandable, inspectable behavior over magic or hidden automation. Do not add complexity in anticipation of future needs unless there is a strong reason.
-
-Default stack: Swift for Apple-native projects, Tauri (Rust + WebView) for cross-platform desktop apps, unless I specify otherwise. If a different stack would be meaningfully better for a given project, suggest it with reasoning — but do not switch without approval.
-
-Core values: safe by default; local-first and least-privilege by default; visible behavior over hidden behavior; reversible changes over destructive changes; measured impact over assumptions; explicit tradeoffs over silent fallbacks; honest status over confident-sounding partial work.
-
 ## Session Startup
 
-At the start of every session, read these files if they exist in the repo:
-- `docs/DECISIONS.md` — the project decision log
-- `docs/WHERE_WE_STAND.md` — the current project status snapshot
-- any current project brief or milestone plan if present
+Use minimal startup context.
 
-Use them to understand approved decisions, current state, known risks, open priorities, and prior constraints that should not be re-litigated accidentally before beginning work.
+For tiny / low-risk tasks:
+- read only the files needed for the current edit,
+- do not automatically load project status, decision logs, or philosophy docs unless clearly relevant.
 
-After reading the core project docs, identify all conditional rule files that apply to the task. More than one often applies. Read every matching file before planning or coding. Do not stop after the first match.
+For normal / risky tasks, read relevant startup docs if they exist:
+- `docs/DECISIONS.md`
+- `docs/WHERE_WE_STAND.md`
+- current project brief or milestone plan
+
+Use these docs to avoid contradicting approved decisions, current state, known risks, and open priorities.
 
 ## Safety-First Principles (Non-Negotiable)
 
@@ -70,16 +76,18 @@ If approval is needed, present 2 to 3 options with pros/cons and recommend one.
 
 If a project-specific brief, milestone plan, or decision log explicitly approves behavior that would otherwise require re-asking under these general rules, follow that approval while still honoring safety, privacy, reversibility, and transparency. If there is a conflict, the stricter safety/privacy rule wins unless I explicitly override it.
 
+Later sections may mention specific examples, but this section is the controlling ask-first rule.
+
 ## Working With Me
 
 - Ask clarifying questions freely when they will improve the result, expose a tradeoff, or reduce the chance of a wrong turn.
-- Offer suggestions freely when they may improve safety, usability, maintainability, fit, or overall quality.
+- Offer concise, high-signal suggestions when they are likely to materially improve safety, usability, maintainability, or fit. Avoid speculative or low-value suggestion sprawl.
 - Distinguish clearly between what I asked for, what you recommend, and what is optional.
 - Do not treat suggestions as approved changes unless I explicitly approve them.
 - I value back-and-forth iteration and course correction more than one giant "finished" pass.
-- Small related improvements are welcome when low-risk and clearly disclosed. Do not silently turn one requested change into a broad rewrite. If additional improvements seem worthwhile, mention them in the plan before coding, or list them separately as suggestions. Smart adjacent judgment is useful. Silent scope expansion is not.
+- Small related improvements are welcome when low-risk, clearly disclosed, and tightly related to the request. Avoid broad rewrites or exploratory expansion without approval.
 - Be clear, direct, and practical. Do not hide uncertainty behind confident language. Surface meaningful tradeoffs. When there are real choices, present them cleanly and recommend one. Avoid unnecessary jargon when a plain description will do. Be helpful without becoming overeager or sprawling.
-- Do not treat defaults or preferences in this file as approval to make behavior-changing edits without the normal ask-first checks.
+- Behavior-changing edits remain subject to the Ask-First Gate.
 
 ## Implementation Style
 
@@ -93,41 +101,210 @@ If a project-specific brief, milestone plan, or decision log explicitly approves
 - Follow the project's existing code formatting and linting conventions. If none exist, use the language's community-standard formatter (e.g., swift-format for Swift, rustfmt for Rust, Prettier for JS/TS) with default settings.
 - Preserve existing behavior unless the requested task requires changing it.
 - Update docs when behavior, setup, architecture, or operational expectations materially change.
-- For risky, user-visible, or behavior-changing work, prefer opt-in controls, staged rollout paths, feature flags, or isolated code paths. Default new risky behavior to off unless the project plan clearly says otherwise.
+- For risky or user-visible work, prefer opt-in or isolated rollout paths unless already approved.
+
+## Patch Discipline
+
+Prefer targeted patches over rewrites.
+
+- Edit the smallest practical region that solves the problem.
+- Do not rewrite whole files, components, or modules unless the task requires it.
+- Preserve existing structure, naming, formatting, and ordering when practical.
+- If a rewrite is cleaner, explain why and ask before doing it unless already approved.
+
+## Scope Escalation Control
+
+Do not escalate a localized task into a broad refactor without approval.
+
+Pause and ask before:
+- touching many unrelated files,
+- restructuring architecture,
+- changing shared patterns project-wide,
+- replacing existing approaches that already work,
+- or expanding the task primarily for cleanup, consistency, or elegance.
+
+Prefer solving the requested problem locally unless broader change is clearly justified.
+
+## Completion Discipline
+
+Once the requested task is successfully completed and verified, stop.
+
+- Do not continue exploring, refactoring, optimizing, or expanding scope unless:
+  - the user requested it,
+  - a meaningful unresolved risk remains,
+  - or a brief high-signal suggestion is warranted.
+- Avoid "while I'm here" changes after successful completion.
+- Prefer finishing cleanly over opportunistic additional work.
+
+## Context and Command Output Discipline
+
+Protect the context window aggressively.
+
+- Inspect the smallest useful scope first: targeted files, symbols, nearby call sites, focused diffs, and relevant log tails.
+- Avoid dumping full files, full logs, broad search results, generated files, minified files, binary files, databases, build artifacts, or large JSON/JSONL unless clearly required.
+- Any command with unknown or potentially large output must be byte-capped, not only line-capped.
+- Prefer:
+  - `COMMAND 2>&1 | head -c 4000`
+  - `COMMAND 2>&1 | tail -c 4000`
+- For failure logs, prefer recent output with `tail -c`.
+- If capped output is insufficient, narrow the command before increasing the cap.
+- Do not byte-cap instruction files, agent rule files, project briefs, decision logs, or status docs when they are directly relevant; read the whole relevant file unless it is unexpectedly huge.
+
+## Tool Usage Discipline
+
+Treat tool calls, searches, file reads, and command executions as expensive operations.
+
+- Before using a tool, ask whether existing context is already sufficient.
+- Avoid repeating searches, file reads, or commands whose results are still valid.
+- Prefer acting on strong local evidence over gathering excessive additional context.
+- If a previous step already established the answer with high confidence, continue execution instead of re-verifying unnecessarily.
+
+## Communication Token Discipline
+
+Do not provide a transcript of the work.
+
+- Report decisions, risks, blockers, changes, and verification results.
+- Do not narrate routine file reads, searches, command attempts, or obvious next steps unless they affect the plan or outcome.
+- Avoid repeating the same rationale in the plan, implementation notes, and final summary.
+- Prefer concise status over exhaustive explanation.
+- If nothing unusual happened, keep the summary short.
+
+## Summary Deduplication
+
+Do not repeat the same information in multiple places.
+
+- If something was already clearly stated in the plan, do not restate it unless the outcome changed.
+- Final summaries should focus on what changed, what was verified, and what remains.
+- Avoid repeating unchanged constraints, obvious context, or previously approved decisions.
+- Keep status/document updates factual and non-duplicative.
+
+## Large Output Discipline
+
+Do not print large generated content inline unless the user asks.
+
+- Prefer editing files directly over pasting full file contents into the response.
+- For large diffs, summarize the change and reference changed files.
+- Do not paste full logs, generated JSON, lockfiles, manifests, snapshots, or build output unless needed for review.
+- If the user needs copy/paste output, provide the smallest complete block that solves the need.
+
+## Repository Context Discipline
+
+Use minimal context first.
+
+- Do not scan the whole repo unless the task requires broad understanding.
+- Prefer targeted reads: relevant files, nearby tests, related symbols, recent errors, and known project docs.
+- Before broad searches, state what uncertainty the search is meant to resolve.
+- Stop reading once enough context exists to make a safe, bounded change.
+- Do not repeatedly re-read unchanged instruction files, status docs, or decision logs in the same session unless new information suggests they matter.
+- For tiny / low-risk tasks, read only the project docs and conditional rule files that are clearly relevant.
+- For normal / risky tasks, follow the full startup and conditional-rule workflow.
+
+## Search Discipline
+
+Prefer targeted search over broad discovery.
+
+- Search for specific symbols, filenames, error strings, config keys, or user-facing text before broad keywords.
+- Avoid broad repo-wide searches unless the task requires cross-cutting understanding.
+- When search results are large, refine the query instead of reading many matches.
+- Do not inspect generated, vendored, dependency, cache, build, or archive directories unless directly relevant.
 
 ## Task Workflow
 
-### Before Coding
+Use the lightest workflow that safely fits the task.
 
-Provide:
-1. a short plan,
-2. the files expected to change,
+### Tiny / Low-Risk Tasks
+
+For tiny, low-risk tasks, do not produce a full formal plan unless useful.
+
+A tiny / low-risk task means all are true:
+- expected edit is small and localized,
+- no user data, permissions, migrations, security, privacy, CI/release, dependency, or architecture impact,
+- no destructive behavior,
+- no compatibility break,
+- no broad refactor,
+- no meaningful performance/output-quality risk.
+
+For these tasks:
+- briefly state the intended edit,
+- make the change,
+- run the narrowest relevant check,
+- summarize files changed and verification performed.
+
+### Normal / Risky Tasks
+
+For anything non-trivial, risky, ambiguous, broad, user-visible, or behavior-changing, provide before coding:
+1. short plan,
+2. files expected to change,
 3. any new dependencies, permissions, entitlements, migrations, external tools, or network behavior,
 4. risk level: low / medium / high.
 
 Also:
-- Call out meaningful uncertainty or hidden risk.
-- Note whether the task appears likely to affect performance, reliability, compatibility, output quality, or user data.
-- Check `docs/DECISIONS.md` for relevant prior decisions before proposing something that may have already been decided.
-- State which conditional rule files were reviewed for this task and why. If none, say "none."
+- call out meaningful uncertainty or hidden risk,
+- note likely impact on performance, reliability, compatibility, output quality, or user data,
+- check `docs/DECISIONS.md` for relevant prior decisions before proposing something that may have already been decided,
+- state which conditional rule files were reviewed and why. If none, say "none."
 
-### Verification (Required Output)
+### Verification Output
 
-Provide:
-- exact build/run/test steps,
-- a short manual smoke-test checklist,
-- meaningful before/after measurements when performance, reliability, or output quality may have changed.
+Always report verification, but scale detail to risk.
 
-If the task could affect user data, permissions, fallbacks, or long-running work, verify the relevant safety conditions from the applicable conditional sections below.
+For tiny / low-risk tasks:
+- report the exact check run, or say not run with reason.
 
-### Change Summary (Required Output)
+For normal / risky tasks:
+- provide exact build/run/test steps,
+- include before/after measurements when performance, reliability, or output quality may have changed.
 
-Provide:
+If the task could affect user data, permissions, fallbacks, or long-running work, verify the relevant safety conditions from the applicable conditional rule files.
+
+### Verification Scope Discipline
+
+Match verification scope to change scope.
+
+- Prefer the narrowest meaningful verification.
+- For localized changes, prefer targeted tests, focused builds, or limited smoke checks over full-suite runs.
+- Do not run expensive builds or broad test suites unless:
+  - the change meaningfully affects shared behavior,
+  - the task explicitly requires it,
+  - or localized verification is insufficient.
+- If broader verification was intentionally skipped, say so briefly.
+
+### Change Summary
+
+Always summarize:
 - files changed,
-- what was added, removed, or behaviorally changed,
-- known limitations,
-- follow-ups or deferred risks,
-- whether a new build was completed, not completed, or not attempted (make this the final line — do not make me infer build status from context).
+- what changed,
+- verification performed,
+- known limitations or follow-ups if any,
+- final build/test status.
+
+
+## Planning Discipline
+
+Do enough planning to make a safe, bounded change, then execute.
+
+- Avoid repeated re-planning unless new information materially changes the task or risk profile.
+- Do not repeatedly revisit settled decisions during the same task.
+- Prefer one coherent plan plus execution over recursive planning loops.
+- If uncertainty is low and the task is localized, act instead of continuing analysis.
+
+## Debugging Discipline
+
+Prefer the smallest plausible fix first.
+
+- For localized failures with an obvious likely cause, make one targeted fix before broad investigation.
+- Do not inspect unrelated systems until the local hypothesis fails.
+- If the first fix fails, use the failure output to narrow the next step.
+- Escalate to broader investigation only after local fixes are exhausted or the failure suggests systemic risk.
+
+## Failure Loop Discipline
+
+Do not repeat similar failed attempts.
+
+- After 2 failed attempts at the same problem, stop and reassess before trying again.
+- Summarize what failed, what the failure suggests, and the next most likely cause.
+- Do not keep rerunning the same command/test without a changed hypothesis or changed code.
+- If the issue appears blocked by missing context, tooling, credentials, or environment state, report that clearly instead of continuing to guess.
 
 ## Decision Log
 
@@ -161,10 +338,10 @@ For projects with meaningful versioning, milestone releases, or durable rollback
 - Default branch strategy is commit-to-main unless I specify otherwise. Do not create feature branches, pull requests, or branch-based workflows without being asked.
 - Write commit messages as short imperative sentences, ≤72 characters for the subject line. e.g. `Add login screen`, `Fix empty CSV export crash`. Add a body paragraph for non-obvious changes explaining why, not just what.
 - At session end, commit completed work with a clear message. Leave work-in-progress uncommitted and note what remains in the change summary.
-- Do not make material code changes in a repo with no commit history. If no baseline commit exists, stop and ask first.
+- If no baseline commit exists, the Ask-First Gate applies before material edits.
 - For medium- or high-risk tasks, create or recommend a rollback point before material edits.
 - Prefer small, reviewable commits at stable milestones over large opaque changes.
-- Do not delete history, rewrite history, reset branches, or discard uncommitted work without explicit approval.
+- History rewrites, resets, and destructive git actions require Ask-First approval.
 - If I explicitly identify a state as known good, create or recommend a durable rollback anchor using the repo's normal workflow.
 - Before any rollback or reset-like action, explain exactly what target would be restored and what current work could be lost.
 
@@ -186,7 +363,7 @@ For projects with meaningful versioning, milestone releases, or durable rollback
 - Handle errors explicitly. No silent failures.
 - Prefer actionable error surfaces over generic failures.
 
-If a proposed change is likely to make the app noticeably worse at its core job, or create a noticeable or avoidable regression in correctness, output quality, responsiveness, startup time, memory use, I/O, network use, battery use, or hang risk, stop and ask first unless that operating model is already approved.
+If a change risks meaningful regression in core functionality, performance, reliability, or output quality, the Ask-First Gate applies unless already approved.
 
 Before implementing a materially heavier or lower-quality approach, provide:
 1. baseline behavior,
@@ -209,53 +386,35 @@ If the project already has users, saved data, config files, scripts, documented 
   4. the rollback path.
 - Prefer additive changes, compatibility shims, or deprecation paths over abrupt breaking changes.
 
-## Honesty and Integrity
+## Integrity
 
-### Completion Honesty
+- Do not present unverified, mocked, scaffolded, placeholder, or partial work as complete.
+- Keep docs, comments, tests, screenshots, and status aligned with actual behavior.
+- Do not weaken or rewrite tests merely to make failures disappear.
+- State uncertainty, incomplete verification, limitations, and deferred work clearly.
+- Distinguish between implemented, partial, and planned behavior when relevant.
 
-- Do not describe scaffolded, mocked, placeholder, temporary-workaround, or unverified work as complete.
-- Label partial, temporary, or deferred work clearly.
-- Distinguish between: implemented, partial, scaffolded, planned.
-- Do not update docs, comments, screenshots, or status files to describe behavior that does not actually exist.
-- Prefer slightly incomplete docs over confidently inaccurate docs.
-- When behavior changed but verification is incomplete, say that directly.
+## About Screen
 
-### Test Integrity
+- About Screen of all apps must give copyright credit to "John Kenneth Fisher" and include a clickable link to the public GitHub page if one exists.
 
-- Do not weaken or rewrite tests just to make failures disappear.
-- Change tests only when behavior, requirements, or expectations have genuinely changed.
-- Do not change snapshots, fixtures, tolerances, or expected outputs without a real behavioral reason.
-- If a test is wrong or outdated, say so explicitly and justify the change.
-- Write tests for non-trivial logic, edge cases, and anything that has broken before. Skip tests for simple glue code, trivial UI wiring, and straightforward config. When in doubt about coverage expectations, ask.
-
-## App Defaults
-
-### UX and Interaction
-
-- Follow the target platform's native design conventions and interaction patterns. On Apple platforms this means Apple HIG; on Windows this means Fluent/WinUI conventions. When no platform is specified, default to Apple HIG. Favor strong information hierarchy, good spacing, readable typography, and native controls over custom replacements.
-- Avoid noisy UI, excessive chrome, gimmicky interactions, or flashy design. Optimize for repeated daily use, not first-impression effect.
-- Keep primary screens focused; put secondary detail in drill-downs, panels, or debug views.
-- Prefer obvious controls and predictable behavior over novelty.
-- Prefer empty states, warnings, and errors that explain what is happening, what still works, and what I can do next. Avoid dead-end messages that only announce failure without guidance.
-- Support both light and dark system appearances using platform-standard dynamic colors. Do not hardcode colors.
-- Include basic accessibility support: label interactive elements for screen readers, ensure sufficient contrast, and support keyboard navigation.
-- Default to English-only. Do not add localization infrastructure or string tables unless I explicitly request it.
-- Unless the project specifies otherwise, target the current major OS version minus one (e.g., if current is macOS 15, target macOS 14).
-
-### Behavior
-
-- Prefer local-first behavior where practical.
-- Prefer conservative defaults and opt-in power features.
-- Prefer graceful degradation over brittle all-or-nothing behavior when integrity is not at risk.
-- Prefer visible status over hidden background activity.
-- Prefer explicit progress, state, and health signals when something may take time or become stale.
-- Prefer predictable output and deterministic behavior where practical.
-- Store app data, settings, and user-authored content in inspectable, recoverable formats and predictable locations. Do not trap important content in opaque internal state.
-- Make settings visible, understandable, and grouped by real user meaning. Do not bury important behavior behind hidden toggles or obscure configuration.
 
 ## Conditional Rule Triggers
 
-Read all matching files. More than one often applies.
+Use progressive disclosure for conditional rules.
+
+At planning time, identify every conditional rule file that may apply, but only read the full file immediately when:
+- the task directly changes behavior covered by that file,
+- the task is medium/high risk,
+- the task affects user data, security, privacy, permissions, migrations, CI/release, external tools, or destructive/bulk operations,
+- the task is ambiguous and the rule file may change the plan,
+- or the user explicitly asks for maximum caution.
+
+For tiny / low-risk tasks, mention likely relevant conditional files but do not load them unless they affect the edit.
+
+If uncertainty increases during implementation, stop and read the relevant conditional file before continuing.
+
+When in doubt on safety, privacy, data integrity, destructive operations, permissions, or releases, read the file.
 
 - `docs/agent-rules/user-data-permissions.md`
   - Read when the task touches user data, local files, cloud files, photos, notes, mail, contacts, calendars, storage locations, app permissions, privacy prompts, destructive operations, bulk operations, app-owned vs user-owned paths, or anything that reads/writes/moves/renames/deletes user content.
@@ -290,24 +449,12 @@ Read all matching files. More than one often applies.
 - `docs/agent-rules/ci-release.md`
   - Read when the task touches GitHub Actions, CI, releases, packaging, DMGs, EXEs, build artifacts, version-triggered releases, code signing, notarization workflow, or app distribution automation.
 
-- `docs/agent-rules/readme-distribution.md`
-  - Read when the task touches README, installation instructions, distribution notes, About screen, licensing text, or end-user run instructions.
+- `docs/agent-rules/about-distribution.md`
+  - Read this file when the task touches distribution notes, About screen, or licensing text
+  
+- `docs/agent-rules/readme-rules.md`
+  - Read this file when the task touches README, installation instructions, distribution notes, or end-user run instructions.
+  
+- `docs/agent-rules/local-rtk.md`
+  - Read only when `rtk` is available on PATH or the user asks about RTK/token-compressed command output.
 
-Important:
-- Some tasks require multiple conditional files.
-- Do not stop after the first apparent match.
-- When uncertain, read the extra file.
-
-Examples:
-- Photo library import feature -> `apple.md` + `user-data-permissions.md` + `long-running-work.md`
-- macOS app packaging change -> `apple.md` + `ci-release.md` + `readme-distribution.md`
-- Tauri file import flow -> `tauri-web.md` + `user-data-permissions.md` + `untrusted-input-tools.md`
-- Cross-platform export pipeline -> `cross-platform.md` + `long-running-work.md` + `untrusted-input-tools.md`
-- Adding AI-based ranking to imported documents -> `ai-inference.md` + `untrusted-input-tools.md` + `user-data-permissions.md`
-- Adding persistent crash logging -> `diagnostics-privacy.md` + `user-data-permissions.md`
-
-## README, Distribution, and About Screen
-
-- Default to MIT license unless I specify otherwise.
-- For personal apps, hobby projects, or largely vibe-coded repos, the README MUST say that plainly near the top when it is materially true. It should make clear that the project primarily exists to satisfy the owner's needs, that outside usefulness is incidental, and that no warranties, support commitments, stability guarantees, or roadmap promises are implied beyond the actual license.
-- For personal apps where the About Screen exists, it must give copyright credit to "John Kenneth Fisher" and include a clickable link to the public GitHub page if one exists.

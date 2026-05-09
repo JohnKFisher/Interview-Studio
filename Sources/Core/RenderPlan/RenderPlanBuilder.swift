@@ -114,6 +114,7 @@ public struct RenderPlanBuilder {
 
         let boundaries = buildBoundaries(sequence: sequence, project: project, questionClipLookup: questionClipLookup, settings: settings, frameRate: exportProfile.frameRate)
         issues.append(contentsOf: boundaries.flatMap(\.issues))
+        let plexMetadata = buildPlexMetadataPlan(document: document, sequence: sequence, boundaries: boundaries, issues: &issues)
 
         let summary = makeSummary(
             sequence: sequence,
@@ -134,6 +135,7 @@ public struct RenderPlanBuilder {
             ),
             exportProfile: exportProfile,
             settings: settings,
+            plexMetadata: plexMetadata,
             sequence: sequence,
             boundaries: boundaries,
             issues: deduplicatedIssues(issues),
@@ -148,6 +150,9 @@ public struct RenderPlanBuilder {
             guard var question = byKey[key] else { return nil }
             if let editedText = document.questionDisplayTexts[key], !editedText.isEmpty {
                 question.displayText = editedText
+            }
+            if document.titleCaseQuestions {
+                question.displayText = TitleCaseFormatter.format(question.displayText)
             }
             return question
         }
@@ -346,6 +351,113 @@ public struct RenderPlanBuilder {
         return issues
     }
 
+    private func buildPlexMetadataPlan(
+        document: ProjectDocument,
+        sequence: [RenderSequenceNode],
+        boundaries: [BoundaryTransition],
+        issues: inout [AssemblyIssue]
+    ) -> PlexMetadataPlan? {
+        let input = document.plexMetadata
+        guard input.isEnabled else { return nil }
+
+        let missingFields = plexMissingFields(for: input)
+        guard missingFields.isEmpty,
+              let seasonNumber = Int(input.season.trimmingCharacters(in: .whitespacesAndNewlines)),
+              let episodeNumber = Int(input.episode.trimmingCharacters(in: .whitespacesAndNewlines)) else {
+            issues.append(
+                AssemblyIssue(
+                    severity: .blocker,
+                    code: "PLEX_METADATA_INCOMPLETE",
+                    humanMessage: "Plex companion export is enabled, but Show, Season, Episode, Episode Title, and Summary must all be filled before export.",
+                    aiContext: [
+                        "missing_fields": .array(missingFields.map(JSONValue.string))
+                    ],
+                    suggestedFix: "Fill the required Plex metadata fields or turn off Plex companion export for this project."
+                )
+            )
+            return nil
+        }
+
+        return PlexMetadataPlan(
+            show: input.show.trimmingCharacters(in: .whitespacesAndNewlines),
+            seasonNumber: seasonNumber,
+            episodeNumber: episodeNumber,
+            episodeTitle: input.episodeTitle.trimmingCharacters(in: .whitespacesAndNewlines),
+            summary: input.summary.trimmingCharacters(in: .whitespacesAndNewlines),
+            chapters: chapterPlan(sequence: sequence, boundaries: boundaries)
+        )
+    }
+
+    private func plexMissingFields(for input: PlexMetadataInput) -> [String] {
+        var missing: [String] = []
+        if input.show.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            missing.append("Show")
+        }
+        if input.season.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || Int(input.season.trimmingCharacters(in: .whitespacesAndNewlines)) == nil {
+            missing.append("Season")
+        }
+        if input.episode.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || Int(input.episode.trimmingCharacters(in: .whitespacesAndNewlines)) == nil {
+            missing.append("Episode")
+        }
+        if input.episodeTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            missing.append("Episode Title")
+        }
+        if input.summary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            missing.append("Summary")
+        }
+        return missing
+    }
+
+    private func chapterPlan(sequence: [RenderSequenceNode], boundaries: [BoundaryTransition]) -> [RenderChapter] {
+        let boundaryLookup = Dictionary(uniqueKeysWithValues: boundaries.map { ("\($0.fromNodeID)->\($0.toNodeID)", $0) })
+        var markers: [(title: String, startUS: Int64)] = []
+        var cursorUS: Int64 = 0
+
+        for index in sequence.indices {
+            let node = sequence[index]
+            if let chapterTitle = chapterTitle(for: node) {
+                markers.append((chapterTitle, cursorUS))
+            }
+
+            cursorUS += durationUS(for: node)
+            guard index < sequence.count - 1 else { continue }
+
+            let next = sequence[index + 1]
+            if let boundary = boundaryLookup["\(node.nodeID)->\(next.nodeID)"],
+               boundary.boundaryType == "answer_to_answer",
+               boundary.resolved.style == "soft_crossfade" {
+                cursorUS += boundary.requested.durationUS
+            }
+        }
+
+        let totalDurationUS = cursorUS
+        return markers.enumerated().compactMap { index, marker in
+            let endUS = index < markers.count - 1 ? markers[index + 1].startUS : totalDurationUS
+            guard endUS > marker.startUS else { return nil }
+            return RenderChapter(title: marker.title, startUS: marker.startUS, endUS: endUS)
+        }
+    }
+
+    private func chapterTitle(for node: RenderSequenceNode) -> String? {
+        switch node.type {
+        case .openingCard:
+            return (node.text?.title ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : node.text?.title
+        case .questionCard:
+            return node.questionText
+        case .closingCard:
+            return (node.text?.title ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : node.text?.title
+        case .answerClip:
+            return nil
+        }
+    }
+
+    private func durationUS(for node: RenderSequenceNode) -> Int64 {
+        if let template = node.template {
+            return Int64((template.durationSeconds * 1_000_000).rounded())
+        }
+        return node.timing?.durationUS ?? 0
+    }
+
     private func evaluateConfidence(for row: ManifestRow, issues: [AssemblyIssue]) -> Confidence {
         var reasons: [String] = []
         var level: ConfidenceLevel = .high
@@ -394,7 +506,9 @@ public struct RenderPlanBuilder {
         let confidences = sequence.compactMap(\.confidence?.level)
         let runtime = sequence.reduce(0.0) { partial, node in
             partial + (node.template?.durationSeconds ?? 0) + (node.timing.map { Double($0.durationUS) / 1_000_000 } ?? 0)
-        }
+        } + boundaries
+            .filter { $0.boundaryType == "answer_to_answer" && $0.resolved.style == "soft_crossfade" }
+            .reduce(0.0) { $0 + (Double($1.requested.durationUS) / 1_000_000) }
 
         return RenderPlanSummary(
             questionCount: questionCount,
