@@ -44,6 +44,21 @@ struct ContentView: View {
             .padding(20)
         }
         .frame(minWidth: 1360, minHeight: 940)
+        .alert(
+            "Interview Studio Warning",
+            isPresented: Binding(
+                get: { !appState.errorMessage.isEmpty },
+                set: { isPresented in
+                    if !isPresented {
+                        appState.errorMessage = ""
+                    }
+                }
+            )
+        ) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(appState.errorMessage)
+        }
     }
 
     private func projectHeader(_ project: LoadedManifestProject) -> some View {

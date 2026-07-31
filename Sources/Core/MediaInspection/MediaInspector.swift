@@ -41,8 +41,18 @@ public struct FFmpegCapabilities: Sendable {
     public var hasOverlay: Bool
     public var hasLibx265: Bool
 
+    public var missingPhaseOneCapabilities: [String] {
+        var missing: [String] = []
+        if !hasZscale { missing.append("zscale") }
+        if !hasXfade { missing.append("xfade") }
+        if !hasAcrossfade { missing.append("acrossfade") }
+        if !hasOverlay { missing.append("overlay") }
+        if !hasLibx265 { missing.append("libx265") }
+        return missing
+    }
+
     public var isSufficientForPhaseOne: Bool {
-        hasZscale && hasXfade && hasAcrossfade && hasOverlay && hasLibx265
+        missingPhaseOneCapabilities.isEmpty
     }
 }
 
@@ -77,39 +87,74 @@ public enum FFmpegLocatorError: LocalizedError {
 public struct FFmpegLocator {
     public init() {}
 
-    public func locate(bundleResourceURL: URL? = Bundle.main.resourceURL) throws -> FFmpegBinarySet {
-        if let bundleResourceURL {
-            let bundledTools = bundleResourceURL.appendingPathComponent("BundledTools", isDirectory: true)
-            let bundledFFmpeg = bundledTools.appendingPathComponent("ffmpeg")
-            let bundledFFprobe = bundledTools.appendingPathComponent("ffprobe")
-            if FileManager.default.isExecutableFile(atPath: bundledFFmpeg.path),
-               FileManager.default.isExecutableFile(atPath: bundledFFprobe.path) {
-                return FFmpegBinarySet(ffmpegURL: bundledFFmpeg, ffprobeURL: bundledFFprobe, sourceDescription: "app bundle")
+    public func candidates(bundleResourceURL: URL? = Bundle.main.resourceURL) -> [FFmpegBinarySet] {
+        var results: [FFmpegBinarySet] = []
+        var seenFFmpegPaths: Set<String> = []
+
+        func appendCandidate(ffmpegPath: String, ffprobePath: String, description: String) {
+            guard !ffmpegPath.isEmpty,
+                  !ffprobePath.isEmpty,
+                  FileManager.default.isExecutableFile(atPath: ffmpegPath),
+                  FileManager.default.isExecutableFile(atPath: ffprobePath) else {
+                return
             }
+
+            let normalizedFFmpegPath = URL(fileURLWithPath: ffmpegPath).standardizedFileURL.path
+            guard seenFFmpegPaths.insert(normalizedFFmpegPath).inserted else { return }
+            results.append(
+                FFmpegBinarySet(
+                    ffmpegURL: URL(fileURLWithPath: ffmpegPath),
+                    ffprobeURL: URL(fileURLWithPath: ffprobePath),
+                    sourceDescription: description
+                )
+            )
         }
 
-        let candidates: [(String, String, String)] = [
+        if let bundleResourceURL {
+            let bundledTools = bundleResourceURL.appendingPathComponent("BundledTools", isDirectory: true)
+            appendCandidate(
+                ffmpegPath: bundledTools.appendingPathComponent("ffmpeg").path,
+                ffprobePath: bundledTools.appendingPathComponent("ffprobe").path,
+                description: "app bundle"
+            )
+        }
+
+        let fixedCandidates: [(String, String, String)] = [
             (
                 ProcessInfo.processInfo.environment["YEARLY_INTERVIEW_STUDIO_FFMPEG"] ?? "",
                 ProcessInfo.processInfo.environment["YEARLY_INTERVIEW_STUDIO_FFPROBE"] ?? "",
                 "environment override"
             ),
             ("/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg", "/opt/homebrew/opt/ffmpeg-full/bin/ffprobe", "homebrew ffmpeg-full"),
-            ("/opt/homebrew/bin/ffmpeg", "/opt/homebrew/bin/ffprobe", "homebrew ffmpeg")
+            ("/opt/homebrew/bin/ffmpeg", "/opt/homebrew/bin/ffprobe", "homebrew ffmpeg"),
+            ("/usr/local/bin/ffmpeg", "/usr/local/bin/ffprobe", "usr-local ffmpeg"),
+            ("/opt/local/bin/ffmpeg", "/opt/local/bin/ffprobe", "MacPorts ffmpeg")
         ]
 
-        for (ffmpegPath, ffprobePath, description) in candidates where !ffmpegPath.isEmpty && !ffprobePath.isEmpty {
-            if FileManager.default.isExecutableFile(atPath: ffmpegPath),
-               FileManager.default.isExecutableFile(atPath: ffprobePath) {
-                return FFmpegBinarySet(
-                    ffmpegURL: URL(fileURLWithPath: ffmpegPath),
-                    ffprobeURL: URL(fileURLWithPath: ffprobePath),
-                    sourceDescription: description
-                )
-            }
+        for (ffmpegPath, ffprobePath, description) in fixedCandidates {
+            appendCandidate(ffmpegPath: ffmpegPath, ffprobePath: ffprobePath, description: description)
         }
 
-        throw FFmpegLocatorError.binariesMissing
+        let pathDirectories = (ProcessInfo.processInfo.environment["PATH"] ?? "")
+            .split(separator: ":")
+            .map(String.init)
+        for directory in pathDirectories {
+            let directoryURL = URL(fileURLWithPath: directory, isDirectory: true)
+            appendCandidate(
+                ffmpegPath: directoryURL.appendingPathComponent("ffmpeg").path,
+                ffprobePath: directoryURL.appendingPathComponent("ffprobe").path,
+                description: "PATH \(directory)"
+            )
+        }
+
+        return results
+    }
+
+    public func locate(bundleResourceURL: URL? = Bundle.main.resourceURL) throws -> FFmpegBinarySet {
+        guard let candidate = candidates(bundleResourceURL: bundleResourceURL).first else {
+            throw FFmpegLocatorError.binariesMissing
+        }
+        return candidate
     }
 }
 

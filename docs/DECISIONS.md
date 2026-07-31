@@ -29,3 +29,9 @@ Question title casing is now a display/render treatment stored in the sidecar an
 
 ## 2026-05-07 - Use temp storage for success-path render work and persist diagnostics only on failure or opt-in
 Renderer intermediates now live in an app-scoped system temp folder and are cleaned up on success or cancel, while persistent diagnostics are kept only for failures or when the user explicitly asks to preserve a successful run. This was chosen to stop filling Application Support with throwaway work products while keeping useful failure evidence. Status: approved.
+
+## 2026-07-31 - Keep GPL FFmpeg for now while deferring a replacement investigation
+Interview Studio will continue using the working GPL-enabled FFmpeg path for the current Phase 1 workflow. Replacing GPL FFmpeg entirely remains a future investigation for licensing, packaging, and distribution reasons, but it is deliberately out of scope while the current renderer remains useful and functional. Status: approved.
+
+## 2026-07-31 - Complete Phase 1 within the assembly-from-manifest scope
+Phase 1 is considered complete for its defined product boundary: importing prepared manifest-backed projects, reviewing the deterministic assembly plan, and exporting the locked HDR master plus optional Plex companion. Raw clip creation, manifest authoring, trimming, and timeline work remain future phases rather than unfinished Phase 1 requirements. Status: approved.

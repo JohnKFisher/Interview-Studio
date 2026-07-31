@@ -1,0 +1,167 @@
+{
+  "Package.swift": {
+    "mtime": 1777836402.4028504,
+    "ast_hash": "f3c530846293c8e3e72a8c331f21929a",
+    "semantic_hash": "f3c530846293c8e3e72a8c331f21929a"
+  },
+  "Sources/App/AppState.swift": {
+    "mtime": 1778162490.5936456,
+    "ast_hash": "6ee7f4a8513bdd1de9db291417666b6f",
+    "semantic_hash": "6ee7f4a8513bdd1de9db291417666b6f"
+  },
+  "Sources/App/ContentView.swift": {
+    "mtime": 1778162442.5566978,
+    "ast_hash": "b212ad66e93be20e0670753424610a21",
+    "semantic_hash": "b212ad66e93be20e0670753424610a21"
+  },
+  "Sources/App/PreviewRenderer.swift": {
+    "mtime": 1778162490.6328921,
+    "ast_hash": "97ced43d4075709246a27eb76fadc634",
+    "semantic_hash": "97ced43d4075709246a27eb76fadc634"
+  },
+  "Sources/App/StudioWindows.swift": {
+    "mtime": 1778162472.3060422,
+    "ast_hash": "379b73b48c55dd023c1db35809c3c773",
+    "semantic_hash": "379b73b48c55dd023c1db35809c3c773"
+  },
+  "Sources/App/YearlyInterviewStudioApp.swift": {
+    "mtime": 1778106551.242152,
+    "ast_hash": "c61ee92701d29d71f41701b320a09609",
+    "semantic_hash": "c61ee92701d29d71f41701b320a09609"
+  },
+  "Sources/CLI/main.swift": {
+    "mtime": 1778162503.4102862,
+    "ast_hash": "efbcc2ebc2757a8d84eea94bd54b2815",
+    "semantic_hash": "efbcc2ebc2757a8d84eea94bd54b2815"
+  },
+  "Sources/Core/Manifest/ManifestModels.swift": {
+    "mtime": 1777836606.516897,
+    "ast_hash": "9099b411938a66c590fe42da12297ef5",
+    "semantic_hash": "9099b411938a66c590fe42da12297ef5"
+  },
+  "Sources/Core/Manifest/ManifestParser.swift": {
+    "mtime": 1777835691.8687937,
+    "ast_hash": "b5ae24b62384ce20e9909ac8c3d6592b",
+    "semantic_hash": "b5ae24b62384ce20e9909ac8c3d6592b"
+  },
+  "Sources/Core/Manifest/ManifestPathResolver.swift": {
+    "mtime": 1777834941.5154715,
+    "ast_hash": "9d826d53fbb21ce728356e44e9cae8d8",
+    "semantic_hash": "9d826d53fbb21ce728356e44e9cae8d8"
+  },
+  "Sources/Core/MediaInspection/MediaInspector.swift": {
+    "mtime": 1777835780.928178,
+    "ast_hash": "714c90f5c4392566fb41cd7141c67e1f",
+    "semantic_hash": "714c90f5c4392566fb41cd7141c67e1f"
+  },
+  "Sources/Core/Project/ProjectDocument.swift": {
+    "mtime": 1778162069.678749,
+    "ast_hash": "fe3801ad4cb0e5c741a662c5672ea5f4",
+    "semantic_hash": "fe3801ad4cb0e5c741a662c5672ea5f4"
+  },
+  "Sources/Core/Project/QuestionGroupBuilder.swift": {
+    "mtime": 1777836626.293077,
+    "ast_hash": "64200e9f56508068dd6eb117f36a1da8",
+    "semantic_hash": "64200e9f56508068dd6eb117f36a1da8"
+  },
+  "Sources/Core/RenderPlan/AudioBoundaryAnalyzer.swift": {
+    "mtime": 1778106723.9762788,
+    "ast_hash": "adce0e95c83c8610d9d652af07684e18",
+    "semantic_hash": "adce0e95c83c8610d9d652af07684e18"
+  },
+  "Sources/Core/RenderPlan/PreviewSelection.swift": {
+    "mtime": 1778106415.8331265,
+    "ast_hash": "240897856d1cb8d44431f5ccaf85dd99",
+    "semantic_hash": "240897856d1cb8d44431f5ccaf85dd99"
+  },
+  "Sources/Core/RenderPlan/RenderPlanBuilder.swift": {
+    "mtime": 1778162110.2592585,
+    "ast_hash": "81bb04e5a22fbc94546be59a6bde76f3",
+    "semantic_hash": "81bb04e5a22fbc94546be59a6bde76f3"
+  },
+  "Sources/Core/RenderPlan/RenderPlanModels.swift": {
+    "mtime": 1778162248.9933937,
+    "ast_hash": "4e9256ffe6147eb680521f69e06aec7b",
+    "semantic_hash": "4e9256ffe6147eb680521f69e06aec7b"
+  },
+  "Sources/Core/RenderPlan/TransitionPlanner.swift": {
+    "mtime": 1778106322.0687754,
+    "ast_hash": "f6cb10a35bda129b13f805479e73bd23",
+    "semantic_hash": "f6cb10a35bda129b13f805479e73bd23"
+  },
+  "Sources/Core/Rendering/Renderer.swift": {
+    "mtime": 1778163561.0739725,
+    "ast_hash": "70a586a32fb6d93b80658582bf98c9e5",
+    "semantic_hash": "70a586a32fb6d93b80658582bf98c9e5"
+  },
+  "Sources/Core/Support/FlexibleDecoding.swift": {
+    "mtime": 1777835720.4528887,
+    "ast_hash": "a049f0a8b6172a55376e678b804350f9",
+    "semantic_hash": "a049f0a8b6172a55376e678b804350f9"
+  },
+  "Sources/Core/Support/JSONValue.swift": {
+    "mtime": 1777835211.0518863,
+    "ast_hash": "77abaa9f40f71ff3ed38d6c727d175a6",
+    "semantic_hash": "77abaa9f40f71ff3ed38d6c727d175a6"
+  },
+  "Sources/Core/Support/ProcessRunner.swift": {
+    "mtime": 1777841258.0978987,
+    "ast_hash": "fb5551042085aae87b474e0691eb1d67",
+    "semantic_hash": "fb5551042085aae87b474e0691eb1d67"
+  },
+  "Sources/Core/Support/TitleCaseFormatter.swift": {
+    "mtime": 1778162069.6419902,
+    "ast_hash": "71e5e0bcb40933915b35f9c44ddfd591",
+    "semantic_hash": "71e5e0bcb40933915b35f9c44ddfd591"
+  },
+  "Sources/Core/Templates/TemplateModels.swift": {
+    "mtime": 1777835211.135664,
+    "ast_hash": "b8263ccb5f35d3142bdba97142854a83",
+    "semantic_hash": "b8263ccb5f35d3142bdba97142854a83"
+  },
+  "Sources/Core/Templates/TemplateRenderer.swift": {
+    "mtime": 1778162495.6328795,
+    "ast_hash": "0eb656073f4809280f9326f42b54d800",
+    "semantic_hash": "0eb656073f4809280f9326f42b54d800"
+  },
+  "Tests/CoreTests/Fixtures/fixture_manifest.json": {
+    "mtime": 1777835623.8124423,
+    "ast_hash": "ef9e6ea040cddf3622453eefe32c4856",
+    "semantic_hash": "ef9e6ea040cddf3622453eefe32c4856"
+  },
+  "Tests/CoreTests/ManifestAndRenderPlanTests.swift": {
+    "mtime": 1778162546.8937378,
+    "ast_hash": "4dca2e722e394c0a0d8c0ad56ef463b9",
+    "semantic_hash": "4dca2e722e394c0a0d8c0ad56ef463b9"
+  },
+  "Tests/CoreTests/RendererTests.swift": {
+    "mtime": 1778163544.8795311,
+    "ast_hash": "8bd3f7ee9360ceab397425d4a1cdb6e7",
+    "semantic_hash": "8bd3f7ee9360ceab397425d4a1cdb6e7"
+  },
+  "Tests/CoreTests/TemplateRendererTests.swift": {
+    "mtime": 1778106641.2347164,
+    "ast_hash": "ecf37e0d07791c729837b9a4cfb09854",
+    "semantic_hash": "ecf37e0d07791c729837b9a4cfb09854"
+  },
+  "Tests/CoreTests/TestWorkspace.swift": {
+    "mtime": 1778106613.2424147,
+    "ast_hash": "7c03b73bf2295817ebfd8c354117bbee",
+    "semantic_hash": "7c03b73bf2295817ebfd8c354117bbee"
+  },
+  "docs/Historical/SAMPLE final_manifest.json": {
+    "mtime": 1777825252.7193208,
+    "ast_hash": "df367b7af636130da6df1e7f38796d07",
+    "semantic_hash": "df367b7af636130da6df1e7f38796d07"
+  },
+  "script/build_and_run.sh": {
+    "mtime": 1778162912.7023246,
+    "ast_hash": "14290d72ffc5b26abc5cfbfadda78557",
+    "semantic_hash": "14290d72ffc5b26abc5cfbfadda78557"
+  },
+  "script/generate_app_icon.swift": {
+    "mtime": 1778162624.906174,
+    "ast_hash": "b645398bd976b9592e17ca05ad60f610",
+    "semantic_hash": "b645398bd976b9592e17ca05ad60f610"
+  }
+}

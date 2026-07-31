@@ -4,7 +4,7 @@ Current version/build:
 - `0.1.2 (3)` in the current app bundle script and packaged app.
 
 Overall status:
-- Phase 1 Assembly Studio is now implemented as a working internal macOS app plus a shared core library and CLI.
+- Phase 1 Assembly Studio is complete for its defined assembly-from-manifest scope as a working internal macOS app plus a shared core library and CLI.
 - The app can import a manifest-backed project folder, build a deterministic render plan, surface issues/confidence, and export a real final movie.
 - The current phase is assembly-from-manifest only; creating source clips or building the manifest inside the app is future work.
 
@@ -18,8 +18,9 @@ What works now:
 - Main-window live previews for opening cards, question cards, and a real-frame answer overlay sample using the current project data, now loaded progressively with placeholders/stale-frame reuse instead of blocking the whole rebuild.
 - Dedicated Sequence and Issues windows reachable from both the main UI and the Window menu, with issue cards now surfacing question text, age context, and stable question keys.
 - Safer transition audio planning that prefers quiet seams or conservative fallback instead of leaking stray handle speech.
-- Verified smoke export to a real playable file using the locked Phase 1 contract: `3840x2160`, `60 fps`, `HEVC`, `yuv420p10le`, `BT.2020`, `bt2020nc`, `HLG`.
+- Verified smoke export and prior owner testing against actual project media using the locked Phase 1 contract: `3840x2160`, `60 fps`, `HEVC`, `yuv420p10le`, `BT.2020`, `bt2020nc`, `HLG`.
 - Build script that stages a testable macOS `.app` under `dist/Yearly Interview Studio.app`, bundles `ffmpeg`/`ffprobe` when found on the host, and now includes a real app icon.
+- Runtime FFmpeg discovery checks each executable candidate for the required Phase 1 filters/codecs and presents an actionable warning if no installed pair is capable.
 
 What is partial:
 - The app UI now has a better review loop, but it is still a compact Phase 1 interface rather than a polished studio-grade workflow.
@@ -40,14 +41,14 @@ What is not implemented yet:
 Known limitations and trust warnings:
 - Phase 1 supports one person per project only.
 - Phase 1 requires a prepared project folder with `final_manifest.json` and referenced media already in place.
-- HDR export depends on an FFmpeg build with the required filters/codecs available.
+- HDR export depends on an FFmpeg/FFprobe pair with the required filters/codecs available; the app now searches multiple installed candidates instead of trusting the first pair it finds.
 - Existing projects now default to Plex companion export on, which means export will block until the required Plex fields are filled or the feature is turned off for that project.
 - The current UI is intentionally conservative after a more ambitious SwiftUI screen triggered compiler instability during this pass.
-- Renderer smoke tests are opt-in in XCTest because they depend on local FFmpeg and graphical template rendering support.
+- Renderer smoke tests are opt-in in XCTest because they depend on local FFmpeg and graphical template rendering support. Actual project media has also been used for prior testing and has worked so far; rerunning the birthday projects after toolchain changes remains the owner check.
 
 Setup/runtime requirements:
 - macOS 14 or newer.
-- FFmpeg and FFprobe available either from the bundled app resources or from a compatible local installation.
+- FFmpeg and FFprobe available either from the bundled app resources or from a compatible local installation. The renderer searches the bundle, explicit environment overrides, common Homebrew/MacPorts locations, and PATH candidates.
 - For local Codex verification, diagnostics/output should point to writable paths; successful runs now clean temp intermediates by default and only preserve diagnostics on failure or explicit opt-in.
 
 Important operational risks:
@@ -56,7 +57,7 @@ Important operational risks:
 - The new Plex companion path depends on remux-compatible final audio/video streams and standard MP4 tag behavior; smoke verification covers the current implementation, but broader real-library validation is still prudent.
 
 Recommended next priorities:
-- Start designing the next phase that creates/adds clips and grows the manifest inside the app instead of assuming a fully prepared input folder.
+- Start designing the next phase that creates/adds clips and grows the manifest inside the app instead of assuming a fully prepared input folder; see [PHASE_2_PLAN.md](PHASE_2_PLAN.md).
 - Improve render throughput, especially for synthetic card segments and SDR-to-HLG normalization.
 - Expand the in-app Assembly Studio workflow with player-style QA, progress details, and deeper boundary review.
 - Move version/build values into dedicated source-controlled version files.

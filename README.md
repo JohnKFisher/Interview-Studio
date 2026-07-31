@@ -6,11 +6,11 @@ Right now it is focused on the assembly/export phase of that workflow: import a 
 
 ## Project Status
 
-Active development. Very incomplete.
+Phase 1 Assembly Studio is complete for its defined assembly-from-manifest scope. The broader product remains in active development because clip creation and manifest authoring are planned for a later phase. The current Phase 2 checklist is in [docs/PHASE_2_PLAN.md](docs/PHASE_2_PLAN.md).
 
 Built primarily for my own workflow, but possibly useful if you also have a manifest-driven interview pipeline and want a Mac-native finishing tool instead of stitching everything together by hand.
 
-This is still an early Phase 1 app. Large parts of the eventual workflow are missing, and the parts that do exist are still being actively reshaped.
+The current app is still intentionally narrow: it finishes prepared interview projects rather than creating the source clips from raw interviews.
 
 Right now this should be read as an in-progress app repo, not a finished product.
 
@@ -33,7 +33,7 @@ It does not yet create source clips, ingest raw media into this project format, 
 
 That broader workflow is intended for a later phase: tools to create clips, add clips, and build or extend the manifest inside the app instead of arriving with those pieces pre-generated.
 
-Phase 1 is intentionally narrow and still incomplete:
+Phase 1 is intentionally narrow; these are boundaries of the completed phase and the broader product:
 
 - one person per project
 - one locked export profile
@@ -81,7 +81,7 @@ Requirements:
 
 - macOS 14 or newer
 - Swift toolchain compatible with `swift-tools-version: 6.0`
-- `ffmpeg` and `ffprobe` available on your system if you want the packaged app build script to bundle them automatically
+- a compatible `ffmpeg`/`ffprobe` pair with `zscale`, `xfade`, `acrossfade`, `overlay`, and `libx265`; the app checks the bundled tools and other installed candidates until it finds a capable pair
 
 Build the app bundle:
 
@@ -128,11 +128,12 @@ The CLI expects the project folder to contain `final_manifest.json`. It prints p
 - `Tests/CoreTests` - focused tests for the shared core
 - `script/build_and_run.sh` - packaged app build/run helper
 - `docs/WHERE_WE_STAND.md` - plain-language current state
+- `docs/PHASE_2_PLAN.md` - current Clip Factory plan and checklist
 - `docs/DECISIONS.md` - decision log for durable project choices
 
 ## Notes On Packaging
 
-The packaged `.app` is built from source-controlled version values in `script/build_and_run.sh`, and the build script copies in an app icon plus bundled `ffmpeg` / `ffprobe` when those tools are available on the host machine.
+The packaged `.app` is built from source-controlled version values in `script/build_and_run.sh`, and the build script copies in an app icon plus bundled `ffmpeg` / `ffprobe` when those tools are available on the host machine. At runtime, the renderer preflights each discovered FFmpeg installation instead of assuming the first one is capable; if none is suitable, the app explains what is missing and asks the user to install a compatible build.
 
 This means the app is currently convenient for local use, but still early as a polished distribution story.
 

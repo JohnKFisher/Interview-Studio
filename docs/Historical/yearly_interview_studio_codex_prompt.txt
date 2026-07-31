@@ -1,0 +1,79 @@
+You are helping build a macOS app named Yearly Interview Studio.
+
+Read the attached planning docs first:
+1. yearly_interview_studio_codex_plan.md
+2. yearly_interview_studio_render_plan_schema.md
+3. SAMPLE final_manifest.json
+4. final_manifest_field_guide.md
+5. HDR_COLOR_REFERENCE.md
+
+Immediate task:
+Build as much of the complete Phase 1 Assembly Studio as possible in one pass, prioritizing a working macOS app that can actually generate a final playable movie file. Do not stop at schemas, mock renderer code, or a render-plan-only implementation.
+
+Core requirements:
+- Parse final_manifest.json into typed Swift models.
+- Resolve output_file paths relative to the selected manifest/export folder.
+- Filter usable rows: export_status exported or skipped_existing; status ready unless no status exists.
+- Group rows by question_key.
+- Sort questions by question_original_index.
+- Sort answer clips within each question by age_sort_key.
+- Preserve editable question display text separately from question_key.
+- Build a serializable RenderPlan matching the schema document.
+- Add opening_card, question_card, answer_clip, and closing_card nodes.
+- Generate explicit boundary transition objects.
+- Implement handle-aware transition planning for a 12-frame default soft crossfade, with clean-cut fallback.
+- Add issue objects with severity, code, human_message, ai_context, and suggested_fix.
+- Add confidence labels: high, medium, low, based on deterministic manifest fields.
+- Add render-plan summary counts.
+- Add unit tests using a small fixture manifest.
+
+Renderer requirements:
+- Implement a real FFmpeg-backed renderer.
+- It must generate a real playable movie file from the RenderPlan.
+- Start with ordered clip assembly if necessary, but do not leave the renderer as a stub.
+- Add full-screen question cards.
+- Add opening and closing screens.
+- Add persistent age overlays.
+- Add optional persistent question overlays.
+- Add global answer-to-answer transition handling.
+- Default to 12-frame soft crossfade.
+- Use real handles where available.
+- Generate renderer-owned synthetic padding when safe.
+- Fall back to clean cut only when needed.
+- Keep transitions consistent globally.
+- Add gentle loudness matching if feasible.
+- Target 4K 60fps HLG HDR, BT.2020, bt2020nc, HEVC Main10.
+- Use source-aware normalization based on HDR_COLOR_REFERENCE.md.
+- Do not rely on metadata-only HDR tagging.
+- Block export if HDR-safe rendering cannot be achieved.
+
+Staged build strategy:
+The goal is to complete all renderer capabilities in one implementation pass if possible. However, if unable to complete everything, leave the app in the most complete working state possible.
+
+Required minimum:
+- Parse final_manifest.json.
+- Build render plan.
+- Validate files.
+- Generate a real final video file from ordered clips.
+
+Then add, in priority order:
+1. Full-screen question cards, opening cards, closing cards, persistent age overlays, and optional persistent question overlays.
+2. Global answer-to-answer transition handling with 12-frame soft crossfade and clean-cut fallback.
+3. Gentle loudness matching without aggressive compression or noise reduction.
+4. HDR-aware export targeting 4K 60fps HLG HDR, BT.2020, bt2020nc, HEVC Main10.
+
+Fallback rule:
+A simpler working renderer is better than an ambitious non-working renderer. Do not leave only UI, schemas, or mock renderer code.
+
+Do not implement:
+- timeline UI
+- Phase 2 scrubbing/trimming
+- individual clip exclusion
+
+Important architecture rule:
+Phase 1 is an Assembly Studio with no timeline. Phase 2 will later be a Clip Factory that can scrub/trim long videos and produce new clips/manifests for Phase 1. Do not make choices that prevent Phase 2.
+
+When complete:
+- Create a full, working macOS .app I can test.
+- Include build/run instructions.
+- Include a short summary of what is implemented and what remains.

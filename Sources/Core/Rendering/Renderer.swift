@@ -60,11 +60,8 @@ public final class Renderer: @unchecked Sendable {
             try planData.write(to: workspace.tempRootURL.appendingPathComponent("render_plan.json"))
 
             progress(.init(phase: "preflight", detail: "Locating ffmpeg and verifying required filters/codecs."))
-            let binaries = try locator.locate()
-            let preflightResult = try preflight.run(using: binaries)
-            guard preflightResult.capabilities.isSufficientForPhaseOne else {
-                throw RendererError.ffmpegPreflightFailed("The selected ffmpeg build is missing one or more required Phase 1 capabilities (zscale, xfade, acrossfade, overlay, libx265).")
-            }
+            let preflightResult = try locatePhaseOneFFmpeg(progress: progress)
+            let binaries = preflightResult.binaries
 
             let answerNodes = plan.sequence.filter { $0.type == .answerClip }
             var inspections: [String: MediaInspectionResult] = [:]
@@ -205,6 +202,44 @@ public final class Renderer: @unchecked Sendable {
             }
             throw RendererError.renderFailed(message: error.localizedDescription, diagnosticsURL: diagnosticsURL)
         }
+    }
+
+    private func locatePhaseOneFFmpeg(
+        progress: @escaping @Sendable (RenderJobState) -> Void
+    ) throws -> FFmpegPreflightResult {
+        let candidates = locator.candidates()
+        guard !candidates.isEmpty else {
+            throw RendererError.ffmpegPreflightFailed(
+                "Interview Studio could not find an executable ffmpeg/ffprobe pair. Install FFmpeg and FFprobe, then try again."
+            )
+        }
+
+        var attempts: [String] = []
+        for (index, candidate) in candidates.enumerated() {
+            progress(
+                .init(
+                    phase: "preflight",
+                    detail: "Checking FFmpeg candidate \(index + 1) of \(candidates.count): \(candidate.sourceDescription)."
+                )
+            )
+
+            do {
+                let result = try preflight.run(using: candidate)
+                if result.capabilities.isSufficientForPhaseOne {
+                    return result
+                }
+
+                let missing = result.capabilities.missingPhaseOneCapabilities.joined(separator: ", ")
+                attempts.append("\(candidate.sourceDescription): missing \(missing)")
+            } catch {
+                attempts.append("\(candidate.sourceDescription): preflight failed (\(error.localizedDescription))")
+            }
+        }
+
+        let attemptSummary = attempts.isEmpty ? "No usable candidates were found." : attempts.joined(separator: "\n")
+        throw RendererError.ffmpegPreflightFailed(
+            "Interview Studio found FFmpeg installations, but none provides the capabilities required for Phase 1 rendering (zscale, xfade, acrossfade, overlay, libx265).\n\nChecked:\n\(attemptSummary)\n\nInstall a compatible FFmpeg/FFprobe build, such as Homebrew ffmpeg-full, then try again."
+        )
     }
 
     private func orderedFinalSegments(
