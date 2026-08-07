@@ -5,11 +5,16 @@ MODE="${1:-run}"
 APP_NAME="YearlyInterviewStudioApp"
 BUNDLE_NAME="Yearly Interview Studio"
 BUNDLE_ID="com.jkfisher.yearlyinterviewstudio"
-MIN_SYSTEM_VERSION="14.0"
-MARKETING_VERSION="0.1.2"
-BUILD_NUMBER="3"
+MIN_SYSTEM_VERSION="26.0"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+VERSION_SOURCE="$ROOT_DIR/Sources/Core/Support/AppVersion.swift"
+MARKETING_VERSION="$(sed -n 's/.*marketing = "\([^"]*\)".*/\1/p' "$VERSION_SOURCE")"
+BUILD_NUMBER="$(sed -n 's/.*build = "\([^"]*\)".*/\1/p' "$VERSION_SOURCE")"
+if [[ -z "$MARKETING_VERSION" || -z "$BUILD_NUMBER" ]]; then
+  echo "Could not read the app version from $VERSION_SOURCE." >&2
+  exit 1
+fi
 DIST_DIR="$ROOT_DIR/dist"
 SCRATCH_PATH="${TMPDIR:-/tmp}/interview-studio-build-$RANDOM"
 APP_BUNDLE="$DIST_DIR/$BUNDLE_NAME.app"
@@ -22,6 +27,11 @@ ICON_SOURCE="$ROOT_DIR/Sources/App/Resources/AppIcon.icns"
 
 SYSTEM_FFMPEG="$(command -v ffmpeg || true)"
 SYSTEM_FFPROBE="$(command -v ffprobe || true)"
+
+if [[ "$(uname -m)" != "arm64" ]]; then
+  echo "Yearly Interview Studio requires Apple Silicon (arm64)." >&2
+  exit 1
+fi
 
 pkill -x "$APP_NAME" >/dev/null 2>&1 || true
 pkill -x "$BUNDLE_NAME" >/dev/null 2>&1 || true
@@ -69,6 +79,23 @@ with path.open("wb") as handle:
             "LSMinimumSystemVersion": sys.argv[5],
             "NSHighResolutionCapable": True,
             "NSPrincipalClass": "NSApplication",
+            "NSPhotoLibraryUsageDescription": "Yearly Interview Studio needs access to the Photos videos you explicitly choose to import.",
+            "NSSpeechRecognitionUsageDescription": "Yearly Interview Studio can transcribe an interview on this Mac when you explicitly start analysis.",
+            "CFBundleDocumentTypes": [
+                {
+                    "CFBundleTypeName": "Yearly Interview Studio Project",
+                    "CFBundleTypeRole": "Editor",
+                    "LSItemContentTypes": ["com.jkfisher.yearly-interview-studio.project"],
+                }
+            ],
+            "UTExportedTypeDeclarations": [
+                {
+                    "UTTypeIdentifier": "com.jkfisher.yearly-interview-studio.project",
+                    "UTTypeDescription": "Yearly Interview Studio project",
+                    "UTTypeConformsTo": ["com.apple.package"],
+                    "UTTypeTagSpecification": {"public.filename-extension": ["interviewstudio"]},
+                }
+            ],
         },
         handle,
     )

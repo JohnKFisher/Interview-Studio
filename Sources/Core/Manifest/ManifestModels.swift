@@ -103,6 +103,38 @@ public struct SourcePart: Codable, Hashable, Sendable {
         case handleAfterStatus = "handle_after_status"
     }
 
+    public init(
+        partIndex: Int,
+        sourceArchiveMember: String? = nil,
+        sourceFile: String? = nil,
+        sourceUUID: String? = nil,
+        sourceIsDolby: Bool = false,
+        parsedSourceInUS: Int64? = nil,
+        parsedSourceOutUS: Int64? = nil,
+        sourceDurationUS: Int64? = nil,
+        exportSourceInUS: Int64? = nil,
+        exportSourceOutUS: Int64? = nil,
+        actualHandleBeforeUS: Int64? = nil,
+        actualHandleAfterUS: Int64? = nil,
+        handleBeforeStatus: String? = nil,
+        handleAfterStatus: String? = nil
+    ) {
+        self.partIndex = partIndex
+        self.sourceArchiveMember = sourceArchiveMember
+        self.sourceFile = sourceFile
+        self.sourceUUID = sourceUUID
+        self.sourceIsDolby = sourceIsDolby
+        self.parsedSourceInUS = parsedSourceInUS
+        self.parsedSourceOutUS = parsedSourceOutUS
+        self.sourceDurationUS = sourceDurationUS
+        self.exportSourceInUS = exportSourceInUS
+        self.exportSourceOutUS = exportSourceOutUS
+        self.actualHandleBeforeUS = actualHandleBeforeUS
+        self.actualHandleAfterUS = actualHandleAfterUS
+        self.handleBeforeStatus = handleBeforeStatus
+        self.handleAfterStatus = handleAfterStatus
+    }
+
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         partIndex = try container.decodeLossyInt(forKey: .partIndex) ?? 0
@@ -210,6 +242,90 @@ public struct ManifestRow: Codable, Hashable, Sendable, Identifiable {
         case durationDriftUS = "duration_drift_us"
         case sourcePartCount = "source_part_count"
         case sourceParts = "source_parts"
+    }
+
+    public init(
+        clipNumber: String,
+        sequenceIndex: Int? = nil,
+        person: String,
+        personKey: String,
+        question: String,
+        questionKey: String,
+        questionOriginalIndex: Int? = nil,
+        age: String,
+        ageRawText: String? = nil,
+        ageKey: String,
+        ageYears: Double? = nil,
+        ageSortKey: Double? = nil,
+        outputFile: String,
+        outputPath: String? = nil,
+        exportStatus: String = "exported",
+        status: String? = "ready",
+        parserConfidence: ManifestParserConfidence? = .high,
+        warnings: String = "",
+        notes: String = "",
+        sourceIsDolby: Bool = false,
+        hdrDolbyValidation: String = "unknown",
+        sourceVideoSignature: ManifestVideoSignature? = nil,
+        outputVideoSignature: ManifestVideoSignature? = nil,
+        requestedHandleBeforeUS: Int64 = 0,
+        requestedHandleAfterUS: Int64 = 0,
+        actualHandleBeforeUS: Int64 = 0,
+        actualHandleAfterUS: Int64 = 0,
+        syntheticHandleBeforeUS: Int64 = 0,
+        syntheticHandleAfterUS: Int64 = 0,
+        handleBeforeStatus: String = "none",
+        handleAfterStatus: String = "none",
+        syntheticHandleBeforeStatus: String = "none",
+        syntheticHandleAfterStatus: String = "none",
+        realMediaStartInOutputUS: Int64 = 0,
+        realMediaEndInOutputUS: Int64 = 0,
+        answerStartInOutputUS: Int64 = 0,
+        answerEndInOutputUS: Int64 = 0,
+        durationDriftUS: Int64? = nil,
+        sourcePartCount: Int = 1,
+        sourceParts: [SourcePart] = []
+    ) {
+        self.clipNumber = clipNumber
+        self.sequenceIndex = sequenceIndex
+        self.person = person
+        self.personKey = personKey
+        self.question = question
+        self.questionKey = questionKey
+        self.questionOriginalIndex = questionOriginalIndex
+        self.age = age
+        self.ageRawText = ageRawText
+        self.ageKey = ageKey
+        self.ageYears = ageYears
+        self.ageSortKey = ageSortKey
+        self.outputFile = outputFile
+        self.outputPath = outputPath
+        self.exportStatus = exportStatus
+        self.status = status
+        self.parserConfidence = parserConfidence
+        self.warnings = warnings
+        self.notes = notes
+        self.sourceIsDolby = sourceIsDolby
+        self.hdrDolbyValidation = hdrDolbyValidation
+        self.sourceVideoSignature = sourceVideoSignature
+        self.outputVideoSignature = outputVideoSignature
+        self.requestedHandleBeforeUS = requestedHandleBeforeUS
+        self.requestedHandleAfterUS = requestedHandleAfterUS
+        self.actualHandleBeforeUS = actualHandleBeforeUS
+        self.actualHandleAfterUS = actualHandleAfterUS
+        self.syntheticHandleBeforeUS = syntheticHandleBeforeUS
+        self.syntheticHandleAfterUS = syntheticHandleAfterUS
+        self.handleBeforeStatus = handleBeforeStatus
+        self.handleAfterStatus = handleAfterStatus
+        self.syntheticHandleBeforeStatus = syntheticHandleBeforeStatus
+        self.syntheticHandleAfterStatus = syntheticHandleAfterStatus
+        self.realMediaStartInOutputUS = realMediaStartInOutputUS
+        self.realMediaEndInOutputUS = realMediaEndInOutputUS
+        self.answerStartInOutputUS = answerStartInOutputUS
+        self.answerEndInOutputUS = answerEndInOutputUS
+        self.durationDriftUS = durationDriftUS
+        self.sourcePartCount = sourcePartCount
+        self.sourceParts = sourceParts
     }
 
     public init(from decoder: Decoder) throws {

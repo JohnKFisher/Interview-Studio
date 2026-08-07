@@ -1,4 +1,4 @@
-import Core
+@testable import Core
 import XCTest
 
 final class FFmpegTests: XCTestCase {

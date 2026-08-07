@@ -41,6 +41,20 @@ public struct FFmpegCapabilities: Sendable {
     public var hasOverlay: Bool
     public var hasLibx265: Bool
 
+    public init(
+        hasZscale: Bool,
+        hasXfade: Bool,
+        hasAcrossfade: Bool,
+        hasOverlay: Bool,
+        hasLibx265: Bool
+    ) {
+        self.hasZscale = hasZscale
+        self.hasXfade = hasXfade
+        self.hasAcrossfade = hasAcrossfade
+        self.hasOverlay = hasOverlay
+        self.hasLibx265 = hasLibx265
+    }
+
     public var missingPhaseOneCapabilities: [String] {
         var missing: [String] = []
         if !hasZscale { missing.append("zscale") }
