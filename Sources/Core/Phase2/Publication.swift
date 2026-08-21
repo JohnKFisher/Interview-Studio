@@ -7,6 +7,7 @@ public enum NativePublishingError: LocalizedError, Sendable {
     case unsupportedMultiPart(String)
     case sourceMissing(String)
     case exportFailed(String)
+    case outputAlreadyExists(URL)
     case outputProfileMismatch(String)
     case manifestBlocked(String)
 
@@ -17,6 +18,7 @@ public enum NativePublishingError: LocalizedError, Sendable {
         case .unsupportedMultiPart(let key): return "Multi-part answer \(key) requires the Phase 2 compositor and cannot be published by this pass."
         case .sourceMissing(let path): return "The selected source recording is missing: \(path)"
         case .exportFailed(let message): return "Native answer export failed: \(message)"
+        case .outputAlreadyExists(let url): return "The answer output already exists and was not overwritten: \(url.path)"
         case .outputProfileMismatch(let message): return "Native answer output did not meet the protected publication profile: \(message)"
         case .manifestBlocked(let message): return "The generated manifest is blocked: \(message)"
         }
@@ -46,7 +48,10 @@ public struct NativeAnswerPublisher: Sendable {
         self.recipe = recipe
     }
 
-    public func generate(part: AnswerPart, sourceURL: URL, outputURL: URL) async throws {
+    public func generate(part: AnswerPart, sourceURL: URL, outputURL: URL) async throws -> NativeMediaInspection {
+        guard !FileManager.default.fileExists(atPath: outputURL.path) else {
+            throw NativePublishingError.outputAlreadyExists(outputURL)
+        }
         guard let boundaries = part.refinedBoundaries ?? refinedFallback(for: part.rawMarkers) else {
             throw NativePublishingError.exportFailed("The answer has no usable boundaries.")
         }
@@ -74,7 +79,6 @@ public struct NativeAnswerPublisher: Sendable {
         }
 
         try FileManager.default.createDirectory(at: outputURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-        if FileManager.default.fileExists(atPath: outputURL.path) { try FileManager.default.removeItem(at: outputURL) }
         let preset = AVAssetExportPresetHEVC3840x2160
         guard let exporter = AVAssetExportSession(asset: composition, presetName: preset) else {
             throw NativePublishingError.exportFailed("The system does not provide \(preset).")
@@ -86,7 +90,7 @@ public struct NativeAnswerPublisher: Sendable {
         guard exporter.status == .completed else {
             throw NativePublishingError.exportFailed(exporter.error?.localizedDescription ?? "Unknown export error.")
         }
-        try validate(outputURL: outputURL)
+        return try validate(outputURL: outputURL, expectedDuration: duration)
     }
 
     private func refinedFallback(for markers: RawAnswerMarkers) -> RefinedBoundaries? {
@@ -94,16 +98,28 @@ public struct NativeAnswerPublisher: Sendable {
         return RefinedBoundaries(visibleStart: start, visibleEnd: end, safeLeadingStart: start, safeTrailingEnd: end, confidence: 0.4, reasons: ["Native fallback used raw markers."], algorithmIdentifier: "raw-marker-fallback", algorithmVersion: "1.0")
     }
 
-    private func validate(outputURL: URL) throws {
-        let asset = AVURLAsset(url: outputURL)
-        guard let video = asset.tracks(withMediaType: .video).first else { throw NativePublishingError.outputProfileMismatch("No video track.") }
-        let size = video.naturalSize
-        guard Int(abs(size.width.rounded())) == recipe.width, Int(abs(size.height.rounded())) == recipe.height else {
-            throw NativePublishingError.outputProfileMismatch("Expected \(recipe.width)x\(recipe.height), got \(Int(abs(size.width.rounded())))x\(Int(abs(size.height.rounded()))).")
+    private func validate(outputURL: URL, expectedDuration: CMTime) throws -> NativeMediaInspection {
+        let inspection: NativeMediaInspection
+        do {
+            inspection = try NativeMediaInspector().inspect(url: outputURL)
+        } catch {
+            throw NativePublishingError.outputProfileMismatch(error.localizedDescription)
         }
-        guard Double(video.nominalFrameRate) >= Double(recipe.frameRate - 1) else {
-            throw NativePublishingError.outputProfileMismatch("Expected \(recipe.frameRate) fps, got \(video.nominalFrameRate).")
+        guard inspection.hasVideo, inspection.hasAudio, inspection.audioChannels > 0 else {
+            throw NativePublishingError.outputProfileMismatch("The validated output must contain both video and audio.")
         }
+        guard inspection.width == recipe.width, inspection.height == recipe.height else {
+            throw NativePublishingError.outputProfileMismatch("Expected \(recipe.width)x\(recipe.height), got \(inspection.width)x\(inspection.height).")
+        }
+        guard abs(inspection.nominalFrameRate - Double(recipe.frameRate)) <= 1 else {
+            throw NativePublishingError.outputProfileMismatch("Expected \(recipe.frameRate) fps, got \(inspection.nominalFrameRate).")
+        }
+        let expectedDurationUS = Int64((expectedDuration.seconds * 1_000_000).rounded())
+        let durationToleranceUS = max(50_000, Int64((2_000_000.0 / Double(recipe.frameRate)).rounded()))
+        guard abs(inspection.duration.microseconds - expectedDurationUS) <= durationToleranceUS else {
+            throw NativePublishingError.outputProfileMismatch("Expected approximately \(expectedDurationUS) microseconds, got \(inspection.duration.microseconds).")
+        }
+        return inspection
     }
 }
 
@@ -140,11 +156,25 @@ public struct ManifestPublicationBuilder: Sendable {
             guard let recording = session.recordings.first(where: { $0.id == part.sourceRecordingID }) else { throw NativePublishingError.sourceMissing(part.sourceRecordingID.uuidString) }
             let sourceURL = try store.resolve(relativePath: recording.packageRelativePath)
             guard FileManager.default.fileExists(atPath: sourceURL.path) else { throw NativePublishingError.sourceMissing(recording.packageRelativePath) }
-            let relativeOutput = "Answers/\(question.questionKey)/\(project.person.readableKey)--\(session.ageKey)--\(question.questionKey).mov"
-            let outputURL = root.appendingPathComponent(relativeOutput)
-            try await answerPublisher.generate(part: part, sourceURL: sourceURL, outputURL: outputURL)
-            let duration = (try? NativeMediaInspector().inspect(url: outputURL).duration.microseconds) ?? 0
+            let safeQuestionKey = InterviewStudioKey.safeFilenameComponent(question.questionKey, fallback: "question")
+            let safePersonKey = InterviewStudioKey.safeFilenameComponent(project.person.readableKey, fallback: "person")
+            let safeAgeKey = InterviewStudioKey.safeFilenameComponent(session.ageKey, fallback: "age")
+            let relativeOutput = "Answers/\(safeQuestionKey)/\(safePersonKey)--\(safeAgeKey)--\(safeQuestionKey).mov"
+            let outputURL = root.appendingPathComponent(relativeOutput).standardizedFileURL
+            guard outputURL.path.hasPrefix(root.standardizedFileURL.path + "/") else {
+                throw NativePublishingError.manifestBlocked("The generated answer path escaped the publication root.")
+            }
+            let outputInspection = try await answerPublisher.generate(part: part, sourceURL: sourceURL, outputURL: outputURL)
+            let duration = outputInspection.duration.microseconds
             let boundaries = part.refinedBoundaries
+            let outputSignature = ManifestVideoSignature(entries: [
+                .init(
+                    colorSpace: outputInspection.colorMatrix,
+                    colorTransfer: outputInspection.colorTransfer,
+                    colorPrimaries: outputInspection.colorPrimaries,
+                    sideDataTypes: outputInspection.hdrMetadataSummary.map { [$0] } ?? []
+                )
+            ])
             let row = ManifestRow(
                 clipNumber: String(clipNumber),
                 sequenceIndex: questionIndex,
@@ -162,15 +192,16 @@ public struct ManifestPublicationBuilder: Sendable {
                 exportStatus: "exported",
                 status: "ready",
                 parserConfidence: take.confidence.map { $0 >= 0.8 ? .high : .medium },
-                notes: "Native Phase 2 answer clip; source SHA-256 \(recording.mediaSignature.sha256).",
+                notes: "Native Phase 2 answer clip re-inspected after export; source SHA-256 \(recording.mediaSignature.sha256).",
                 sourceIsDolby: (recording.mediaSignature.colorTransfer ?? "").localizedCaseInsensitiveContains("2084"),
                 hdrDolbyValidation: "pending_owner_validation",
+                outputVideoSignature: outputSignature,
                 requestedHandleBeforeUS: boundaries.map { max(0, $0.visibleStart.microseconds - $0.safeLeadingStart.microseconds) } ?? 0,
                 requestedHandleAfterUS: boundaries.map { max(0, $0.safeTrailingEnd.microseconds - $0.visibleEnd.microseconds) } ?? 0,
                 actualHandleBeforeUS: boundaries.map { max(0, $0.visibleStart.microseconds - $0.safeLeadingStart.microseconds) } ?? 0,
                 actualHandleAfterUS: boundaries.map { max(0, $0.safeTrailingEnd.microseconds - $0.visibleEnd.microseconds) } ?? 0,
-                handleBeforeStatus: "verified",
-                handleAfterStatus: "verified",
+                handleBeforeStatus: "derived_from_validated_export_range",
+                handleAfterStatus: "derived_from_validated_export_range",
                 realMediaStartInOutputUS: boundaries?.visibleStart.microseconds ?? 0,
                 realMediaEndInOutputUS: boundaries?.visibleEnd.microseconds ?? duration,
                 answerStartInOutputUS: boundaries?.visibleStart.microseconds ?? 0,

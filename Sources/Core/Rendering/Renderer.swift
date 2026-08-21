@@ -579,7 +579,7 @@ public final class Renderer: @unchecked Sendable {
         outputURL: URL,
         profile: ExportProfile
     ) -> [String] {
-        var args = ["-hide_banner", "-loglevel", "error", "-nostdin", "-y"]
+        var args = ["-hide_banner", "-loglevel", "error", "-nostdin", "-n"]
         for input in inputs {
             args.append(contentsOf: input)
         }
@@ -612,7 +612,7 @@ public final class Renderer: @unchecked Sendable {
             "-hide_banner",
             "-loglevel", "error",
             "-nostdin",
-            "-y",
+            "-n",
             "-f", "concat",
             "-safe", "0",
             "-i", concatFileURL.path,
@@ -774,7 +774,7 @@ public final class Renderer: @unchecked Sendable {
             "-hide_banner",
             "-loglevel", "error",
             "-nostdin",
-            "-y",
+            "-n",
             "-i", masterOutputURL.path,
             "-f", "ffmetadata",
             "-i", chapterMetadataURL.path,

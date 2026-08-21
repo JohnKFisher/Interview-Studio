@@ -44,19 +44,26 @@ mkdir -p "$APP_MACOS" "$APP_RESOURCES/BundledTools"
 cp "$BUILD_BINARY" "$APP_BINARY"
 chmod +x "$APP_BINARY"
 
-if [[ -n "$SYSTEM_FFMPEG" ]]; then
+if [[ -n "$SYSTEM_FFMPEG" && -n "$SYSTEM_FFPROBE" ]]; then
   cp "$SYSTEM_FFMPEG" "$APP_RESOURCES/BundledTools/ffmpeg"
-  chmod +x "$APP_RESOURCES/BundledTools/ffmpeg"
-fi
-
-if [[ -n "$SYSTEM_FFPROBE" ]]; then
   cp "$SYSTEM_FFPROBE" "$APP_RESOURCES/BundledTools/ffprobe"
-  chmod +x "$APP_RESOURCES/BundledTools/ffprobe"
+  chmod +x "$APP_RESOURCES/BundledTools/ffmpeg" "$APP_RESOURCES/BundledTools/ffprobe"
+  {
+    echo "bundle_status=host_tools_copied_for_local_build"
+    echo "ffmpeg_version=$("$SYSTEM_FFMPEG" -version | sed -n '1p')"
+    echo "ffprobe_version=$("$SYSTEM_FFPROBE" -version | sed -n '1p')"
+    echo "ffmpeg_sha256=$(shasum -a 256 "$SYSTEM_FFMPEG" | awk '{print $1}')"
+    echo "ffprobe_sha256=$(shasum -a 256 "$SYSTEM_FFPROBE" | awk '{print $1}')"
+  } > "$APP_RESOURCES/BundledTools/PROVENANCE.txt"
+else
+  echo "FFmpeg and FFprobe were not bundled because a complete pair was not found; runtime discovery will use other candidates." >&2
+  echo "bundle_status=not_bundled_incomplete_host_pair" > "$APP_RESOURCES/BundledTools/PROVENANCE.txt"
 fi
 
 if [[ -f "$ICON_SOURCE" ]]; then
   cp "$ICON_SOURCE" "$APP_RESOURCES/AppIcon.icns"
 fi
+cp "$ROOT_DIR/ATTRIBUTIONS.md" "$APP_RESOURCES/ATTRIBUTIONS.md"
 
 /usr/bin/env python3 - <<'PY' "$INFO_PLIST" "$APP_NAME" "$BUNDLE_ID" "$BUNDLE_NAME" "$MIN_SYSTEM_VERSION" "$MARKETING_VERSION" "$BUILD_NUMBER"
 from pathlib import Path
@@ -101,7 +108,11 @@ with path.open("wb") as handle:
     )
 PY
 
-/usr/bin/codesign --force --sign - --deep "$APP_BUNDLE" >/dev/null 2>&1 || true
+if /usr/bin/codesign --force --sign - --deep "$APP_BUNDLE" >/dev/null 2>&1; then
+  echo "Applied ad hoc signing to $APP_BUNDLE"
+else
+  echo "Warning: ad hoc signing failed; the app bundle is unsigned and is not distribution-ready." >&2
+fi
 
 open_app() {
   /usr/bin/open -n "$APP_BUNDLE"

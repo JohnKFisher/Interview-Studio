@@ -4,6 +4,22 @@ import AppKit
 import Core
 import SwiftUI
 
+private final class PlayerObservationLifetime {
+    var player: AVPlayer?
+    var periodic: Any?
+    var boundary: Any?
+
+    func invalidate() {
+        if let periodic, let player { player.removeTimeObserver(periodic) }
+        if let boundary, let player { player.removeTimeObserver(boundary) }
+        periodic = nil
+        boundary = nil
+        player = nil
+    }
+
+    deinit { invalidate() }
+}
+
 @MainActor
 final class InterviewStudioWorkspaceModel: ObservableObject {
     @Published var project: InterviewStudioProject
@@ -17,8 +33,20 @@ final class InterviewStudioWorkspaceModel: ObservableObject {
     @Published var progressMessage: String?
     @Published var isBusy = false
     @Published var renderPlan: RenderPlan?
+    @Published var waveform: WaveformData?
+    @Published var isLoadingWaveform = false
+    @Published var waveformMessage: String?
+    @Published var isTranscribing = false
+    @Published var isBulkTranscribing = false
+    @Published var transcriptionMessage: String?
+    @Published var isAddingYear = false
 
     weak var document: InterviewStudioDocument?
+    private var transcriptionTask: Task<Void, Never>?
+    private var bulkTranscriptionTask: Task<Void, Never>?
+    private let speechTranscriber = SpeechTranscriptionService()
+    let newInterviewYearDraft = NewInterviewYearDraft()
+    private let playerObservation = PlayerObservationLifetime()
 
     init(document: InterviewStudioDocument) {
         self.document = document
@@ -42,6 +70,30 @@ final class InterviewStudioWorkspaceModel: ObservableObject {
         return selectedSession.answers[selectedQuestionKey]
     }
 
+    var selectedAnswerPart: AnswerPart? {
+        selectedAnswer?.selectedTake?.parts.first { $0.sourceRecordingID == selectedRecording?.id }
+            ?? selectedAnswer?.selectedTake?.parts.first
+    }
+
+    var selectedTimelineRange: SelectedTimelineRange? {
+        guard let recording = selectedRecording else { return nil }
+        let duration = waveform?.durationUS ?? recording.mediaSignature.durationMicroseconds ?? 0
+        guard duration > 0 else { return nil }
+        let part = selectedAnswerPart
+        let boundaries = part?.refinedBoundaries
+        let rawStart = part?.rawMarkers.answerStart?.microseconds
+        let rawEnd = part?.rawMarkers.answerEnd?.microseconds
+        let visibleStart = boundaries?.visibleStart.microseconds ?? rawStart ?? 0
+        let visibleEnd = boundaries?.visibleEnd.microseconds ?? rawEnd ?? duration
+        return SelectedTimelineRange(
+            durationUS: duration,
+            visibleStartUS: min(max(visibleStart, 0), duration),
+            visibleEndUS: min(max(visibleEnd, visibleStart), duration),
+            safeLeadingStartUS: boundaries?.safeLeadingStart.microseconds,
+            safeTrailingEndUS: boundaries?.safeTrailingEnd.microseconds
+        )
+    }
+
     var selectedRecording: SourceRecording? {
         guard let selectedSession else { return nil }
         if let answerRecordingID = selectedAnswer?.selectedTake?.parts.first?.sourceRecordingID,
@@ -49,6 +101,25 @@ final class InterviewStudioWorkspaceModel: ObservableObject {
             return answerRecording
         }
         return selectedSession.recordings.first { $0.id == selectedRecordingID } ?? selectedSession.recordings.first
+    }
+
+    var selectedRecordingURL: URL? {
+        guard let store = document?.packageStore, let recording = selectedRecording else { return nil }
+        return try? store.resolve(relativePath: recording.packageRelativePath)
+    }
+
+    var mediaAnalysisID: String {
+        "\(selectedSessionID?.uuidString ?? "none"):\(selectedQuestionKey ?? "none"):\(selectedRecording?.id.uuidString ?? "none")"
+    }
+
+    var selectedTranscript: AnswerTranscript? {
+        guard let transcript = selectedAnswer?.transcript else { return nil }
+        guard transcript.sourceRecordingID == nil || transcript.sourceRecordingID == selectedRecording?.id else { return nil }
+        return transcript
+    }
+
+    var canTranscribeSelectedRecording: Bool {
+        selectedRecordingURL != nil && selectedAnswer?.state != .skipped && !isBulkTranscribing
     }
 
     var isLegacyImport: Bool {
@@ -61,15 +132,306 @@ final class InterviewStudioWorkspaceModel: ObservableObject {
         document?.apply(project: project, sessions: sessions)
     }
 
+    func prepareMediaAnalysis() async {
+        transcriptionTask?.cancel()
+        transcriptionTask = nil
+        isTranscribing = false
+        isLoadingWaveform = false
+        waveform = nil
+        waveformMessage = nil
+        transcriptionMessage = nil
+
+        guard let url = selectedRecordingURL else { return }
+        let analysisID = mediaAnalysisID
+        isLoadingWaveform = true
+        do {
+            let waveform = try await Task.detached(priority: .userInitiated) {
+                try await AudioWaveformAnalyzer().analyze(url: url)
+            }.value
+            guard analysisID == mediaAnalysisID else { return }
+            self.waveform = waveform
+        } catch is CancellationError {
+            return
+        } catch {
+            guard analysisID == mediaAnalysisID else { return }
+            waveformMessage = error.localizedDescription
+        }
+        if analysisID == mediaAnalysisID {
+            isLoadingWaveform = false
+        }
+    }
+
+    func transcribeSelectedRecording() {
+        guard !isBulkTranscribing else {
+            transcriptionMessage = "Project-wide transcription is already running."
+            return
+        }
+        guard let url = selectedRecordingURL, let recording = selectedRecording, let questionKey = selectedQuestionKey else {
+            transcriptionMessage = "Select a recording before transcribing."
+            return
+        }
+        guard canTranscribeSelectedRecording else {
+            transcriptionMessage = "Skipped answers do not have a recording to transcribe."
+            return
+        }
+
+        transcriptionTask?.cancel()
+        let analysisID = mediaAnalysisID
+        isTranscribing = true
+        transcriptionMessage = nil
+        transcriptionTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer {
+                if self.mediaAnalysisID == analysisID {
+                    self.isTranscribing = false
+                    self.transcriptionTask = nil
+                }
+            }
+
+            do {
+                let transcript = try await self.speechTranscriber.transcribe(
+                    url: url,
+                    sourceRecordingID: recording.id,
+                    localeIdentifier: self.project.person.localeIdentifier
+                )
+                guard self.mediaAnalysisID == analysisID,
+                      let sessionIndex = self.sessions.firstIndex(where: { $0.id == self.selectedSessionID }) else { return }
+                var answer = self.sessions[sessionIndex].answers[questionKey] ?? InterviewAnswer(questionKey: questionKey)
+                answer.transcript = transcript
+                self.sessions[sessionIndex].answers[questionKey] = answer
+                self.flushToDocument()
+
+                if let store = self.document?.packageStore {
+                    try store.writeSession(self.sessions[sessionIndex])
+                    try store.rebuildInventory()
+                }
+            } catch is CancellationError {
+                return
+            } catch {
+                guard self.mediaAnalysisID == analysisID else { return }
+                self.transcriptionMessage = error.localizedDescription
+            }
+        }
+    }
+
+    var missingTranscriptionSummary: TranscriptionBatchSummary {
+        let plan = makeMissingTranscriptionPlan()
+        return TranscriptionBatchSummary(candidateCount: plan.candidates.count, skippedCount: plan.skippedCount)
+    }
+
+    func transcribeMissingAnswers() {
+        guard !isTranscribing, !isBulkTranscribing else {
+            transcriptionMessage = "A transcription is already running."
+            return
+        }
+
+        let plan = makeMissingTranscriptionPlan()
+        guard !plan.candidates.isEmpty else {
+            progressMessage = "No missing transcripts with usable selected recordings were found."
+            return
+        }
+
+        isBulkTranscribing = true
+        transcriptionMessage = nil
+        progressMessage = "Transcribing 0 of \(plan.candidates.count) missing answers…"
+        bulkTranscriptionTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            var completedCount = 0
+            var failures: [String] = []
+            var stoppedByAuthorization = false
+            var cancelled = false
+
+            defer {
+                self.isBulkTranscribing = false
+                self.bulkTranscriptionTask = nil
+
+                if cancelled {
+                    self.progressMessage = "Transcription cancelled after \(completedCount) of \(plan.candidates.count) answers."
+                } else {
+                    self.progressMessage = "Transcription finished: \(completedCount) of \(plan.candidates.count) answers."
+                }
+
+                if plan.skippedCount > 0 {
+                    self.progressMessage? += " \(plan.skippedCount) answer(s) were skipped because no usable selected recording was available."
+                }
+                if stoppedByAuthorization {
+                    self.transcriptionMessage = "Transcription stopped: \(failures.first ?? "Speech recognition is not available.")"
+                } else if !failures.isEmpty {
+                    let visibleFailures = failures.prefix(3).joined(separator: "\n")
+                    let remaining = failures.count > 3 ? "\n…and \(failures.count - 3) more." : ""
+                    self.transcriptionMessage = "Some answers could not be transcribed:\n\(visibleFailures)\(remaining)"
+                }
+            }
+
+            for candidate in plan.candidates {
+                do {
+                    try Task.checkCancellation()
+                    let transcript = try await self.speechTranscriber.transcribe(
+                        url: candidate.url,
+                        sourceRecordingID: candidate.recording.id,
+                        localeIdentifier: self.project.person.localeIdentifier
+                    )
+                    guard let sessionIndex = self.sessions.firstIndex(where: { $0.id == candidate.sessionID }) else { continue }
+                    var answer = self.sessions[sessionIndex].answers[candidate.questionKey]
+                        ?? InterviewAnswer(questionKey: candidate.questionKey)
+                    guard answer.transcript == nil else { continue }
+                    answer.transcript = transcript
+                    self.sessions[sessionIndex].answers[candidate.questionKey] = answer
+                    self.flushToDocument()
+                    try await self.persist(session: self.sessions[sessionIndex])
+                    completedCount += 1
+                    self.progressMessage = "Transcribing \(completedCount) of \(plan.candidates.count) missing answers…"
+                } catch is CancellationError {
+                    cancelled = true
+                    break
+                } catch let error as SpeechTranscriptionError {
+                    failures.append("\(candidate.label): \(error.localizedDescription)")
+                    if error.stopsBatch {
+                        stoppedByAuthorization = true
+                        break
+                    }
+                } catch {
+                    failures.append("\(candidate.label): \(error.localizedDescription)")
+                }
+            }
+        }
+    }
+
+    private func makeMissingTranscriptionPlan() -> MissingTranscriptionPlan {
+        guard let store = document?.packageStore else {
+            return MissingTranscriptionPlan(candidates: [], skippedCount: 0)
+        }
+
+        let questionOrder = Dictionary(uniqueKeysWithValues: project.questions.enumerated().map { ($0.element.questionKey, $0.offset) })
+        let questionText = Dictionary(uniqueKeysWithValues: project.questions.map { ($0.questionKey, $0.displayText) })
+        var candidates: [TranscriptionCandidate] = []
+        var skippedCount = 0
+
+        for session in sessions {
+            let answers = session.answers.values.sorted { left, right in
+                let leftOrder = questionOrder[left.questionKey] ?? Int.max
+                let rightOrder = questionOrder[right.questionKey] ?? Int.max
+                return leftOrder == rightOrder ? left.questionKey < right.questionKey : leftOrder < rightOrder
+            }
+
+            for answer in answers {
+                guard answer.transcript == nil, answer.state != .skipped else { continue }
+                guard let part = answer.selectedTake?.parts.first,
+                      let recording = session.recordings.first(where: { $0.id == part.sourceRecordingID }),
+                      let url = try? store.resolve(relativePath: recording.packageRelativePath),
+                      FileManager.default.isReadableFile(atPath: url.path) else {
+                    skippedCount += 1
+                    continue
+                }
+
+                let questionLabel = questionText[answer.questionKey] ?? answer.questionKey
+                candidates.append(TranscriptionCandidate(
+                    sessionID: session.id,
+                    questionKey: answer.questionKey,
+                    recording: recording,
+                    url: url,
+                    label: "\(session.ageLabel) · \(questionLabel)"
+                ))
+            }
+        }
+
+        return MissingTranscriptionPlan(candidates: candidates, skippedCount: skippedCount)
+    }
+
+    private func persist(session: InterviewSession) async throws {
+        guard let store = document?.packageStore else { return }
+        try await Task.detached(priority: .utility) {
+            try store.writeSession(session)
+            try store.rebuildInventory()
+        }.value
+    }
+
+    func seek(to timeUS: Int64) {
+        guard let player else { return }
+        let clamped = max(0, timeUS)
+        player.seek(to: CMTime(value: clamped, timescale: 1_000_000))
+        currentTimeUS = clamped
+    }
+
+    func replacePlayer(with url: URL) {
+        removePlaybackObservers()
+        let newPlayer = AVPlayer(url: url)
+        player = newPlayer
+        playerObservation.player = newPlayer
+        playerObservation.periodic = newPlayer.addPeriodicTimeObserver(forInterval: CMTime(value: 50_000, timescale: 1_000_000), queue: .main) { time in
+            guard time.isNumeric else { return }
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.currentTimeUS = max(0, Int64((time.seconds * 1_000_000).rounded()))
+            }
+        }
+    }
+
+    func playFullRecording() {
+        removeRangeBoundaryObserver()
+        player?.play()
+    }
+
+    func playVisibleAnswer() {
+        guard let range = selectedTimelineRange else { return }
+        playRange(startUS: range.visibleStartUS, endUS: range.visibleEndUS)
+    }
+
+    func playBufferedSelection() {
+        guard let range = selectedTimelineRange,
+              let start = range.safeLeadingStartUS,
+              let end = range.safeTrailingEndUS else { return }
+        playRange(startUS: start, endUS: end)
+    }
+
+    private func playRange(startUS: Int64, endUS: Int64) {
+        guard let player, endUS > startUS else { return }
+        removeRangeBoundaryObserver()
+        let capturedPlayer = player
+        let start = CMTime(value: startUS, timescale: 1_000_000)
+        let end = CMTime(value: endUS, timescale: 1_000_000)
+        capturedPlayer.pause()
+        capturedPlayer.seek(to: start, toleranceBefore: .zero, toleranceAfter: .zero) { [capturedPlayer] _ in
+            Task { @MainActor [weak self, capturedPlayer] in
+                guard let self, self.player === capturedPlayer else { return }
+                self.currentTimeUS = startUS
+                self.playerObservation.boundary = capturedPlayer.addBoundaryTimeObserver(forTimes: [NSValue(time: end)], queue: .main) { [capturedPlayer] in
+                    Task { @MainActor [weak self, capturedPlayer] in
+                        guard let self, self.player === capturedPlayer else { return }
+                        capturedPlayer.pause()
+                        self.currentTimeUS = endUS
+                        self.removeRangeBoundaryObserver()
+                    }
+                }
+                capturedPlayer.play()
+            }
+        }
+    }
+
+    private func removeRangeBoundaryObserver() {
+        if let token = playerObservation.boundary {
+            playerObservation.player?.removeTimeObserver(token)
+            playerObservation.boundary = nil
+        }
+    }
+
+    private func removePlaybackObservers() {
+        playerObservation.invalidate()
+    }
+
     func save() {
         flushToDocument()
         document?.save(nil)
     }
 
-    func addYear() {
-        let ageLabel = "New Interview Year"
-        let ageKey = InterviewStudioKey.readableKey(from: ageLabel)
-        let session = InterviewSession(id: UUID(), ageKey: ageKey, ageLabel: ageLabel)
+    func addYear(age: Double) {
+        let ageDisplay = age.formatted(.number.precision(.fractionLength(0...2)))
+        let ageLabel = age == 1 ? "1 Year Old" : "\(ageDisplay) Years Old"
+        let ageKey = InterviewStudioKey.readableKey(
+            from: "age \(ageDisplay)",
+            existing: Set(sessions.map(\.ageKey))
+        )
+        let session = InterviewSession(id: UUID(), ageKey: ageKey, ageLabel: ageLabel, ageSortValue: age)
         sessions.append(session)
         sessions.sort { ($0.ageSortValue ?? .greatestFiniteMagnitude) < ($1.ageSortValue ?? .greatestFiniteMagnitude) }
         selectedSessionID = session.id
@@ -94,25 +456,38 @@ final class InterviewStudioWorkspaceModel: ObservableObject {
         panel.allowedContentTypes = [.movie, .mpeg4Movie, .quickTimeMovie]
         guard panel.runModal() == .OK else { return }
         let session = sessions[sessionIndex]
+        let recordingURLs = panel.urls
+        let storeForImport = store
         isBusy = true
-        progressMessage = "Staging \(panel.urls.count) recording(s)…"
+        progressMessage = "Staging \(recordingURLs.count) recording(s)…"
+        let importTask = Task.detached(priority: .userInitiated) {
+            var updated = session
+            for (index, url) in recordingURLs.enumerated() {
+                let imported = try storeForImport.importRecording(
+                    from: url,
+                    ageKey: session.ageKey,
+                    ageLabel: session.ageLabel,
+                    source: .finder,
+                    order: updated.recordings.count + index
+                )
+                if imported.duplicateOf == nil {
+                    updated.recordings.append(imported.recording)
+                }
+            }
+            try storeForImport.writeSession(updated)
+            try storeForImport.rebuildInventory()
+            return updated
+        }
         Task { @MainActor [weak self] in
             guard let self else { return }
             do {
-                var updated = session
-                for (index, url) in panel.urls.enumerated() {
-                    let imported = try store.importRecording(from: url, ageKey: session.ageKey, ageLabel: session.ageLabel, source: .finder, order: updated.recordings.count + index)
-                    if imported.duplicateOf == nil {
-                        updated.recordings.append(imported.recording)
-                    }
-                }
-                self.sessions[sessionIndex] = updated
+                let updated = try await importTask.value
+                guard let currentIndex = self.sessions.firstIndex(where: { $0.id == session.id }) else { return }
+                self.sessions[currentIndex] = updated
                 self.selectedRecordingID = updated.recordings.first?.id
                 self.progressMessage = "Recording import complete."
                 self.isBusy = false
                 self.flushToDocument()
-                try store.writeSession(updated)
-                try store.rebuildInventory()
             } catch {
                 self.errorMessage = error.localizedDescription
                 self.progressMessage = nil
@@ -164,10 +539,13 @@ final class InterviewStudioWorkspaceModel: ObservableObject {
         progressMessage = "Generating validated answer clips and manifest…"
         let project = self.project
         let buildRoot = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!.appendingPathComponent("YearlyInterviewStudio/Generated", isDirectory: true)
+        let finishTask = Task.detached(priority: .userInitiated) {
+            try await FinishAndLockService().finishAndLock(project: project, session: selectedSession, store: store, buildRoot: buildRoot)
+        }
         Task { @MainActor [weak self] in
             guard let self else { return }
             do {
-                let result = try await FinishAndLockService().finishAndLock(project: project, session: selectedSession, store: store, buildRoot: buildRoot)
+                let result = try await finishTask.value
                 self.sessions = try store.listSessions()
                 self.renderPlan = result.renderPlan
                 self.selectedSessionID = selectedSession.id
@@ -236,6 +614,44 @@ final class InterviewStudioWorkspaceModel: ObservableObject {
     }
 }
 
+struct TranscriptionBatchSummary: Sendable {
+    let candidateCount: Int
+    let skippedCount: Int
+
+    var confirmationMessage: String {
+        var message = "(candidateCount) answer(s) have a selected recording and no saved transcript."
+        if skippedCount > 0 {
+            message += "\n\n(skippedCount) other answer(s) will be left unchanged because they have no usable selected recording."
+        }
+        message += "\n\nExisting transcripts will not be overwritten."
+        return message
+    }
+}
+
+private struct MissingTranscriptionPlan {
+    let candidates: [TranscriptionCandidate]
+    let skippedCount: Int
+}
+
+private struct TranscriptionCandidate {
+    let sessionID: UUID
+    let questionKey: String
+    let recording: SourceRecording
+    let url: URL
+    let label: String
+}
+
+@MainActor
+final class NewInterviewYearDraft: ObservableObject {
+    @Published var ageText = ""
+    @Published var validationMessage: String?
+
+    func reset() {
+        ageText = ""
+        validationMessage = nil
+    }
+}
+
 struct DocumentWorkspaceView: View {
     @ObservedObject var model: InterviewStudioWorkspaceModel
 
@@ -252,6 +668,12 @@ struct DocumentWorkspaceView: View {
             Button("OK") { model.errorMessage = nil }
         } message: {
             Text(model.errorMessage ?? "")
+        }
+        .sheet(isPresented: $model.isAddingYear) {
+            NewInterviewYearSheet(draft: model.newInterviewYearDraft) { age in
+                model.addYear(age: age)
+                model.isAddingYear = false
+            }
         }
     }
 
@@ -290,7 +712,7 @@ struct DocumentWorkspaceView: View {
         .navigationTitle("Project")
         .toolbar {
             ToolbarItemGroup {
-                Button("New Year", systemImage: "plus") { model.addYear() }
+                Button("New Year", systemImage: "plus") { model.isAddingYear = true }
                 Button("Save", systemImage: "square.and.arrow.down") { model.save() }
             }
         }
@@ -397,6 +819,57 @@ struct DocumentWorkspaceView: View {
     }
 }
 
+private struct NewInterviewYearSheet: View {
+    @ObservedObject var draft: NewInterviewYearDraft
+    let onCreate: (Double) -> Void
+
+    @Environment(\.dismiss) private var dismiss
+
+    private var parsedAge: Double? {
+        let value = draft.ageText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let age = Double(value), age.isFinite, age >= 0 else { return nil }
+        return age
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("New Interview Year")
+                .font(.title2.weight(.semibold))
+            Text("Enter the person’s age for this interview. Half-years are supported, such as 2.5.")
+                .foregroundStyle(.secondary)
+            TextField("Age in years", text: $draft.ageText)
+                .textFieldStyle(.roundedBorder)
+                .onSubmit(createYear)
+            if let validationMessage = draft.validationMessage {
+                Text(validationMessage)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+            }
+            HStack {
+                Spacer()
+                Button("Cancel", role: .cancel) { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+                Button("Create Year", action: createYear)
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(parsedAge == nil)
+            }
+        }
+        .padding(24)
+        .frame(width: 400)
+        .task {
+            draft.reset()
+        }
+    }
+
+    private func createYear() {
+        guard let age = parsedAge else {
+            draft.validationMessage = "Enter a number such as 5 or 2.5."
+            return
+        }
+        onCreate(age)
+    }
+}
+
     private struct RecordingPlayer: View {
     @ObservedObject var model: InterviewStudioWorkspaceModel
 
@@ -411,20 +884,49 @@ struct DocumentWorkspaceView: View {
                 AVPlayerContainer(player: model.player)
                     .frame(minHeight: 360)
                     .onAppear {
-                        model.player = AVPlayer(url: url)
+                        model.replacePlayer(with: url)
                     }
                     .onChange(of: url) { _, newValue in
-                        model.player = AVPlayer(url: newValue)
+                        model.replacePlayer(with: newValue)
+                        model.currentTimeUS = 0
                     }
+                if model.isLoadingWaveform {
+                    ProgressView("Building waveform…")
+                        .controlSize(.small)
+                } else if let waveform = model.waveform {
+                    WaveformView(waveform: waveform, timeline: model.selectedTimelineRange, currentTimeUS: model.currentTimeUS) { timeUS in
+                        model.seek(to: timeUS)
+                    }
+                    if let range = model.selectedTimelineRange {
+                        Text(timelineSummary(range))
+                            .font(.caption.monospaced())
+                            .foregroundStyle(.secondary)
+                    }
+                } else if let waveformMessage = model.waveformMessage {
+                    Label(waveformMessage, systemImage: "waveform.slash")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                TranscriptPanel(
+                    transcript: model.selectedTranscript,
+                    isTranscribing: model.isTranscribing,
+                    canTranscribe: model.canTranscribeSelectedRecording,
+                    message: model.transcriptionMessage,
+                    onTranscribe: model.transcribeSelectedRecording
+                )
                 HStack {
-                    Button("Play / Pause") {
-                        guard let player = model.player else { return }
-                        if player.timeControlStatus == .playing { player.pause() } else { player.play() }
-                    }
+                    Button("Preview Answer") { model.playVisibleAnswer() }
+                    Button("Preview With Buffers") { model.playBufferedSelection() }
+                        .disabled(model.selectedTimelineRange?.hasPreciseBuffers != true)
+                    Button("Play Full Recording") { model.playFullRecording() }
+                    Button("Pause") { model.player?.pause() }
                     Button("-1 s") { seek(by: -1) }
                     Button("+1 s") { seek(by: 1) }
                     TextField("Source seconds", value: Binding(get: { Double(model.currentTimeUS) / 1_000_000 }, set: { model.currentTimeUS = Int64(($0 * 1_000_000).rounded()) }), format: .number)
                         .frame(width: 120)
+                }
+                .task(id: model.mediaAnalysisID) {
+                    await model.prepareMediaAnalysis()
                 }
             } else if model.selectedRecording?.importSource == .legacy {
                 ContentUnavailableView("Legacy clip unavailable", systemImage: "exclamationmark.triangle", description: Text("The imported manifest row could not be resolved to a playable clip."))
@@ -435,15 +937,26 @@ struct DocumentWorkspaceView: View {
     }
 
     private var recordingURL: URL? {
-        guard let store = model.document?.packageStore, let recording = model.selectedRecording else { return nil }
-        return try? store.resolve(relativePath: recording.packageRelativePath)
+        model.selectedRecordingURL
     }
 
     private func seek(by seconds: Double) {
         guard let player = model.player else { return }
         let time = player.currentTime().seconds + seconds
-        player.seek(to: CMTime(seconds: max(0, time), preferredTimescale: 600))
-        model.currentTimeUS = Int64(max(0, time) * 1_000_000)
+        model.seek(to: Int64(max(0, time) * 1_000_000))
+    }
+
+    private func timelineSummary(_ range: SelectedTimelineRange) -> String {
+        let answer = String(format: "Answer %.2f–%.2fs", Double(range.visibleStartUS) / 1_000_000, Double(range.visibleEndUS) / 1_000_000)
+        guard let start = range.safeLeadingStartUS, let end = range.safeTrailingEndUS else {
+            return "\(answer) · leading/trailing buffers unavailable until refined"
+        }
+        return String(format: "Leading buffer %.2fs · %@ · trailing buffer %.2fs · export %.2f–%.2fs",
+                      Double(range.visibleStartUS - start) / 1_000_000,
+                      answer,
+                      Double(end - range.visibleEndUS) / 1_000_000,
+                      Double(start) / 1_000_000,
+                      Double(end) / 1_000_000)
     }
 }
 

@@ -122,7 +122,7 @@ struct YearlyInterviewStudioCLI {
             throw NativePublishingError.sourceMissing(part.sourceRecordingID.uuidString)
         }
         let sourceURL = try store.resolve(relativePath: recording.packageRelativePath)
-        try await NativeAnswerPublisher().generate(part: part, sourceURL: sourceURL, outputURL: outputURL)
+        _ = try await NativeAnswerPublisher().generate(part: part, sourceURL: sourceURL, outputURL: outputURL)
         print("answer=\(outputURL.path)")
     }
 

@@ -1,10 +1,25 @@
 # Phase 2 Plan — Clip Factory
 
-Status: proposed next phase; not started.
+Status: active prototype; incomplete and not release-ready.
 
-Phase 1 is the Assembly Studio: it takes prepared clips and a prepared `final_manifest.json` and creates the finished movie. Phase 2 is the missing front half of that workflow: a Clip Factory that turns long interview source media into the clips and manifest that Phase 1 already understands.
+Phase 1 is the Assembly Studio: it takes prepared clips and a prepared `final_manifest.json` and creates the finished movie. Phase 2 is the front half of that workflow: a package-backed Clip Factory prototype that turns local interview source media into candidate clips and a manifest that Phase 1 can understand.
 
 The original detailed plan is preserved in [Historical/yearly_interview_studio_codex_plan.md](Historical/yearly_interview_studio_codex_plan.md). This file is the current working checklist and should be updated as decisions are made.
+
+## Current implementation snapshot — 2026-08-07
+
+Implemented in the current prototype:
+
+- Finder recording import into app-owned project packages with checksums and media inspection.
+- Native source playback, waveform review, answer markers, optional on-device transcription, and session persistence.
+- Single-part native answer publication with safe output names, no-overwrite behavior, output media reinspection, and a generated manifest.
+
+Still required before this phase can be called complete:
+
+- Real birthday-project source → answer clip → manifest → Phase 1 round-trip verification.
+- Cancellation/retry and duplicate-publication UX.
+- Multipart answers, incremental manifest editing, and deeper boundary/handle QA.
+- Broader playback and library validation of generated media and metadata.
 
 ## Phase 2 outcome
 

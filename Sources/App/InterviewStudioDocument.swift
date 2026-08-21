@@ -31,7 +31,14 @@ final class InterviewStudioDocument: NSDocument {
         let project = try store.readProjectAllowingReadOnly()
         self.packageStore = store
         self.project = project
-        self.sessions = try store.listSessions()
+        var sessions = try store.listSessions()
+        let legacyRowsURL = url.appendingPathComponent("Legacy Import/Original/legacy_rows.json")
+        if let data = try? Data(contentsOf: legacyRowsURL),
+           let rows = try? JSONDecoder.interviewStudio.decode([ManifestRow].self, from: data) {
+            let restorer = LegacyRangeRestorer()
+            sessions = sessions.map { restorer.repair(session: $0, rows: rows) }
+        }
+        self.sessions = sessions
         isPackageReadOnly = !project.compatibility.isWritable
     }
 

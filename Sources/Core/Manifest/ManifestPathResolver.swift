@@ -9,16 +9,31 @@ public struct ManifestPathResolver {
     public init() {}
 
     public func resolve(row: ManifestRow, projectFolder: URL) -> ManifestPathResolution {
-        let relativeURL = projectFolder.appendingPathComponent(row.outputFile)
-        if FileManager.default.fileExists(atPath: relativeURL.path) {
-            return .init(resolvedURL: relativeURL, issues: [])
+        let projectRoot = projectFolder.standardizedFileURL.resolvingSymlinksInPath()
+
+        if isSafeRelativePath(row.outputFile) {
+            let relativeURL = projectRoot.appendingPathComponent(row.outputFile).standardizedFileURL
+            if let safeURL = existingURL(relativeURL, within: projectRoot) {
+                return .init(resolvedURL: safeURL, issues: [])
+            }
+        } else if !row.outputFile.isEmpty {
+            return .init(
+                resolvedURL: nil,
+                issues: [unsafePathIssue(row: row, code: "UNSAFE_RELATIVE_OUTPUT_PATH", message: "The manifest's relative output path is not a safe project-relative path.")]
+            )
         }
 
         if let outputPath = row.outputPath, !outputPath.isEmpty {
-            let absoluteURL = URL(fileURLWithPath: outputPath)
-            if FileManager.default.fileExists(atPath: absoluteURL.path) {
+            guard outputPath.hasPrefix("/") else {
                 return .init(
-                    resolvedURL: absoluteURL,
+                    resolvedURL: nil,
+                    issues: [unsafePathIssue(row: row, code: "UNSAFE_ABSOLUTE_OUTPUT_PATH", message: "The manifest's fallback output path is not an absolute local path.")]
+                )
+            }
+            let absoluteURL = URL(fileURLWithPath: outputPath)
+            if let safeURL = existingURL(absoluteURL, within: projectRoot) {
+                return .init(
+                    resolvedURL: safeURL,
                     issues: [
                         AssemblyIssue(
                             severity: .warning,
@@ -35,6 +50,13 @@ public struct ManifestPathResolver {
                     ]
                 )
             }
+
+            if FileManager.default.fileExists(atPath: absoluteURL.path) {
+                return .init(
+                    resolvedURL: nil,
+                    issues: [unsafePathIssue(row: row, code: "ABSOLUTE_OUTPUT_PATH_OUTSIDE_PROJECT", message: "The manifest points outside the selected project folder, so the clip was not opened.")]
+                )
+            }
         }
 
         return .init(
@@ -48,12 +70,41 @@ public struct ManifestPathResolver {
                         "question_key": .string(row.questionKey),
                         "age_key": .string(row.ageKey),
                         "relative_path": .string(row.outputFile),
-                        "selected_project_folder": .string(projectFolder.path),
+                        "selected_project_folder": .string(projectRoot.path),
                         "absolute_path": .string(row.outputPath ?? "")
                     ],
                     suggestedFix: "Confirm the selected project folder is correct or regenerate the missing clip."
                 )
             ]
+        )
+    }
+
+    private func isSafeRelativePath(_ path: String) -> Bool {
+        guard !path.isEmpty, !path.hasPrefix("/"), !path.contains("\\") else { return false }
+        let components = path.split(separator: "/", omittingEmptySubsequences: false).map(String.init)
+        return !components.isEmpty && !components.contains(where: { $0.isEmpty || $0 == "." || $0 == ".." })
+    }
+
+    private func existingURL(_ candidate: URL, within root: URL) -> URL? {
+        guard FileManager.default.fileExists(atPath: candidate.path) else { return nil }
+        let resolvedRoot = root.resolvingSymlinksInPath().standardizedFileURL
+        let resolvedCandidate = candidate.resolvingSymlinksInPath().standardizedFileURL
+        guard resolvedCandidate.path == resolvedRoot.path || resolvedCandidate.path.hasPrefix(resolvedRoot.path + "/") else { return nil }
+        return resolvedCandidate
+    }
+
+    private func unsafePathIssue(row: ManifestRow, code: String, message: String) -> AssemblyIssue {
+        AssemblyIssue(
+            severity: .blocker,
+            code: code,
+            humanMessage: message,
+            aiContext: [
+                "question_key": .string(row.questionKey),
+                "age_key": .string(row.ageKey),
+                "relative_path": .string(row.outputFile),
+                "absolute_path": .string(row.outputPath ?? "")
+            ],
+            suggestedFix: "Keep generated media inside the selected project folder and use a normalized relative output path."
         )
     }
 }

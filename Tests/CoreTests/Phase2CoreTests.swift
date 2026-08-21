@@ -50,6 +50,9 @@ final class Phase2CoreTests: XCTestCase {
         try FileManager.default.createDirectory(at: clipURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         try Data("legacy clip".utf8).write(to: clipURL)
 
+        let secondClipRelativePath = "clips/second-answer.mov"
+        try Data("second legacy clip".utf8).write(to: legacyRoot.appendingPathComponent(secondClipRelativePath))
+
         let row = ManifestRow(
             clipNumber: "1",
             person: "Ellie",
@@ -61,18 +64,31 @@ final class Phase2CoreTests: XCTestCase {
             ageSortKey: 5,
             outputFile: clipRelativePath
         )
+        let secondRow = ManifestRow(
+            clipNumber: "2",
+            person: "Ellie",
+            personKey: "ellie",
+            question: "What is your favorite color?",
+            questionKey: "favorite_color",
+            age: "6 Years Old",
+            ageKey: "age_6",
+            ageSortKey: 6,
+            outputFile: secondClipRelativePath
+        )
         let manifestURL = legacyRoot.appendingPathComponent("final_manifest.json")
-        try JSONEncoder.interviewStudio.encode([row]).write(to: manifestURL, options: .atomic)
+        try JSONEncoder.interviewStudio.encode([row, secondRow]).write(to: manifestURL, options: .atomic)
 
         let service = LegacyMigrationService()
         let analysis = try service.analyze(sourceFolder: legacyRoot)
         let result = try service.import(analysis: analysis, to: packageRoot)
         let store = try InterviewStudioPackageStore(rootURL: result.packageURL)
         try store.verifyInventory()
-        let session = try XCTUnwrap(store.listSessions().first)
+        let sessions = try store.listSessions()
+        let session = try XCTUnwrap(sessions.first(where: { $0.ageKey == "age_5" }))
         let recording = try XCTUnwrap(session.recordings.first)
         let answer = try XCTUnwrap(session.answers["favorite_memory"])
         let part = try XCTUnwrap(answer.selectedTake?.parts.first)
+        let skippedAnswer = try XCTUnwrap(session.answers["favorite_color"])
 
         XCTAssertEqual(session.lifecycle, .locked)
         XCTAssertEqual(session.revision, 1)
@@ -80,13 +96,102 @@ final class Phase2CoreTests: XCTestCase {
         XCTAssertEqual(recording.importSource, .legacy)
         XCTAssertEqual(part.sourceRecordingID, recording.id)
         XCTAssertEqual(answer.state, .complete)
+        XCTAssertEqual(skippedAnswer.state, .skipped)
+        XCTAssertEqual(skippedAnswer.extensions["legacy_import_assumption"], .string("blank_response"))
         XCTAssertTrue(FileManager.default.fileExists(atPath: try store.resolve(relativePath: recording.packageRelativePath).path))
+    }
+
+    func testInterviewAnswerRemainsReadableWithoutOptionalTranscript() throws {
+        let data = Data(#"{"questionKey":"favorite_memory","selectedTakeID":null,"takes":[],"state":"not_started","lastReviewedAt":null,"extensions":{}}"#.utf8)
+        let answer = try JSONDecoder.interviewStudio.decode(InterviewAnswer.self, from: data)
+        XCTAssertNil(answer.transcript)
+    }
+
+    func testInterviewAnswerRoundTripsTimedTranscript() throws {
+        let recordingID = UUID()
+        let transcript = AnswerTranscript(
+            text: "Hello there.",
+            segments: [TranscriptSegment(text: "Hello there.", start: .microseconds(0), end: .microseconds(1_200_000))],
+            localeIdentifier: "en_US",
+            sourceRecordingID: recordingID
+        )
+        let answer = InterviewAnswer(questionKey: "favorite_memory", transcript: transcript)
+        let data = try JSONEncoder.interviewStudio.encode(answer)
+        let decoded = try JSONDecoder.interviewStudio.decode(InterviewAnswer.self, from: data)
+
+        XCTAssertEqual(decoded.transcript?.text, "Hello there.")
+        XCTAssertEqual(decoded.transcript?.segments.first?.start.microseconds, 0)
+        XCTAssertEqual(decoded.transcript?.segments.first?.end.microseconds, 1_200_000)
+        XCTAssertEqual(decoded.transcript?.sourceRecordingID, recordingID)
     }
 
     func testReadableQuestionKeysAreStableAndCollisionSafe() {
         let existing: Set<String> = ["favorite_memory", "favorite_memory_2"]
         XCTAssertEqual(InterviewStudioKey.readableKey(from: "Favorite Memory", existing: existing), "favorite_memory_3")
         XCTAssertEqual(InterviewStudioKey.readableKey(from: "  2026?  ", existing: []), "question_2026")
+        XCTAssertEqual(InterviewStudioKey.safeFilenameComponent("..", fallback: "question"), "question")
+    }
+
+    func testManifestPathResolverRejectsTraversalAndExternalAbsoluteMedia() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("manifest-path-\(UUID().uuidString)", isDirectory: true)
+        let outside = FileManager.default.temporaryDirectory.appendingPathComponent("outside-\(UUID().uuidString).mov")
+        defer {
+            try? FileManager.default.removeItem(at: root)
+            try? FileManager.default.removeItem(at: outside)
+        }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try Data("not a movie".utf8).write(to: outside)
+
+        let traversalRow = ManifestRow(
+            clipNumber: "1",
+            person: "Ellie",
+            personKey: "ellie",
+            question: "Memory",
+            questionKey: "memory",
+            age: "5 Years Old",
+            ageKey: "age_5",
+            outputFile: "../\(outside.lastPathComponent)"
+        )
+        let externalRow = ManifestRow(
+            clipNumber: "2",
+            person: "Ellie",
+            personKey: "ellie",
+            question: "Memory",
+            questionKey: "memory",
+            age: "5 Years Old",
+            ageKey: "age_5",
+            outputFile: "missing.mov",
+            outputPath: outside.path
+        )
+
+        let resolver = ManifestPathResolver()
+        let traversal = resolver.resolve(row: traversalRow, projectFolder: root)
+        let external = resolver.resolve(row: externalRow, projectFolder: root)
+
+        XCTAssertNil(traversal.resolvedURL)
+        XCTAssertEqual(traversal.issues.first?.code, "UNSAFE_RELATIVE_OUTPUT_PATH")
+        XCTAssertNil(external.resolvedURL)
+        XCTAssertEqual(external.issues.first?.code, "ABSOLUTE_OUTPUT_PATH_OUTSIDE_PROJECT")
+    }
+
+    func testNativePublisherDoesNotOverwriteExistingOutput() async throws {
+        let outputURL = FileManager.default.temporaryDirectory.appendingPathComponent("existing-\(UUID().uuidString).mov")
+        defer { try? FileManager.default.removeItem(at: outputURL) }
+        try Data("existing output".utf8).write(to: outputURL)
+
+        do {
+            _ = try await NativeAnswerPublisher().generate(
+                part: AnswerPart(sourceRecordingID: UUID(), rawMarkers: .init()),
+                sourceURL: outputURL,
+                outputURL: outputURL
+            )
+            XCTFail("An existing output must be rejected before export.")
+        } catch let error as NativePublishingError {
+            guard case .outputAlreadyExists(let url) = error else {
+                return XCTFail("Expected outputAlreadyExists, got \(error)")
+            }
+            XCTAssertEqual(url, outputURL)
+        }
     }
 
     func testInventoryRejectsAnUnlistedPackageEntry() throws {
@@ -137,5 +242,72 @@ final class Phase2CoreTests: XCTestCase {
         XCTAssertLessThanOrEqual(result.boundaries.visibleStart.microseconds, 1_000_000)
         XCTAssertGreaterThan(result.boundaries.visibleEnd.microseconds, 1_900_000)
         XCTAssertLessThanOrEqual(result.boundaries.safeTrailingEnd.microseconds, 2_650_000)
+    }
+
+    func testLegacyRangeRestorerPreservesManifestCoordinatesAndClampsToClip() {
+        let row = ManifestRow(
+            clipNumber: "7", person: "Ellie", personKey: "ellie", question: "Memory", questionKey: "memory",
+            age: "5 Years Old", ageKey: "age_5", outputFile: "clip.mov",
+            actualHandleBeforeUS: 500_000, actualHandleAfterUS: 600_000,
+            realMediaStartInOutputUS: 400_000, realMediaEndInOutputUS: 4_600_000,
+            answerStartInOutputUS: 1_000_000, answerEndInOutputUS: 4_000_000
+        )
+        let boundaries = LegacyRangeRestorer().boundaries(for: row, durationUS: 5_000_000)
+        XCTAssertEqual(boundaries.visibleStart.microseconds, 1_000_000)
+        XCTAssertEqual(boundaries.visibleEnd.microseconds, 4_000_000)
+        XCTAssertEqual(boundaries.safeLeadingStart.microseconds, 400_000)
+        XCTAssertEqual(boundaries.safeTrailingEnd.microseconds, 4_600_000)
+
+        let invalid = ManifestRow(
+            clipNumber: "8", person: "Ellie", personKey: "ellie", question: "Memory", questionKey: "memory",
+            age: "5 Years Old", ageKey: "age_5", outputFile: "invalid.mov",
+            realMediaStartInOutputUS: -10, realMediaEndInOutputUS: 99_000_000,
+            answerStartInOutputUS: 4_000_000, answerEndInOutputUS: 1_000_000
+        )
+        let fallback = LegacyRangeRestorer().boundaries(for: invalid, durationUS: 5_000_000)
+        XCTAssertEqual(fallback.visibleStart.microseconds, 0)
+        XCTAssertEqual(fallback.visibleEnd.microseconds, 5_000_000)
+        XCTAssertEqual(fallback.safeLeadingStart.microseconds, 0)
+        XCTAssertEqual(fallback.safeTrailingEnd.microseconds, 5_000_000)
+
+        let noInspectionDuration = LegacyRangeRestorer().effectiveDurationUS(for: row, inspectedDurationUS: nil)
+        XCTAssertEqual(noInspectionDuration, 4_600_000)
+        let noInspection = LegacyRangeRestorer().boundaries(for: row, durationUS: noInspectionDuration)
+        XCTAssertEqual(noInspection.visibleStart.microseconds, 1_000_000)
+        XCTAssertEqual(noInspection.visibleEnd.microseconds, 4_000_000)
+        XCTAssertEqual(noInspection.safeTrailingEnd.microseconds, 4_600_000)
+    }
+
+    func testLegacyRangeRestorerRepairsMatchingImportedPartWithoutWriting() {
+        let recordingID = UUID()
+        var session = InterviewSession(ageKey: "age_5", ageLabel: "5 Years Old", ageSortValue: 5)
+        let part = AnswerPart(
+            sourceRecordingID: recordingID,
+            rawMarkers: .init(),
+            refinedBoundaries: .init(visibleStart: .microseconds(0), visibleEnd: .microseconds(5_000_000), safeLeadingStart: .microseconds(0), safeTrailingEnd: .microseconds(5_000_000), confidence: 1),
+            extensions: ["legacy_manifest_row": .object(["clip_number": .string("7"), "output_file": .string("clip.mov")])]
+        )
+        let take = AnswerTake(parts: [part])
+        session.answers["memory"] = InterviewAnswer(questionKey: "memory", selectedTakeID: take.id, takes: [take], state: .complete)
+        session.recordings = [SourceRecording(id: recordingID, ageKey: "age_5", ageLabel: "5 Years Old", packageRelativePath: "Legacy Published Media/clip.mov", originalFilename: "clip.mov", importSource: .legacy, mediaSignature: .init(byteCount: 1, sha256: "x", durationMicroseconds: 5_000_000))]
+
+        let row = ManifestRow(
+            clipNumber: "7", person: "Ellie", personKey: "ellie", question: "Memory", questionKey: "memory",
+            age: "5 Years Old", ageKey: "age_5", outputFile: "clip.mov",
+            realMediaStartInOutputUS: 500_000, realMediaEndInOutputUS: 4_500_000,
+            answerStartInOutputUS: 1_000_000, answerEndInOutputUS: 4_000_000
+        )
+        let repaired = LegacyRangeRestorer().repair(session: session, rows: [row])
+        let repairedPart = repaired.answers["memory"]?.selectedTake?.parts.first
+        XCTAssertEqual(repairedPart?.rawMarkers.answerStart?.microseconds, 1_000_000)
+        XCTAssertEqual(repairedPart?.rawMarkers.answerEnd?.microseconds, 4_000_000)
+        XCTAssertEqual(repairedPart?.refinedBoundaries?.visibleStart.microseconds, 1_000_000)
+        XCTAssertEqual(repairedPart?.refinedBoundaries?.safeTrailingEnd.microseconds, 4_500_000)
+        XCTAssertEqual(repairedPart?.extensions["legacy_manifest_timing"], .object([
+            "answer_start_in_output_us": .number(1_000_000),
+            "answer_end_in_output_us": .number(4_000_000),
+            "real_media_start_in_output_us": .number(500_000),
+            "real_media_end_in_output_us": .number(4_500_000)
+        ]))
     }
 }

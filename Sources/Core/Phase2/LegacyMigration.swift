@@ -60,6 +60,84 @@ public struct LegacyImportResult: Sendable {
     }
 }
 
+/// Restores the coordinate system recorded by a legacy manifest. Manifest
+/// answer/handle times are relative to the published clip, not its source.
+public struct LegacyRangeRestorer: Sendable {
+    public init() {}
+
+    public func effectiveDurationUS(for row: ManifestRow, inspectedDurationUS: Int64?) -> Int64 {
+        if let inspectedDurationUS, inspectedDurationUS > 0 { return inspectedDurationUS }
+        let answerEnd = max(row.answerEndInOutputUS, 0)
+        let realEnd = max(row.realMediaEndInOutputUS, 0)
+        let handledEnd = answerEnd + max(row.actualHandleAfterUS, 0) + max(row.syntheticHandleAfterUS, 0)
+        return max(realEnd, handledEnd)
+    }
+
+    public func boundaries(for row: ManifestRow, durationUS: Int64) -> RefinedBoundaries {
+        let duration = max(durationUS, 0)
+        let answerStart = clamp(row.answerStartInOutputUS, to: duration)
+        let answerEndCandidate = clamp(row.answerEndInOutputUS, to: duration)
+        let hasAnswerRange = answerEndCandidate > answerStart
+        let visibleStart = hasAnswerRange ? answerStart : 0
+        let visibleEnd = hasAnswerRange ? answerEndCandidate : duration
+
+        let fallbackStart = max(0, visibleStart - max(row.actualHandleBeforeUS + row.syntheticHandleBeforeUS, 0))
+        let fallbackEnd = min(duration, visibleEnd + max(row.actualHandleAfterUS + row.syntheticHandleAfterUS, 0))
+        let safeStartCandidate = row.realMediaStartInOutputUS > 0 ? row.realMediaStartInOutputUS : fallbackStart
+        let safeEndCandidate = row.realMediaEndInOutputUS > 0 ? row.realMediaEndInOutputUS : fallbackEnd
+        let safeStart = min(visibleStart, clamp(safeStartCandidate, to: duration))
+        let safeEnd = max(visibleEnd, clamp(safeEndCandidate, to: duration))
+
+        return RefinedBoundaries(
+            visibleStart: .microseconds(visibleStart),
+            visibleEnd: .microseconds(visibleEnd),
+            safeLeadingStart: .microseconds(safeStart),
+            safeTrailingEnd: .microseconds(safeEnd),
+            confidence: hasAnswerRange ? 1 : 0.45,
+            reasons: hasAnswerRange ? ["Restored legacy manifest clip coordinates."] : ["Legacy manifest did not contain a valid answer range; inspected clip duration used."],
+            algorithmIdentifier: "legacy-manifest-restoration",
+            algorithmVersion: "1.0"
+        )
+    }
+
+    public func repair(session: InterviewSession, rows: [ManifestRow]) -> InterviewSession {
+        var repaired = session
+        let rowsByIdentity = rows.reduce(into: [String: ManifestRow]()) { result, row in
+            result[Self.identity(for: row)] = row
+        }
+        for questionKey in repaired.answers.keys {
+            guard var answer = repaired.answers[questionKey] else { continue }
+            for takeIndex in answer.takes.indices {
+                for partIndex in answer.takes[takeIndex].parts.indices {
+                    let part = answer.takes[takeIndex].parts[partIndex]
+                    guard let metadata = part.extensions["legacy_manifest_row"],
+                          case .object(let values) = metadata,
+                          case .string(let clipNumber) = values["clip_number"],
+                          case .string(let outputFile) = values["output_file"],
+                          let row = rowsByIdentity["\(clipNumber)|\(outputFile)"] else { continue }
+                    let inspectedDuration = repaired.recordings.first(where: { $0.id == part.sourceRecordingID })?.mediaSignature.durationMicroseconds
+                    let duration = effectiveDurationUS(for: row, inspectedDurationUS: inspectedDuration)
+                    let restoredBoundaries = boundaries(for: row, durationUS: duration)
+                    answer.takes[takeIndex].parts[partIndex].rawMarkers.answerStart = restoredBoundaries.visibleStart
+                    answer.takes[takeIndex].parts[partIndex].rawMarkers.answerEnd = restoredBoundaries.visibleEnd
+                    answer.takes[takeIndex].parts[partIndex].refinedBoundaries = restoredBoundaries
+                    answer.takes[takeIndex].parts[partIndex].extensions["legacy_manifest_timing"] = .object([
+                        "answer_start_in_output_us": .number(Double(row.answerStartInOutputUS)),
+                        "answer_end_in_output_us": .number(Double(row.answerEndInOutputUS)),
+                        "real_media_start_in_output_us": .number(Double(row.realMediaStartInOutputUS)),
+                        "real_media_end_in_output_us": .number(Double(row.realMediaEndInOutputUS))
+                    ])
+                }
+            }
+            repaired.answers[questionKey] = answer
+        }
+        return repaired
+    }
+
+    private static func identity(for row: ManifestRow) -> String { "\(row.clipNumber)|\(row.outputFile)" }
+    private func clamp(_ value: Int64, to duration: Int64) -> Int64 { min(max(value, 0), duration) }
+}
+
 public struct LegacyMigrationService: Sendable {
     public init() {}
 
@@ -179,32 +257,28 @@ public struct LegacyMigrationService: Sendable {
                 sessionByAge[row.ageKey]?.recordings.append(recording)
 
                 var answer = sessionByAge[row.ageKey]?.answers[row.questionKey] ?? InterviewAnswer(questionKey: row.questionKey)
+                let restorer = LegacyRangeRestorer()
+                let clipDurationUS = restorer.effectiveDurationUS(for: row, inspectedDurationUS: inspection?.duration.microseconds)
                 let markers = RawAnswerMarkers(
-                    answerStart: inspection == nil ? nil : .microseconds(0),
-                    answerEnd: inspection?.duration
+                    answerStart: clipDurationUS > 0 ? .microseconds(max(0, min(row.answerStartInOutputUS, clipDurationUS))) : nil,
+                    answerEnd: clipDurationUS > 0 ? .microseconds(max(0, min(max(row.answerEndInOutputUS, row.answerStartInOutputUS), clipDurationUS))) : nil
                 )
-                let boundaries = inspection.map {
-                    RefinedBoundaries(
-                        visibleStart: .microseconds(0),
-                        visibleEnd: $0.duration,
-                        safeLeadingStart: .microseconds(0),
-                        safeTrailingEnd: $0.duration,
-                        confidence: 1,
-                        reasons: ["Imported published legacy clip."],
-                        algorithmIdentifier: "legacy-import",
-                        algorithmVersion: "1.0"
-                    )
-                }
+                let boundaries = restorer.boundaries(for: row, durationUS: clipDurationUS)
+                let timingMetadata: [String: JSONValue] = [
+                    "output_file": .string(row.outputFile),
+                    "clip_number": .string(row.clipNumber),
+                    "answer_start_in_output_us": .number(Double(row.answerStartInOutputUS)),
+                    "answer_end_in_output_us": .number(Double(row.answerEndInOutputUS)),
+                    "real_media_start_in_output_us": .number(Double(row.realMediaStartInOutputUS)),
+                    "real_media_end_in_output_us": .number(Double(row.realMediaEndInOutputUS))
+                ]
                 let existingParts = answer.selectedTake?.parts ?? []
                 let part = AnswerPart(
                     sourceRecordingID: recording.id,
                     rawMarkers: markers,
                     refinedBoundaries: boundaries,
                     sourceOrder: existingParts.count,
-                    extensions: ["legacy_manifest_row": .object([
-                        "output_file": .string(row.outputFile),
-                        "clip_number": .string(row.clipNumber)
-                    ])]
+                    extensions: ["legacy_manifest_row": .object(timingMetadata), "legacy_manifest_timing": .object(timingMetadata)]
                 )
                 let take = AnswerTake(
                     parts: existingParts + [part],
@@ -232,6 +306,17 @@ public struct LegacyMigrationService: Sendable {
                 ])
                 sessionByAge[row.ageKey]?.answers[row.questionKey] = answer
             }
+        }
+        for ageKey in sessionByAge.keys {
+            guard var session = sessionByAge[ageKey] else { continue }
+            for question in questions where session.answers[question.questionKey] == nil {
+                session.answers[question.questionKey] = InterviewAnswer(
+                    questionKey: question.questionKey,
+                    state: .skipped,
+                    extensions: ["legacy_import_assumption": .string("blank_response")]
+                )
+            }
+            sessionByAge[ageKey] = session
         }
         for var session in sessionByAge.values {
             session.lifecycle = .locked

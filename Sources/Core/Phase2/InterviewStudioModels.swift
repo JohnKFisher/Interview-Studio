@@ -334,20 +334,58 @@ public struct AnswerTake: Codable, Hashable, Sendable, Identifiable {
     }
 }
 
+public struct TranscriptSegment: Codable, Hashable, Sendable, Identifiable {
+    public var id: UUID
+    public var text: String
+    public var start: MediaTime
+    public var end: MediaTime
+
+    public init(id: UUID = UUID(), text: String, start: MediaTime, end: MediaTime) {
+        self.id = id
+        self.text = text
+        self.start = start
+        self.end = end
+    }
+}
+
+public struct AnswerTranscript: Codable, Hashable, Sendable {
+    public var text: String
+    public var segments: [TranscriptSegment]
+    public var localeIdentifier: String
+    public var sourceRecordingID: UUID?
+    public var createdAt: Date
+
+    public init(
+        text: String,
+        segments: [TranscriptSegment] = [],
+        localeIdentifier: String = Locale.current.identifier,
+        sourceRecordingID: UUID? = nil,
+        createdAt: Date = Date()
+    ) {
+        self.text = text
+        self.segments = segments
+        self.localeIdentifier = localeIdentifier
+        self.sourceRecordingID = sourceRecordingID
+        self.createdAt = createdAt
+    }
+}
+
 public struct InterviewAnswer: Codable, Hashable, Sendable {
     public var questionKey: String
     public var selectedTakeID: UUID?
     public var takes: [AnswerTake]
     public var state: QuestionProgressState
     public var lastReviewedAt: Date?
+    public var transcript: AnswerTranscript?
     public var extensions: [String: JSONValue]
 
-    public init(questionKey: String, selectedTakeID: UUID? = nil, takes: [AnswerTake] = [], state: QuestionProgressState = .notStarted, lastReviewedAt: Date? = nil, extensions: [String: JSONValue] = [:]) {
+    public init(questionKey: String, selectedTakeID: UUID? = nil, takes: [AnswerTake] = [], state: QuestionProgressState = .notStarted, lastReviewedAt: Date? = nil, transcript: AnswerTranscript? = nil, extensions: [String: JSONValue] = [:]) {
         self.questionKey = questionKey
         self.selectedTakeID = selectedTakeID
         self.takes = takes
         self.state = state
         self.lastReviewedAt = lastReviewedAt
+        self.transcript = transcript
         self.extensions = extensions
     }
 

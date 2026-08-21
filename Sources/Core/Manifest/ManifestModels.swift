@@ -25,6 +25,16 @@ public struct ManifestVideoSignature: Codable, Hashable, Sendable {
             case colorPrimaries = "color_primaries"
             case sideDataTypes = "side_data_types"
         }
+
+        public init(codecName: String? = nil, pixFmt: String? = nil, colorRange: String? = nil, colorSpace: String? = nil, colorTransfer: String? = nil, colorPrimaries: String? = nil, sideDataTypes: [String] = []) {
+            self.codecName = codecName
+            self.pixFmt = pixFmt
+            self.colorRange = colorRange
+            self.colorSpace = colorSpace
+            self.colorTransfer = colorTransfer
+            self.colorPrimaries = colorPrimaries
+            self.sideDataTypes = sideDataTypes
+        }
     }
 
     public var entries: [Entry]

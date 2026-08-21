@@ -162,6 +162,6 @@ public enum InterviewStudioKey {
         let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_ ."))
         let scalars = value.unicodeScalars.map { allowed.contains($0) ? Character(String($0)) : "_" }
         let result = String(scalars).trimmingCharacters(in: .whitespacesAndNewlines)
-        return result.isEmpty ? fallback : result
+        return result.isEmpty || result == "." || result == ".." ? fallback : result
     }
 }

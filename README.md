@@ -1,16 +1,16 @@
 # Interview Studio
 
-Interview Studio is a macOS app in active development for assembling interview video clips into a new finished file from a manifest.
+Interview Studio is a macOS app in active development for organizing interview source media, publishing validated answer clips, and assembling interview video into a finished file.
 
-Right now it is focused on the assembly/export phase of that workflow: import a project folder that contains `final_manifest.json`, review the generated sequence and issues, tweak a few presentation details, then export a real `3840x2160` / `60 fps` / HLG master movie. If you want it, it can also produce a Plex-friendly companion `MP4` without changing the protected master export.
+The stable product boundary remains the assembly/export phase: import a project folder that contains `final_manifest.json`, review the generated sequence and issues, tweak a few presentation details, then export a real `3840x2160` / `60 fps` / HLG master movie. A Phase 2 prototype also imports source recordings into a package, reviews answer ranges, and publishes native answer clips and manifests, but that workflow is still under active verification.
 
 ## Project Status
 
-Phase 1 Assembly Studio is complete for its defined assembly-from-manifest scope. The broader product remains in active development because clip creation and manifest authoring are planned for a later phase. The current Phase 2 checklist is in [docs/PHASE_2_PLAN.md](docs/PHASE_2_PLAN.md).
+Phase 1 Assembly Studio is complete for its defined assembly-from-manifest scope. Phase 2 is now an active, incomplete prototype rather than a proposed-only plan; it is not release-ready until real-media round trips and the remaining workflow checks pass. The current checklist is in [docs/PHASE_2_PLAN.md](docs/PHASE_2_PLAN.md).
 
 Built primarily for my own workflow, but possibly useful if you also have a manifest-driven interview pipeline and want a Mac-native finishing tool instead of stitching everything together by hand.
 
-The current app is still intentionally narrow: it finishes prepared interview projects rather than creating the source clips from raw interviews.
+The current app has two distinct lanes: a protected Phase 1 assembly lane for prepared projects and an in-progress Phase 2 source-media/answer-publication lane.
 
 Right now this should be read as an in-progress app repo, not a finished product.
 
@@ -24,14 +24,15 @@ If this repo starts publishing GitHub Releases, those should become the easiest 
 - Shows live previews plus dedicated Sequence and Issues windows
 - Renders a real HDR `MOV` master using FFmpeg
 - Optionally remuxes a Plex-friendly `MP4` companion with metadata and chapters
+- Phase 2 prototype: imports local source recordings, stores package metadata, reviews answer markers, and publishes native answer clips
 
 ## What It Does Not Do Yet
 
-Today, Interview Studio assumes the clips and manifest already exist.
+The Phase 1 assembly lane still assumes the clips and manifest already exist.
 
-It does not yet create source clips, ingest raw media into this project format, or author the manifest from scratch inside the app.
+Phase 2 can now ingest recordings and generate a new package-backed manifest, but its workflow remains incomplete: multipart answers, full boundary QA, cancellation/retry UX, incremental manifest editing, and a real-media round trip still require validation.
 
-That broader workflow is intended for a later phase: tools to create clips, add clips, and build or extend the manifest inside the app instead of arriving with those pieces pre-generated.
+The Phase 2 implementation status is tracked in [docs/PHASE_2_PLAN.md](docs/PHASE_2_PLAN.md) and [docs/WHERE_WE_STAND.md](docs/WHERE_WE_STAND.md).
 
 Phase 1 is intentionally narrow; these are boundaries of the completed phase and the broader product:
 
@@ -42,7 +43,7 @@ Phase 1 is intentionally narrow; these are boundaries of the completed phase and
 
 ## Workflow Shape
 
-The current app is meant to sit on top of an existing clip/manifest generation pipeline rather than replace it.
+The Phase 1 assembly lane sits on top of an existing clip/manifest generation pipeline. The Phase 2 prototype now covers part of the source-media side while it is being validated.
 
 The rough shape is:
 
@@ -52,7 +53,7 @@ The rough shape is:
 4. Export the HDR master movie.
 5. Optionally keep the Plex companion output if you want a library-friendly copy.
 
-A future phase is meant to absorb more of step 1 into the app itself.
+The remaining Phase 2 work is tracked separately and is not yet a release-ready replacement for the prepared-project workflow.
 
 The app keeps its own sidecar state in `yearly_interview_studio_project.json` so presentation edits and metadata do not have to mutate the source manifest.
 
@@ -68,7 +69,7 @@ The app keeps its own sidecar state in `yearly_interview_studio_project.json` so
 
 - macOS only
 - single-person projects only
-- requires an already-prepared manifest-backed project folder
+- Phase 1 requires an already-prepared manifest-backed project folder
 - export can be slow on CPU-heavy systems, especially for card generation and SDR-to-HLG conversion
 - FFmpeg / FFprobe availability still matters
 - the Plex metadata path is intentionally simple and can block export until required fields are filled in or disabled
@@ -79,8 +80,8 @@ For the fuller current-state view, see [docs/WHERE_WE_STAND.md](docs/WHERE_WE_ST
 
 Requirements:
 
-- macOS 14 or newer
-- Swift toolchain compatible with `swift-tools-version: 6.0`
+- macOS 26 or newer
+- Swift toolchain compatible with `swift-tools-version: 6.2`
 - a compatible `ffmpeg`/`ffprobe` pair with `zscale`, `xfade`, `acrossfade`, `overlay`, and `libx265`; the app checks the bundled tools and other installed candidates until it finds a capable pair
 
 Build the app bundle:
@@ -133,7 +134,7 @@ The CLI expects the project folder to contain `final_manifest.json`. It prints p
 
 ## Notes On Packaging
 
-The packaged `.app` is built from source-controlled version values in `script/build_and_run.sh`, and the build script copies in an app icon plus bundled `ffmpeg` / `ffprobe` when those tools are available on the host machine. At runtime, the renderer preflights each discovered FFmpeg installation instead of assuming the first one is capable; if none is suitable, the app explains what is missing and asks the user to install a compatible build.
+The packaged `.app` is built from source-controlled version values in `Sources/Core/Support/AppVersion.swift`. The build script copies the app icon and a complete host `ffmpeg` / `ffprobe` pair only when both tools are present, writes version/hash provenance into the bundle, and carries [ATTRIBUTIONS.md](ATTRIBUTIONS.md). This is a host-specific local development build; ad hoc signing is not distribution signing. At runtime, the renderer preflights each discovered FFmpeg installation instead of assuming the first one is capable.
 
 This means the app is currently convenient for local use, but still early as a polished distribution story.
 
