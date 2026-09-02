@@ -2,6 +2,30 @@ import Core
 import XCTest
 
 final class RendererTests: XCTestCase {
+    func testRenderOutputValidatorRejectsWrongCodecAndAcceptsProtectedProfile() throws {
+        let base = MediaInspectionResult(
+            url: URL(fileURLWithPath: "/tmp/output.mov"),
+            durationSeconds: 10,
+            width: 640,
+            height: 360,
+            frameRate: 30,
+            pixFmt: "yuv420p10le",
+            colorSpace: "bt2020nc",
+            colorTransfer: "arib-std-b67",
+            colorPrimaries: "bt2020",
+            hasAudio: true,
+            audioChannels: 2,
+            colorInfo: ColorInfo(isHDR: true, colorPrimaries: "bt2020", transferFunction: "arib-std-b67", transferFlavor: .hlg, isDisplayP3Like: false),
+            codecName: "hevc",
+            formatName: "mov"
+        )
+        XCTAssertNoThrow(try RenderOutputValidator().validate(base, against: .rendererTest, expectedDurationSeconds: 10))
+
+        var wrongCodec = base
+        wrongCodec.codecName = "h264"
+        XCTAssertThrowsError(try RenderOutputValidator().validate(wrongCodec, against: .rendererTest))
+    }
+
     func testRendererProducesPlayableMovie() async throws {
         guard ProcessInfo.processInfo.environment["RUN_RENDERER_SMOKE_TESTS"] == "1" else {
             throw XCTSkip("Renderer smoke test is opt-in because it depends on the local ffmpeg toolchain and GUI template rendering support.")

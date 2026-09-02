@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 public enum AssemblyIssueSeverity: String, Codable, CaseIterable, Sendable {
@@ -21,7 +22,17 @@ public struct AssemblyIssue: Codable, Hashable, Sendable, Identifiable {
         aiContext: [String: JSONValue] = [:],
         suggestedFix: String = ""
     ) {
-        self.id = UUID()
+        let context = aiContext.keys.sorted().map { key in
+            "\(key)=\(String(describing: aiContext[key]!))"
+        }.joined(separator: "&")
+        let identity = [severity.rawValue, code, humanMessage, context, suggestedFix].joined(separator: "|")
+        let digest = Array(SHA256.hash(data: Data(identity.utf8)).prefix(16))
+        self.id = UUID(uuid: (
+            digest[0], digest[1], digest[2], digest[3], digest[4], digest[5],
+            (digest[6] & 0x0f) | 0x50, digest[7],
+            (digest[8] & 0x3f) | 0x80, digest[9], digest[10], digest[11],
+            digest[12], digest[13], digest[14], digest[15]
+        ))
         self.severity = severity
         self.code = code
         self.humanMessage = humanMessage

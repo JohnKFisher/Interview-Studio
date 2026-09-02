@@ -233,7 +233,7 @@ public struct InterviewStudioPackageStore: Sendable {
         captureDate: Date? = nil,
         order: Int = 0,
         firstQuestionHint: String? = nil
-    ) throws -> ImportedRecording {
+    ) async throws -> ImportedRecording {
         let sourceURL = sourceURL.standardizedFileURL
         var isDirectory: ObjCBool = false
         guard FileManager.default.fileExists(atPath: sourceURL.path, isDirectory: &isDirectory), !isDirectory.boolValue else {
@@ -260,7 +260,7 @@ public struct InterviewStudioPackageStore: Sendable {
         try FileManager.default.moveItem(at: staged, to: destination)
 
         var signature = MediaSignature(byteCount: fileByteCount(destination), sha256: sourceHash)
-        if let inspection = try? NativeMediaInspector().inspect(url: destination) {
+        if let inspection = try? await NativeMediaInspector().inspect(url: destination) {
             signature.durationMicroseconds = inspection.duration.microseconds
             signature.width = inspection.width
             signature.height = inspection.height
@@ -316,18 +316,19 @@ public struct InterviewStudioPackageStore: Sendable {
     }
 
     private func inventoryEntries() throws -> [PackageInventoryEntry] {
-        guard let enumerator = FileManager.default.enumerator(at: rootURL, includingPropertiesForKeys: [.isDirectoryKey, .fileSizeKey], options: [.skipsHiddenFiles]) else { return [] }
+        let paths = try FileManager.default.subpathsOfDirectory(atPath: rootURL.path)
         var entries: [PackageInventoryEntry] = []
-        while let item = enumerator.nextObject() as? URL {
-            let values = try item.resourceValues(forKeys: [.isDirectoryKey])
-            guard values.isDirectory != true else { continue }
-            let rootPrefix = rootURL.path.hasSuffix("/") ? rootURL.path : rootURL.path + "/"
-            guard item.path.hasPrefix(rootPrefix) else { continue }
-            let relative = String(item.path.dropFirst(rootPrefix.count))
-            guard relative != Self.inventoryFilename && relative != Self.inventoryDigestFilename else { continue }
+        for relative in paths.sorted() {
+            let components = relative.split(separator: "/").map(String.init)
+            guard !components.contains(where: { $0.hasPrefix(".") }),
+                  relative != Self.inventoryFilename,
+                  relative != Self.inventoryDigestFilename else { continue }
+            let item = rootURL.appendingPathComponent(relative)
+            var isDirectory: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: item.path, isDirectory: &isDirectory), !isDirectory.boolValue else { continue }
             entries.append(PackageInventoryEntry(relativePath: relative, byteCount: fileByteCount(item), sha256: sha256(fileURL: item), kind: entryKind(for: relative)))
         }
-        return entries.sorted { $0.relativePath < $1.relativePath }
+        return entries
     }
 
     private func entryKind(for relativePath: String) -> PackageEntryKind {

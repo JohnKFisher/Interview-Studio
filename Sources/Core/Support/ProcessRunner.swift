@@ -12,7 +12,7 @@ public enum ProcessRunnerError: LocalizedError {
     public var errorDescription: String? {
         switch self {
         case .nonZeroExit(let command, let status, let stderr):
-            return "Command failed (\(status)): \(command)\n\(stderr)"
+            return "Command failed (\(status)): \(command)\n\(ProcessRunner.redactDiagnosticText(stderr))"
         }
     }
 }
@@ -80,7 +80,7 @@ public struct ProcessRunner {
         let output = ProcessOutput(status: process.terminationStatus, stdout: stdout, stderr: stderr)
 
         guard output.status == 0 else {
-            let command = ([executableURL.path] + arguments).joined(separator: " ")
+            let command = "\(executableURL.lastPathComponent) (arguments redacted)"
             throw ProcessRunnerError.nonZeroExit(command: command, status: output.status, stderr: stderr)
         }
 
@@ -95,19 +95,15 @@ public struct ProcessRunner {
         destinationURL: URL
     ) throws {
         let timestamp = ISO8601DateFormatter().string(from: Date())
-        let command = ([shellEscape(executableURL.path)] + arguments.map(shellEscape)).joined(separator: " ")
         var lines = ["[\(timestamp)]"]
-        if let currentDirectoryURL {
-            lines.append("cwd=\(currentDirectoryURL.path)")
+        lines.append("tool=\(executableURL.lastPathComponent) argument_count=\(arguments.count)")
+        if currentDirectoryURL != nil {
+            lines.append("cwd=<redacted>")
         }
         if !environment.isEmpty {
-            let renderedEnvironment = environment
-                .sorted(by: { $0.key < $1.key })
-                .map { "\($0.key)=\(shellEscape($0.value))" }
-                .joined(separator: " ")
-            lines.append("env=\(renderedEnvironment)")
+            lines.append("environment_keys=\(environment.keys.sorted().joined(separator: ","))")
         }
-        lines.append(command)
+        lines.append("arguments=<redacted>")
         lines.append("")
 
         let payload = lines.joined(separator: "\n")
@@ -117,16 +113,16 @@ public struct ProcessRunner {
             try handle.seekToEnd()
             handle.write(Data(payload.utf8))
         } else {
-            try Data(payload.utf8).write(to: destinationURL)
+            try Data(payload.utf8).write(to: destinationURL, options: .atomic)
         }
     }
 
-    private func shellEscape(_ value: String) -> String {
-        if value.isEmpty {
-            return "''"
-        }
-        let escaped = value.replacingOccurrences(of: "'", with: "'\\''")
-        return "'\(escaped)'"
+    fileprivate static func redactDiagnosticText(_ value: String) -> String {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        return value
+            .replacingOccurrences(of: home, with: "<user-home>")
+            .replacingOccurrences(of: "/private/tmp", with: "<temp>")
+            .replacingOccurrences(of: NSTemporaryDirectory(), with: "<temp>")
     }
 }
 

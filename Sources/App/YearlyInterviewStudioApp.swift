@@ -60,7 +60,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 savePanel.allowedContentTypes = [.interviewStudioProject]
                 guard savePanel.runModal() == .OK, let destinationURL = savePanel.url else { return }
                 let result = try await Task.detached(priority: .userInitiated) {
-                    try LegacyMigrationService().import(analysis: analysis, to: destinationURL)
+                    try await LegacyMigrationService().import(analysis: analysis, to: destinationURL)
                 }.value
                 openDocument(at: result.packageURL)
             } catch {
@@ -96,11 +96,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             showAlert(title: "No saved package", message: "Save the document before verifying its package inventory.")
             return
         }
-        do {
-            try store.verifyInventory()
-            showAlert(title: "Package verified", message: "The package inventory and recorded source bytes are intact.")
-        } catch {
-            showAlert(title: "Package verification failed", message: error.localizedDescription)
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                try await Task.detached(priority: .utility) {
+                    try store.verifyInventory()
+                }.value
+                showAlert(title: "Package verified", message: "The package inventory and recorded source bytes are intact.")
+            } catch {
+                showAlert(title: "Package verification failed", message: error.localizedDescription)
+            }
         }
     }
 

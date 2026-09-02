@@ -183,7 +183,7 @@ public struct LegacyMigrationService: Sendable {
         )
     }
 
-    public func `import`(analysis: LegacyMigrationAnalysis, to packageURL: URL) throws -> LegacyImportResult {
+    public func `import`(analysis: LegacyMigrationAnalysis, to packageURL: URL) async throws -> LegacyImportResult {
         guard analysis.canImport else {
             throw InterviewStudioCompatibilityError.invalid("The legacy project has unresolved blockers. Resolve them before importing.")
         }
@@ -198,7 +198,14 @@ public struct LegacyMigrationService: Sendable {
             settings = AssemblySettings(renderSettings: legacy.renderSettings, plexMetadata: legacy.plexMetadata, openingTitle: legacy.openingTitle, closingTitle: legacy.closingTitle)
         }
         let project = InterviewStudioProject(person: InterviewPerson(readableKey: personKey, displayName: analysis.personName), questions: questions, assemblySettings: settings)
-        let store = try InterviewStudioPackageStore.create(project: project, at: packageURL)
+        let destination = packageURL.standardizedFileURL
+        guard !FileManager.default.fileExists(atPath: destination.path) else {
+            throw InterviewStudioPackageError.fileExists(destination)
+        }
+        let stagingURL = destination.deletingLastPathComponent()
+            .appendingPathComponent(".\\(destination.lastPathComponent).\\(UUID().uuidString).interviewstudio-staging", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: stagingURL) }
+        let store = try InterviewStudioPackageStore.create(project: project, at: stagingURL)
         let legacyRoot = store.rootURL.appendingPathComponent("Legacy Import/Original", isDirectory: true)
         try FileManager.default.createDirectory(at: legacyRoot, withIntermediateDirectories: true)
         try FileManager.default.copyItem(at: analysis.manifestURL, to: legacyRoot.appendingPathComponent("final_manifest.json"))
@@ -227,7 +234,7 @@ public struct LegacyMigrationService: Sendable {
                     byteCount: ((try? FileManager.default.attributesOfItem(atPath: destination.path)[.size] as? NSNumber)?.int64Value) ?? 0,
                     sha256: sha256(fileURL: destination)
                 )
-                let inspection = try? NativeMediaInspector().inspect(url: destination)
+                let inspection = try? await NativeMediaInspector().inspect(url: destination)
                 if let inspection {
                     signature.durationMicroseconds = inspection.duration.microseconds
                     signature.width = inspection.width
@@ -330,7 +337,11 @@ public struct LegacyMigrationService: Sendable {
         updatedProject.migrationHistoryIDs.append(record.id)
         try store.writeProject(updatedProject)
         try store.rebuildInventory()
-        return LegacyImportResult(packageURL: store.rootURL, analysis: analysis, migrationRecord: record)
+        guard !FileManager.default.fileExists(atPath: destination.path) else {
+            throw InterviewStudioPackageError.fileExists(destination)
+        }
+        try FileManager.default.moveItem(at: stagingURL, to: destination)
+        return LegacyImportResult(packageURL: destination, analysis: analysis, migrationRecord: record)
     }
 }
 

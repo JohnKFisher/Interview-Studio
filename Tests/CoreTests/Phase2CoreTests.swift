@@ -37,7 +37,7 @@ final class Phase2CoreTests: XCTestCase {
         XCTAssertEqual(session.revision, 1)
     }
 
-    func testLegacyImportAttachesPublishedClipsAndLocksImportedYears() throws {
+    func testLegacyImportAttachesPublishedClipsAndLocksImportedYears() async throws {
         let legacyRoot = FileManager.default.temporaryDirectory.appendingPathComponent("legacy-\(UUID().uuidString)", isDirectory: true)
         let packageRoot = FileManager.default.temporaryDirectory.appendingPathComponent("imported-\(UUID().uuidString).interviewstudio", isDirectory: true)
         defer {
@@ -80,7 +80,7 @@ final class Phase2CoreTests: XCTestCase {
 
         let service = LegacyMigrationService()
         let analysis = try service.analyze(sourceFolder: legacyRoot)
-        let result = try service.import(analysis: analysis, to: packageRoot)
+        let result = try await service.import(analysis: analysis, to: packageRoot)
         let store = try InterviewStudioPackageStore(rootURL: result.packageURL)
         try store.verifyInventory()
         let sessions = try store.listSessions()

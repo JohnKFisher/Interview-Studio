@@ -53,36 +53,52 @@ public enum NativeMediaInspectionError: LocalizedError, Sendable {
 public struct NativeMediaInspector: Sendable {
     public init() {}
 
-    public func inspect(url: URL) throws -> NativeMediaInspection {
+    public func inspect(url: URL) async throws -> NativeMediaInspection {
         let asset = AVURLAsset(url: url)
-        guard asset.isPlayable else { throw NativeMediaInspectionError.unreadable(url) }
-        guard let videoTrack = asset.tracks(withMediaType: .video).first else { throw NativeMediaInspectionError.missingVideo(url) }
-        guard let audioTrack = asset.tracks(withMediaType: .audio).first else { throw NativeMediaInspectionError.missingAudio(url) }
-        guard asset.duration.isNumeric, asset.duration.timescale > 0 else { throw NativeMediaInspectionError.invalidDuration(url) }
+        do {
+            guard try await asset.load(.isPlayable) else {
+                throw NativeMediaInspectionError.unreadable(url)
+            }
+            guard let videoTrack = try await asset.loadTracks(withMediaType: .video).first else {
+                throw NativeMediaInspectionError.missingVideo(url)
+            }
+            guard let audioTrack = try await asset.loadTracks(withMediaType: .audio).first else {
+                throw NativeMediaInspectionError.missingAudio(url)
+            }
+            let duration = try await asset.load(.duration)
+            guard duration.isNumeric, duration.timescale > 0 else {
+                throw NativeMediaInspectionError.invalidDuration(url)
+            }
 
-        let size = videoTrack.naturalSize
-        let nominalFrameRate = Double(videoTrack.nominalFrameRate)
-        let audioChannels = audioTrack.formatDescriptions.compactMap { description -> Int? in
-            let audioDescription = description as! CMAudioFormatDescription
-            guard let streamDescription = CMAudioFormatDescriptionGetStreamBasicDescription(audioDescription) else { return nil }
-            return Int(streamDescription.pointee.mChannelsPerFrame)
-        }.first ?? 0
-
-        let color = colorProperties(from: videoTrack.formatDescriptions.first as! CMFormatDescription)
-        return NativeMediaInspection(
-            url: url,
-            duration: MediaTime(value: asset.duration.value, timescale: asset.duration.timescale),
-            width: Int(abs(size.width.rounded())),
-            height: Int(abs(size.height.rounded())),
-            nominalFrameRate: nominalFrameRate,
-            audioChannels: audioChannels,
-            hasVideo: true,
-            hasAudio: true,
-            colorPrimaries: color.primaries,
-            colorTransfer: color.transfer,
-            colorMatrix: color.matrix,
-            hdrMetadataSummary: color.hdrSummary
-        )
+            let size = try await videoTrack.load(.naturalSize)
+            let nominalFrameRate = Double(try await videoTrack.load(.nominalFrameRate))
+            let audioDescriptions = try await audioTrack.load(.formatDescriptions)
+            let audioChannels = audioDescriptions.compactMap { description -> Int? in
+                let audioDescription = description
+                guard let streamDescription = CMAudioFormatDescriptionGetStreamBasicDescription(audioDescription) else { return nil }
+                return Int(streamDescription.pointee.mChannelsPerFrame)
+            }.first ?? 0
+            let videoDescriptions = try await videoTrack.load(.formatDescriptions)
+            let color = colorProperties(from: videoDescriptions.first)
+            return NativeMediaInspection(
+                url: url,
+                duration: MediaTime(value: duration.value, timescale: duration.timescale),
+                width: Int(abs(size.width.rounded())),
+                height: Int(abs(size.height.rounded())),
+                nominalFrameRate: nominalFrameRate,
+                audioChannels: audioChannels,
+                hasVideo: true,
+                hasAudio: true,
+                colorPrimaries: color.primaries,
+                colorTransfer: color.transfer,
+                colorMatrix: color.matrix,
+                hdrMetadataSummary: color.hdrSummary
+            )
+        } catch let error as NativeMediaInspectionError {
+            throw error
+        } catch {
+            throw NativeMediaInspectionError.unreadable(url)
+        }
     }
 
     private func colorProperties(from description: CMFormatDescription?) -> (primaries: String?, transfer: String?, matrix: String?, hdrSummary: String?) {

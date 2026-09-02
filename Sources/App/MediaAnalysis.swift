@@ -42,7 +42,7 @@ enum MediaAnalysisError: LocalizedError, Sendable {
 struct MediaAudioExtractor: Sendable {
     func extract(from url: URL) async throws -> URL {
         let asset = AVURLAsset(url: url)
-        guard asset.tracks(withMediaType: .audio).first != nil else {
+        guard try await asset.loadTracks(withMediaType: .audio).first != nil else {
             throw MediaAnalysisError.missingAudio(url)
         }
 

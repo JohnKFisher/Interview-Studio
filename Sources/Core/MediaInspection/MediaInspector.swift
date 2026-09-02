@@ -88,6 +88,40 @@ public struct MediaInspectionResult: Sendable, Hashable {
     public var hasAudio: Bool
     public var audioChannels: Int
     public var colorInfo: ColorInfo
+    public var codecName: String?
+    public var formatName: String?
+
+    public init(
+        url: URL,
+        durationSeconds: Double,
+        width: Int,
+        height: Int,
+        frameRate: Double,
+        pixFmt: String? = nil,
+        colorSpace: String? = nil,
+        colorTransfer: String? = nil,
+        colorPrimaries: String? = nil,
+        hasAudio: Bool,
+        audioChannels: Int,
+        colorInfo: ColorInfo,
+        codecName: String? = nil,
+        formatName: String? = nil
+    ) {
+        self.url = url
+        self.durationSeconds = durationSeconds
+        self.width = width
+        self.height = height
+        self.frameRate = frameRate
+        self.pixFmt = pixFmt
+        self.colorSpace = colorSpace
+        self.colorTransfer = colorTransfer
+        self.colorPrimaries = colorPrimaries
+        self.hasAudio = hasAudio
+        self.audioChannels = audioChannels
+        self.colorInfo = colorInfo
+        self.codecName = codecName
+        self.formatName = formatName
+    }
 }
 
 public enum FFmpegLocatorError: LocalizedError {
@@ -213,7 +247,7 @@ public struct MediaInspector {
         let data = Data(output.stdout.utf8)
         let decoded = try JSONDecoder().decode(FFprobeEnvelope.self, from: data)
         guard let video = decoded.streams.first(where: { $0.codecType == "video" }) else {
-            throw ManifestParserError.invalidJSON("ffprobe did not return a video stream for \(url.lastPathComponent).")
+            throw MediaInspectionError.missingVideo(url)
         }
 
         let audio = decoded.streams.first(where: { $0.codecType == "audio" })
@@ -233,11 +267,18 @@ public struct MediaInspector {
         let isDisplayP3Like = primaries.contains("p3") || primaries.contains("smpte432")
         let isHDR = transferFlavor != .sdr || primaries.contains("2020") || (video.pixFmt ?? "").contains("10")
 
+        let duration = Double(decoded.format?.duration ?? "") ?? 0
+        let width = video.width ?? 0
+        let height = video.height ?? 0
+        guard duration.isFinite, duration > 0, width > 0, height > 0, frameRate.isFinite, frameRate > 0 else {
+            throw MediaInspectionError.invalidVideoMetadata(url)
+        }
+
         return MediaInspectionResult(
             url: url,
-            durationSeconds: Double(decoded.format?.duration ?? "") ?? 0,
-            width: video.width ?? 0,
-            height: video.height ?? 0,
+            durationSeconds: duration,
+            width: width,
+            height: height,
             frameRate: frameRate,
             pixFmt: video.pixFmt,
             colorSpace: video.colorSpace,
@@ -251,7 +292,9 @@ public struct MediaInspector {
                 transferFunction: video.colorTransfer,
                 transferFlavor: transferFlavor,
                 isDisplayP3Like: isDisplayP3Like
-            )
+            ),
+            codecName: video.codecName,
+            formatName: decoded.format?.formatName
         )
     }
 
@@ -268,6 +311,7 @@ public struct MediaInspector {
 private struct FFprobeEnvelope: Decodable {
     struct Stream: Decodable {
         var codecType: String?
+        var codecName: String?
         var width: Int?
         var height: Int?
         var pixFmt: String?
@@ -279,6 +323,7 @@ private struct FFprobeEnvelope: Decodable {
 
         enum CodingKeys: String, CodingKey {
             case codecType = "codec_type"
+            case codecName = "codec_name"
             case width
             case height
             case pixFmt = "pix_fmt"
@@ -292,8 +337,77 @@ private struct FFprobeEnvelope: Decodable {
 
     struct Format: Decodable {
         var duration: String?
+        var formatName: String?
+
+        enum CodingKeys: String, CodingKey {
+            case duration
+            case formatName = "format_name"
+        }
     }
 
     var streams: [Stream]
     var format: Format?
+}
+
+
+public enum MediaInspectionError: LocalizedError, Sendable {
+    case missingVideo(URL)
+    case invalidVideoMetadata(URL)
+
+    public var errorDescription: String? {
+        switch self {
+        case .missingVideo(let url): return "ffprobe did not return a video stream for \(url.lastPathComponent)."
+        case .invalidVideoMetadata(let url): return "The media has incomplete or invalid video duration, dimensions, or frame-rate metadata: \(url.lastPathComponent)."
+        }
+    }
+}
+
+public struct RenderOutputValidator: Sendable {
+    public init() {}
+
+    public func validate(_ inspection: MediaInspectionResult, against profile: ExportProfile, expectedDurationSeconds: Double? = nil) throws {
+        let codec = inspection.codecName?.lowercased() ?? ""
+        guard codec.contains("hevc") || codec.contains("h265") else {
+            throw RenderOutputValidationError.mismatch(field: "codec", expected: "HEVC", observed: inspection.codecName ?? "missing")
+        }
+        guard inspection.width == profile.width, inspection.height == profile.height else {
+            throw RenderOutputValidationError.mismatch(field: "dimensions", expected: "\(profile.width)x\(profile.height)", observed: "\(inspection.width)x\(inspection.height)")
+        }
+        let frameTolerance = max(0.5, profile.frameRate * 0.01)
+        guard abs(inspection.frameRate - profile.frameRate) <= frameTolerance else {
+            throw RenderOutputValidationError.mismatch(field: "frame rate", expected: "\(profile.frameRate) fps", observed: "\(inspection.frameRate) fps")
+        }
+        guard inspection.pixFmt?.lowercased().contains("10") == true else {
+            throw RenderOutputValidationError.mismatch(field: "pixel format", expected: "10-bit", observed: inspection.pixFmt ?? "missing")
+        }
+        guard inspection.colorPrimaries?.lowercased().contains("2020") == true else {
+            throw RenderOutputValidationError.mismatch(field: "color primaries", expected: profile.colorPrimaries, observed: inspection.colorPrimaries ?? "missing")
+        }
+        guard inspection.colorTransfer?.lowercased().contains("b67") == true || inspection.colorTransfer?.lowercased().contains("hlg") == true else {
+            throw RenderOutputValidationError.mismatch(field: "transfer", expected: profile.colorTransfer, observed: inspection.colorTransfer ?? "missing")
+        }
+        guard inspection.colorSpace?.lowercased().contains("2020") == true else {
+            throw RenderOutputValidationError.mismatch(field: "matrix/colorspace", expected: profile.colorMatrix, observed: inspection.colorSpace ?? "missing")
+        }
+        guard inspection.hasAudio, inspection.audioChannels > 0 else {
+            throw RenderOutputValidationError.mismatch(field: "audio", expected: "an audio stream", observed: "missing or empty")
+        }
+        if let expectedDurationSeconds {
+            let tolerance = max(0.25, 4.0 / profile.frameRate)
+            guard abs(inspection.durationSeconds - expectedDurationSeconds) <= tolerance else {
+                throw RenderOutputValidationError.mismatch(field: "duration", expected: "within \(tolerance) s of \(expectedDurationSeconds)", observed: "\(inspection.durationSeconds) s")
+            }
+        }
+    }
+}
+
+public enum RenderOutputValidationError: LocalizedError, Sendable {
+    case mismatch(field: String, expected: String, observed: String)
+
+    public var errorDescription: String? {
+        switch self {
+        case .mismatch(let field, let expected, let observed):
+            return "Rendered output validation failed for \(field): expected \(expected), observed \(observed)."
+        }
+    }
 }

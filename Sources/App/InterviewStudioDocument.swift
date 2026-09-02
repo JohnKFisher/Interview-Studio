@@ -26,11 +26,9 @@ final class InterviewStudioDocument: NSDocument {
         super.init()
     }
 
-    override func read(from url: URL, ofType typeName: String) throws {
+    nonisolated override func read(from url: URL, ofType typeName: String) throws {
         let store = try InterviewStudioPackageStore(rootURL: url)
         let project = try store.readProjectAllowingReadOnly()
-        self.packageStore = store
-        self.project = project
         var sessions = try store.listSessions()
         let legacyRowsURL = url.appendingPathComponent("Legacy Import/Original/legacy_rows.json")
         if let data = try? Data(contentsOf: legacyRowsURL),
@@ -38,19 +36,26 @@ final class InterviewStudioDocument: NSDocument {
             let restorer = LegacyRangeRestorer()
             sessions = sessions.map { restorer.repair(session: $0, rows: rows) }
         }
-        self.sessions = sessions
-        isPackageReadOnly = !project.compatibility.isWritable
+        MainActor.assumeIsolated {
+            self.packageStore = store
+            self.project = project
+            self.sessions = sessions
+            self.isPackageReadOnly = !project.compatibility.isWritable
+        }
     }
 
-    override func write(to url: URL, ofType typeName: String) throws {
-        guard !isPackageReadOnly else {
-            throw InterviewStudioPackageError.incompatible(project.compatibility)
+    nonisolated override func write(to url: URL, ofType typeName: String) throws {
+        let snapshot = MainActor.assumeIsolated {
+            (isPackageReadOnly, project, sessions, packageStore)
+        }
+        guard !snapshot.0 else {
+            throw InterviewStudioPackageError.incompatible(snapshot.1.compatibility)
         }
         let destination = url.standardizedFileURL
         let store: InterviewStudioPackageStore
-        if let existingStore = packageStore, existingStore.rootURL == destination {
+        if let existingStore = snapshot.3, existingStore.rootURL == destination {
             store = existingStore
-        } else if let existingStore = packageStore {
+        } else if let existingStore = snapshot.3 {
             var isDirectory: ObjCBool = false
             guard !FileManager.default.fileExists(atPath: destination.path, isDirectory: &isDirectory) else {
                 throw InterviewStudioPackageError.fileExists(destination)
@@ -58,14 +63,16 @@ final class InterviewStudioDocument: NSDocument {
             try FileManager.default.copyItem(at: existingStore.rootURL, to: destination)
             store = try InterviewStudioPackageStore(rootURL: destination)
         } else {
-            store = try InterviewStudioPackageStore.create(project: project, at: destination)
+            store = try InterviewStudioPackageStore.create(project: snapshot.1, at: destination)
         }
-        try store.writeProject(project)
-        for session in sessions {
+        try store.writeProject(snapshot.1)
+        for session in snapshot.2 {
             try store.writeSession(session)
         }
         try store.rebuildInventory()
-        packageStore = store
+        MainActor.assumeIsolated {
+            packageStore = store
+        }
     }
 
     override func data(ofType typeName: String) throws -> Data {

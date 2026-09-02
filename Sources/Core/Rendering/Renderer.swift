@@ -9,6 +9,14 @@ public struct RenderResult: Sendable {
     public var outputURL: URL
     public var plexOutputURL: URL?
     public var diagnosticsURL: URL?
+    public var plexWarning: String?
+
+    public init(outputURL: URL, plexOutputURL: URL?, diagnosticsURL: URL?, plexWarning: String? = nil) {
+        self.outputURL = outputURL
+        self.plexOutputURL = plexOutputURL
+        self.diagnosticsURL = diagnosticsURL
+        self.plexWarning = plexWarning
+    }
 }
 
 public enum RendererError: LocalizedError {
@@ -39,6 +47,7 @@ public final class Renderer: @unchecked Sendable {
     private let locator = FFmpegLocator()
     private let preflight = FFmpegPreflight()
     private let inspector = MediaInspector()
+    private let outputValidator = RenderOutputValidator()
 
     public init() {}
 
@@ -55,8 +64,14 @@ public final class Renderer: @unchecked Sendable {
         }
 
         let workspace = try makeWorkspace(baseURL: diagnosticsRoot)
+        var stagedOutputURLs: [URL] = []
+        defer {
+            for url in stagedOutputURLs {
+                try? FileManager.default.removeItem(at: url)
+            }
+        }
         do {
-            let planData = try JSONEncoder.pretty.encode(plan)
+            let planData = try diagnosticPlanData(plan)
             try planData.write(to: workspace.tempRootURL.appendingPathComponent("render_plan.json"))
 
             progress(.init(phase: "preflight", detail: "Locating ffmpeg and verifying required filters/codecs."))
@@ -159,33 +174,46 @@ public final class Renderer: @unchecked Sendable {
 
             let outputURL = try finalOutputURL(for: plan, outputRoot: outputRoot)
             try FileManager.default.createDirectory(at: outputURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+            let stagedMasterURL = stagingURL(for: outputURL)
+            stagedOutputURLs.append(stagedMasterURL)
             try runner.run(
                 executableURL: binaries.ffmpegURL,
                 arguments: finalAssemblyArguments(
                     concatFileURL: workspace.concatFileURL,
-                    outputURL: outputURL,
+                    outputURL: stagedMasterURL,
                     profile: plan.exportProfile
                 ),
                 commandLogURL: workspace.commandLogURL
             )
+            let masterInspection = try inspector.inspect(url: stagedMasterURL, using: binaries)
+            try outputValidator.validate(masterInspection, against: plan.exportProfile, expectedDurationSeconds: plan.summary.estimatedRuntimeSeconds)
+            try promote(stagedURL: stagedMasterURL, to: outputURL)
+            stagedOutputURLs.removeAll { $0 == stagedMasterURL }
 
             var plexOutputURL: URL?
+            var plexWarning: String?
             if let plexMetadata = plan.plexMetadata {
                 progress(.init(phase: "plex", detail: "Packaging Plex-friendly MP4 companion with metadata and chapters."))
-                plexOutputURL = try packagePlexCompanion(
-                    plan: plan,
-                    plexMetadata: plexMetadata,
-                    masterOutputURL: outputURL,
-                    workspace: workspace,
-                    binaries: binaries
-                )
+                do {
+                    plexOutputURL = try packagePlexCompanion(
+                        plan: plan,
+                        plexMetadata: plexMetadata,
+                        masterOutputURL: outputURL,
+                        workspace: workspace,
+                        binaries: binaries,
+                        stagedOutputURLs: &stagedOutputURLs
+                    )
+                } catch {
+                    plexWarning = "Plex companion was not published; the validated HDR master is available. \(error.localizedDescription)"
+                    progress(.init(phase: "plex-warning", detail: plexWarning!))
+                }
             }
 
             let diagnosticsURL = keepSuccessfulDiagnostics ? try persistDiagnostics(from: workspace) : nil
             try cleanupTemporaryArtifacts(at: workspace.tempRootURL)
 
             progress(.init(phase: "done", detail: "Finished rendering \(outputURL.lastPathComponent)."))
-            return RenderResult(outputURL: outputURL, plexOutputURL: plexOutputURL, diagnosticsURL: diagnosticsURL)
+            return RenderResult(outputURL: outputURL, plexOutputURL: plexOutputURL, diagnosticsURL: diagnosticsURL, plexWarning: plexWarning)
         } catch is CancellationError {
             try? cleanupTemporaryArtifacts(at: workspace.tempRootURL)
             throw CancellationError()
@@ -656,7 +684,10 @@ public final class Renderer: @unchecked Sendable {
         case .sdr:
             let transferIn = (colorInfo.transferFunction ?? "").lowercased().contains("iec61966") ? "iec61966-2-1" : "bt709"
             let primariesIn = colorInfo.isDisplayP3Like ? "smpte432" : "bt709"
-            return "colorspace=iall=bt709:all=bt709:fast=1,zscale=transferin=\(transferIn):primariesin=\(primariesIn):matrixin=bt709:transfer=linear,format=gbrpf32le,zscale=transfer=\(profile.colorTransfer):primaries=\(profile.colorPrimaries):matrix=\(profile.colorMatrix):range=tv:npl=400,eq=contrast=1.08"
+            let sourceClassIsKnown = colorInfo.transferFunction != nil || colorInfo.colorPrimaries != nil
+            let creativeAdjustment = sourceClassIsKnown ? ",eq=contrast=1.08" : ""
+            let declaredInput = "setparams=colorspace=bt709:color_primaries=\(primariesIn):color_trc=\(transferIn):range=tv"
+            return "\(declaredInput),zscale=transferin=\(transferIn):primariesin=\(primariesIn):matrixin=bt709:transfer=linear:rangein=tv,format=gbrpf32le,zscale=transfer=\(profile.colorTransfer):primaries=\(profile.colorPrimaries):matrix=\(profile.colorMatrix):range=tv:npl=400\(creativeAdjustment)"
         }
     }
 
@@ -699,6 +730,29 @@ public final class Renderer: @unchecked Sendable {
         )
     }
 
+    private func diagnosticPlanData(_ plan: RenderPlan) throws -> Data {
+        var safePlan = plan
+        safePlan.project.manifestPath = "<redacted>"
+        safePlan.project.mediaRoot = "<redacted>"
+        for index in safePlan.sequence.indices {
+            safePlan.sequence[index].clipRef?.resolvedPath = "<redacted>"
+        }
+        return try JSONEncoder.pretty.encode(safePlan)
+    }
+
+    private func stagingURL(for outputURL: URL) -> URL {
+        let extensionName = outputURL.pathExtension.isEmpty ? "tmp" : outputURL.pathExtension
+        return outputURL.deletingLastPathComponent()
+            .appendingPathComponent(".\(outputURL.lastPathComponent).\(UUID().uuidString).interviewstudio-staging.\(extensionName)")
+    }
+
+    private func promote(stagedURL: URL, to outputURL: URL) throws {
+        guard !FileManager.default.fileExists(atPath: outputURL.path) else {
+            throw RendererError.outputPathUnavailable
+        }
+        try FileManager.default.moveItem(at: stagedURL, to: outputURL)
+    }
+
     private func persistDiagnostics(from workspace: RenderWorkspace) throws -> URL {
         let destination = try makeDiagnosticsDirectory(baseURL: workspace.persistentBaseURL)
         let contents = try FileManager.default.contentsOfDirectory(at: workspace.tempRootURL, includingPropertiesForKeys: nil)
@@ -732,12 +786,15 @@ public final class Renderer: @unchecked Sendable {
         plexMetadata: PlexMetadataPlan,
         masterOutputURL: URL,
         workspace: RenderWorkspace,
-        binaries: FFmpegBinarySet
+        binaries: FFmpegBinarySet,
+        stagedOutputURLs: inout [URL]
     ) throws -> URL {
         let chapterURL = workspace.tempRootURL.appendingPathComponent("plex_chapters.ffmeta")
         try Data(ffmetadataText(for: plexMetadata.chapters).utf8).write(to: chapterURL)
 
         let outputURL = try plexOutputURL(for: masterOutputURL, metadata: plexMetadata)
+        let stagedURL = stagingURL(for: outputURL)
+        stagedOutputURLs.append(stagedURL)
         try runner.run(
             executableURL: binaries.ffmpegURL,
             arguments: plexPackagingArguments(
@@ -745,10 +802,14 @@ public final class Renderer: @unchecked Sendable {
                 plexMetadata: plexMetadata,
                 masterOutputURL: masterOutputURL,
                 chapterMetadataURL: chapterURL,
-                outputURL: outputURL
+                outputURL: stagedURL
             ),
             commandLogURL: workspace.commandLogURL
         )
+        let inspection = try inspector.inspect(url: stagedURL, using: binaries)
+        try outputValidator.validate(inspection, against: plan.exportProfile, expectedDurationSeconds: nil)
+        try promote(stagedURL: stagedURL, to: outputURL)
+        stagedOutputURLs.removeAll { $0 == stagedURL }
         return outputURL
     }
 

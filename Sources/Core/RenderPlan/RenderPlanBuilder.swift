@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 public struct RenderPlanBuilder {
@@ -116,10 +117,11 @@ public struct RenderPlanBuilder {
         issues.append(contentsOf: boundaries.flatMap(\.issues))
         let plexMetadata = buildPlexMetadataPlan(document: document, sequence: sequence, boundaries: boundaries, issues: &issues)
 
+        let normalizedIssues = deduplicatedIssues(issues)
         let summary = makeSummary(
             sequence: sequence,
             boundaries: boundaries,
-            issues: issues,
+            issues: normalizedIssues,
             questionCount: questionCount,
             answerCount: answerCount
         )
@@ -128,7 +130,7 @@ public struct RenderPlanBuilder {
             schemaVersion: "1.0",
             appName: "Yearly Interview Studio",
             project: .init(
-                projectID: project.personKey.isEmpty ? UUID().uuidString : project.personKey,
+                projectID: project.personKey.isEmpty ? stableProjectID(project: project, document: document) : project.personKey,
                 projectName: document.projectName,
                 manifestPath: project.manifestURL.path,
                 mediaRoot: project.mediaRoot.path
@@ -138,9 +140,19 @@ public struct RenderPlanBuilder {
             plexMetadata: plexMetadata,
             sequence: sequence,
             boundaries: boundaries,
-            issues: deduplicatedIssues(issues),
+            issues: normalizedIssues,
             summary: summary
         )
+    }
+
+    private func stableProjectID(project: LoadedManifestProject, document: ProjectDocument) -> String {
+        let seed = [
+            project.personName,
+            document.projectName,
+            document.manifestFilename,
+            project.questions.map(\.questionKey).sorted().joined(separator: "|")
+        ].joined(separator: "\u{1F}")
+        return SHA256.hash(data: Data(seed.utf8)).map { String(format: "%02x", $0) }.joined()
     }
 
     private func orderedQuestions(from project: LoadedManifestProject, using document: ProjectDocument) -> [QuestionGroup] {

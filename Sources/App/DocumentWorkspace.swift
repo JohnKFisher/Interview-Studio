@@ -201,9 +201,8 @@ final class InterviewStudioWorkspaceModel: ObservableObject {
                 self.sessions[sessionIndex].answers[questionKey] = answer
                 self.flushToDocument()
 
-                if let store = self.document?.packageStore {
-                    try store.writeSession(self.sessions[sessionIndex])
-                    try store.rebuildInventory()
+                if self.document?.packageStore != nil {
+                    try await self.persist(session: self.sessions[sessionIndex])
                 }
             } catch is CancellationError {
                 return
@@ -358,7 +357,7 @@ final class InterviewStudioWorkspaceModel: ObservableObject {
         let newPlayer = AVPlayer(url: url)
         player = newPlayer
         playerObservation.player = newPlayer
-        playerObservation.periodic = newPlayer.addPeriodicTimeObserver(forInterval: CMTime(value: 50_000, timescale: 1_000_000), queue: .main) { time in
+        playerObservation.periodic = newPlayer.addPeriodicTimeObserver(forInterval: CMTime(value: 50_000, timescale: 1_000_000), queue: .main) { [weak self] time in
             guard time.isNumeric else { return }
             Task { @MainActor [weak self] in
                 guard let self else { return }
@@ -391,11 +390,11 @@ final class InterviewStudioWorkspaceModel: ObservableObject {
         let start = CMTime(value: startUS, timescale: 1_000_000)
         let end = CMTime(value: endUS, timescale: 1_000_000)
         capturedPlayer.pause()
-        capturedPlayer.seek(to: start, toleranceBefore: .zero, toleranceAfter: .zero) { [capturedPlayer] _ in
+        capturedPlayer.seek(to: start, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self, capturedPlayer] _ in
             Task { @MainActor [weak self, capturedPlayer] in
                 guard let self, self.player === capturedPlayer else { return }
                 self.currentTimeUS = startUS
-                self.playerObservation.boundary = capturedPlayer.addBoundaryTimeObserver(forTimes: [NSValue(time: end)], queue: .main) { [capturedPlayer] in
+                self.playerObservation.boundary = capturedPlayer.addBoundaryTimeObserver(forTimes: [NSValue(time: end)], queue: .main) { [weak self, capturedPlayer] in
                     Task { @MainActor [weak self, capturedPlayer] in
                         guard let self, self.player === capturedPlayer else { return }
                         capturedPlayer.pause()
@@ -463,7 +462,7 @@ final class InterviewStudioWorkspaceModel: ObservableObject {
         let importTask = Task.detached(priority: .userInitiated) {
             var updated = session
             for (index, url) in recordingURLs.enumerated() {
-                let imported = try storeForImport.importRecording(
+                let imported = try await storeForImport.importRecording(
                     from: url,
                     ageKey: session.ageKey,
                     ageLabel: session.ageLabel,
@@ -562,13 +561,35 @@ final class InterviewStudioWorkspaceModel: ObservableObject {
 
     func unlockSelectedYear() {
         guard let store = document?.packageStore, let index = sessions.firstIndex(where: { $0.id == selectedSessionID }) else { return }
+        var unlockedSession = sessions[index]
         do {
-            try sessions[index].unlock()
-            try store.writeSession(sessions[index])
-            try store.rebuildInventory()
-            flushToDocument()
+            try unlockedSession.unlock()
         } catch {
             errorMessage = error.localizedDescription
+            return
+        }
+
+        isBusy = true
+        progressMessage = "Unlocking year…"
+        let unlockTask = Task.detached(priority: .utility) {
+            try store.writeSession(unlockedSession)
+            try store.rebuildInventory()
+            return unlockedSession
+        }
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                let persistedSession = try await unlockTask.value
+                guard let currentIndex = self.sessions.firstIndex(where: { $0.id == persistedSession.id }) else { return }
+                self.sessions[currentIndex] = persistedSession
+                self.isBusy = false
+                self.progressMessage = "Year unlocked."
+                self.flushToDocument()
+            } catch {
+                self.isBusy = false
+                self.progressMessage = nil
+                self.errorMessage = error.localizedDescription
+            }
         }
     }
 

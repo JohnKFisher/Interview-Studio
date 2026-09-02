@@ -56,8 +56,8 @@ public struct NativeAnswerPublisher: Sendable {
             throw NativePublishingError.exportFailed("The answer has no usable boundaries.")
         }
         let asset = AVURLAsset(url: sourceURL)
-        guard let sourceVideo = asset.tracks(withMediaType: .video).first,
-              let sourceAudio = asset.tracks(withMediaType: .audio).first else {
+        guard let sourceVideo = try await asset.loadTracks(withMediaType: .video).first,
+              let sourceAudio = try await asset.loadTracks(withMediaType: .audio).first else {
             throw NativePublishingError.sourceMissing(sourceURL.path)
         }
         let start = CMTime(value: boundaries.safeLeadingStart.value, timescale: boundaries.safeLeadingStart.timescale)
@@ -83,14 +83,21 @@ public struct NativeAnswerPublisher: Sendable {
         guard let exporter = AVAssetExportSession(asset: composition, presetName: preset) else {
             throw NativePublishingError.exportFailed("The system does not provide \(preset).")
         }
-        exporter.outputURL = outputURL
-        exporter.outputFileType = .mov
+        let stagedURL = outputURL.deletingLastPathComponent()
+            .appendingPathComponent(".\\(outputURL.lastPathComponent).\\(UUID().uuidString).interviewstudio-staging")
+        defer { try? FileManager.default.removeItem(at: stagedURL) }
         exporter.shouldOptimizeForNetworkUse = false
-        await exporter.export()
-        guard exporter.status == .completed else {
-            throw NativePublishingError.exportFailed(exporter.error?.localizedDescription ?? "Unknown export error.")
+        do {
+            try await exporter.export(to: stagedURL, as: .mov)
+        } catch {
+            throw NativePublishingError.exportFailed(error.localizedDescription)
         }
-        return try validate(outputURL: outputURL, expectedDuration: duration)
+        let inspection = try await validate(outputURL: stagedURL, expectedDuration: duration)
+        guard !FileManager.default.fileExists(atPath: outputURL.path) else {
+            throw NativePublishingError.outputAlreadyExists(outputURL)
+        }
+        try FileManager.default.moveItem(at: stagedURL, to: outputURL)
+        return inspection
     }
 
     private func refinedFallback(for markers: RawAnswerMarkers) -> RefinedBoundaries? {
@@ -98,10 +105,10 @@ public struct NativeAnswerPublisher: Sendable {
         return RefinedBoundaries(visibleStart: start, visibleEnd: end, safeLeadingStart: start, safeTrailingEnd: end, confidence: 0.4, reasons: ["Native fallback used raw markers."], algorithmIdentifier: "raw-marker-fallback", algorithmVersion: "1.0")
     }
 
-    private func validate(outputURL: URL, expectedDuration: CMTime) throws -> NativeMediaInspection {
+    private func validate(outputURL: URL, expectedDuration: CMTime) async throws -> NativeMediaInspection {
         let inspection: NativeMediaInspection
         do {
-            inspection = try NativeMediaInspector().inspect(url: outputURL)
+            inspection = try await NativeMediaInspector().inspect(url: outputURL)
         } catch {
             throw NativePublishingError.outputProfileMismatch(error.localizedDescription)
         }
@@ -256,13 +263,5 @@ public struct FinishAndLockService: Sendable {
         try store.writePublication(result.publication)
         try store.rebuildInventory()
         return result
-    }
-}
-
-private extension AVAssetExportSession {
-    func export() async {
-        await withCheckedContinuation { continuation in
-            exportAsynchronously { continuation.resume() }
-        }
     }
 }

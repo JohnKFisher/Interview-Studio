@@ -1,7 +1,7 @@
 # Interview Studio
 
 Current version/build:
-- `0.2.0 (4)` from `Sources/Core/Support/AppVersion.swift`.
+- `0.2.0 (10)` from root VERSION and BUILD_NUMBER (the next packaged app build will advance the build number once).
 
 Overall status:
 - Phase 1 Assembly Studio is complete for its defined assembly-from-manifest scope as a working internal macOS app plus a shared core library and CLI.
@@ -19,7 +19,7 @@ What works now:
 - Dedicated Sequence and Issues windows reachable from both the main UI and the Window menu, with issue cards now surfacing question text, age context, and stable question keys.
 - Safer transition audio planning that prefers quiet seams or conservative fallback instead of leaking stray handle speech.
 - Verified smoke export and prior owner testing against actual project media using the locked Phase 1 contract: `3840x2160`, `60 fps`, `HEVC`, `yuv420p10le`, `BT.2020`, `bt2020nc`, `HLG`.
-- Build script that stages a testable macOS `.app` under `dist/Yearly Interview Studio.app`, bundles a complete `ffmpeg`/`ffprobe` pair when found on the host, records provenance, and includes a real app icon.
+- Build script that stages a testable macOS `.app` under a temporary `YearlyInterviewStudio-package-*` directory outside the checkout, bundles a complete `ffmpeg`/`ffprobe` pair when found on the host, records provenance, and includes a real app icon.
 - Runtime FFmpeg discovery checks each executable candidate for the required Phase 1 filters/codecs and presents an actionable warning if no installed pair is capable.
 - Phase 2 prototype code can import Finder recordings, review answer markers, optionally store on-device transcripts, publish native answer clips, and write a package-backed manifest. Those paths still need real-media round-trip verification and workflow hardening.
 
@@ -27,9 +27,8 @@ What is partial:
 - The app UI now has a better review loop, but it is still a compact Phase 1 interface rather than a polished studio-grade workflow.
 - The renderer is correct but slow on card generation because SDR-to-HLG 4K conversion is expensive in software.
 - Plex metadata defaults are intentionally focused and simple rather than a full metadata editor.
-- The bundled app still uses source-controlled version values in a small Swift source file instead of a more mature version/build file workflow.
 - The repo currently represents the back half of the intended workflow: assembly and export after clips and manifest data already exist.
-- Phase 2 publication validates native output readability, audio/video presence, dimensions, frame rate, and duration, but owner playback and broader metadata verification remain open.
+- Phase 2 publication uses async AVFoundation loading, owned staging, atomic promotion, and post-export readability/profile checks, but owner playback and broader metadata verification remain open.
 
 What is not implemented yet:
 - Multipart answer composition and full answer-boundary QA.
@@ -62,7 +61,6 @@ Recommended next priorities:
 - Finish the Phase 2 real-media round trip and remaining source-media workflow checks; see [PHASE_2_PLAN.md](PHASE_2_PLAN.md).
 - Improve render throughput, especially for synthetic card segments and SDR-to-HLG normalization.
 - Expand the in-app Assembly Studio workflow with player-style QA, progress details, and deeper boundary review.
-- Move version/build values into dedicated source-controlled version files.
 - Add a broader metadata regression suite that checks more Plex-facing tags and chapter names across multiple sample exports.
 
 Most recent durable known-good anchor:

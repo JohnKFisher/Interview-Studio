@@ -63,7 +63,7 @@ struct AppPreviewRenderer: Sendable {
             return PreviewFrameModel(id: descriptor.id, title: descriptor.title, subtitle: descriptor.subtitle, image: image, status: .ready)
         case .overlay(let node):
             let style = BuiltInTemplates.overlayStyle(id: plan.settings.selectedOverlayStyleID)
-            let baseImage = try baseFrameImage(for: node, profile: plan.exportProfile)
+            let baseImage = try await baseFrameImage(for: node, profile: plan.exportProfile)
             let image = try await MainActor.run {
                 try overlayPreviewImage(baseImage: baseImage, node: node, style: style, profile: plan.exportProfile)
             }
@@ -142,17 +142,17 @@ struct AppPreviewRenderer: Sendable {
         return composed
     }
 
-    private func baseFrameImage(for node: RenderSequenceNode, profile: ExportProfile) throws -> NSImage {
+    private func baseFrameImage(for node: RenderSequenceNode, profile: ExportProfile) async throws -> NSImage {
         guard let clipRef = node.clipRef,
               let timing = node.timing else {
             return placeholderImage(profile: profile)
         }
 
-        let asset = AVAsset(url: URL(fileURLWithPath: clipRef.resolvedPath))
+        let asset = AVURLAsset(url: URL(fileURLWithPath: clipRef.resolvedPath))
         let generator = AVAssetImageGenerator(asset: asset)
         generator.appliesPreferredTrackTransform = true
         let midpointSeconds = max(Double(timing.answerStartInOutputUS + timing.answerEndInOutputUS) / 2_000_000, 0)
-        let cgImage = try generator.copyCGImage(at: CMTime(seconds: midpointSeconds, preferredTimescale: 600), actualTime: nil)
+        let cgImage = try await generator.image(at: CMTime(seconds: midpointSeconds, preferredTimescale: 600)).image
         return NSImage(cgImage: cgImage, size: .zero)
     }
 

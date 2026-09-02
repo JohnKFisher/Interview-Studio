@@ -35,3 +35,12 @@ Interview Studio will continue using the working GPL-enabled FFmpeg path for the
 
 ## 2026-07-31 - Complete Phase 1 within the assembly-from-manifest scope
 Phase 1 is considered complete for its defined product boundary: importing prepared manifest-backed projects, reviewing the deterministic assembly plan, and exporting the locked HDR master plus optional Plex companion. Raw clip creation, manifest authoring, trimming, and timeline work remain future phases rather than unfinished Phase 1 requirements. Status: approved.
+
+## 2026-09-02 - Treat render plans and outputs as inspectable contracts
+Render-plan issue identities are deterministic and summary counts are computed from the deduplicated issue set. The renderer now stages master and companion files beside their intended destinations, reopens each staged file, checks the frozen HLG/Main10 profile and duration, and promotes only validated files. A companion failure returns an actionable warning while preserving a validated master. Structural output proof does not replace owner playback or perceptual HDR acceptance. Status: approved.
+
+## 2026-09-02 - Keep package and diagnostics writes transactional and privacy-minimal
+Package inventory verification enumerates every visible non-hidden package file, sidecars use atomic writes, migration and CLI publication use owned staging, and subprocess diagnostics omit command arguments, working paths, and environment values. Source media and user-selected final outputs are never overwritten implicitly. Status: approved.
+
+## 2026-09-02 - Use root files for app version identity
+VERSION and BUILD_NUMBER are the source-controlled version contract. The packaged app reads the generated bundle values, and script/build_and_run.sh increments BUILD_NUMBER exactly once per packaged app build. Status: approved.

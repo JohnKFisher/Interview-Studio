@@ -90,11 +90,7 @@ Build the app bundle:
 ./script/build_and_run.sh build
 ```
 
-That creates:
-
-```text
-dist/Yearly Interview Studio.app
-```
+The script prints the signed app path in a temporary `YearlyInterviewStudio-package-*` directory outside the checkout.
 
 Run the app:
 
@@ -134,7 +130,7 @@ The CLI expects the project folder to contain `final_manifest.json`. It prints p
 
 ## Notes On Packaging
 
-The packaged `.app` is built from source-controlled version values in `Sources/Core/Support/AppVersion.swift`. The build script copies the app icon and a complete host `ffmpeg` / `ffprobe` pair only when both tools are present, writes version/hash provenance into the bundle, and carries [ATTRIBUTIONS.md](ATTRIBUTIONS.md). This is a host-specific local development build; ad hoc signing is not distribution signing. At runtime, the renderer preflights each discovered FFmpeg installation instead of assuming the first one is capable.
+The packaged `.app` reads source-controlled version values from the root VERSION and BUILD_NUMBER files; each successful invocation of script/build_and_run.sh increments BUILD_NUMBER once after building. The build script copies the app icon and a complete host `ffmpeg` / `ffprobe` pair only when both tools are present, writes version/hash provenance into the bundle, and carries [ATTRIBUTIONS.md](ATTRIBUTIONS.md). This is a host-specific local development build; ad hoc signing is not distribution signing. At runtime, the renderer preflights each discovered FFmpeg installation instead of assuming the first one is capable.
 
 This means the app is currently convenient for local use, but still early as a polished distribution story.
 

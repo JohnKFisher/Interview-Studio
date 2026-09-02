@@ -31,6 +31,21 @@ final class ManifestAndRenderPlanTests: XCTestCase {
         XCTAssertEqual(answerBoundary.audio.mode, "full_crossfade")
     }
 
+    func testRenderPlanIssuesAndSummaryAreDeterministic() throws {
+        let workspace = try TestWorkspace.make()
+        let loaded = try QuestionGroupBuilder().loadProject(manifestURL: workspace.manifestURL, projectFolder: workspace.rootURL)
+        let document = ProjectDocument.makeDefault(for: loaded)
+
+        let first = RenderPlanBuilder().build(project: loaded, document: document)
+        let second = RenderPlanBuilder().build(project: loaded, document: document)
+
+        XCTAssertEqual(first.issues, second.issues)
+        XCTAssertEqual(first.summary.blockerCount, first.issues.filter { $0.severity == .blocker }.count)
+        XCTAssertEqual(first.summary.warningCount, first.issues.filter { $0.severity == .warning }.count)
+        XCTAssertEqual(first.summary.infoCount, first.issues.filter { $0.severity == .info }.count)
+        XCTAssertEqual(try JSONEncoder.interviewStudio.encode(first), try JSONEncoder.interviewStudio.encode(second))
+    }
+
     func testSpeechyHandlesFallBackToConservativeTransitionAudio() throws {
         let workspace = try TestWorkspace.make(audioProfile: .speechyHandles)
         let loaded = try QuestionGroupBuilder().loadProject(manifestURL: workspace.manifestURL, projectFolder: workspace.rootURL)

@@ -8,16 +8,18 @@ BUNDLE_ID="com.jkfisher.yearlyinterviewstudio"
 MIN_SYSTEM_VERSION="26.0"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-VERSION_SOURCE="$ROOT_DIR/Sources/Core/Support/AppVersion.swift"
-MARKETING_VERSION="$(sed -n 's/.*marketing = "\([^"]*\)".*/\1/p' "$VERSION_SOURCE")"
-BUILD_NUMBER="$(sed -n 's/.*build = "\([^"]*\)".*/\1/p' "$VERSION_SOURCE")"
-if [[ -z "$MARKETING_VERSION" || -z "$BUILD_NUMBER" ]]; then
-  echo "Could not read the app version from $VERSION_SOURCE." >&2
+VERSION_FILE="$ROOT_DIR/VERSION"
+BUILD_NUMBER_FILE="$ROOT_DIR/BUILD_NUMBER"
+MARKETING_VERSION="$(tr -d '[:space:]' < "$VERSION_FILE")"
+CURRENT_BUILD_NUMBER="$(tr -d '[:space:]' < "$BUILD_NUMBER_FILE")"
+if [[ -z "$MARKETING_VERSION" || ! "$CURRENT_BUILD_NUMBER" =~ ^[0-9]+$ ]]; then
+  echo "VERSION and BUILD_NUMBER must contain a version and a numeric build." >&2
   exit 1
 fi
-DIST_DIR="$ROOT_DIR/dist"
+BUILD_NUMBER="$((CURRENT_BUILD_NUMBER + 1))"
+PACKAGE_DIR="${TMPDIR:-/tmp}/YearlyInterviewStudio-package-$BUILD_NUMBER"
 SCRATCH_PATH="${TMPDIR:-/tmp}/interview-studio-build-$RANDOM"
-APP_BUNDLE="$DIST_DIR/$BUNDLE_NAME.app"
+APP_BUNDLE="$PACKAGE_DIR/$BUNDLE_NAME.app"
 APP_CONTENTS="$APP_BUNDLE/Contents"
 APP_MACOS="$APP_CONTENTS/MacOS"
 APP_RESOURCES="$APP_CONTENTS/Resources"
@@ -38,6 +40,8 @@ pkill -x "$BUNDLE_NAME" >/dev/null 2>&1 || true
 
 swift build --scratch-path "$SCRATCH_PATH" --product "$APP_NAME"
 BUILD_BINARY="$(swift build --scratch-path "$SCRATCH_PATH" --show-bin-path)/$APP_NAME"
+
+printf '%s\n' "$BUILD_NUMBER" > "$BUILD_NUMBER_FILE"
 
 rm -rf "$APP_BUNDLE"
 mkdir -p "$APP_MACOS" "$APP_RESOURCES/BundledTools"
@@ -108,10 +112,31 @@ with path.open("wb") as handle:
     )
 PY
 
+# Finder/FileProvider metadata must not be sealed into the app bundle.
+/usr/bin/xattr -rc "$APP_BUNDLE" 2>/dev/null || true
+
 if /usr/bin/codesign --force --sign - --deep "$APP_BUNDLE" >/dev/null 2>&1; then
   echo "Applied ad hoc signing to $APP_BUNDLE"
 else
-  echo "Warning: ad hoc signing failed; the app bundle is unsigned and is not distribution-ready." >&2
+  # FileProvider can reattach FinderInfo while the bundle is being assembled.
+  /usr/bin/xattr -d com.apple.FinderInfo "$APP_BUNDLE" 2>/dev/null || true
+  /usr/bin/xattr -d 'com.apple.fileprovider.fpfs#P' "$APP_BUNDLE" 2>/dev/null || true
+  if /usr/bin/codesign --force --sign - --deep "$APP_BUNDLE" >/dev/null 2>&1; then
+    echo "Applied ad hoc signing to $APP_BUNDLE after removing Finder metadata"
+  else
+    echo "Warning: ad hoc signing failed; the app bundle is unsigned and is not distribution-ready." >&2
+  fi
+fi
+
+# Verify after signing; an ad hoc signature is not useful if the bundle seal is invalid.
+if ! /usr/bin/codesign --verify --deep --strict "$APP_BUNDLE" >/dev/null 2>&1; then
+  /usr/bin/xattr -d com.apple.FinderInfo "$APP_BUNDLE" 2>/dev/null || true
+  /usr/bin/xattr -d 'com.apple.fileprovider.fpfs#P' "$APP_BUNDLE" 2>/dev/null || true
+  if /usr/bin/codesign --force --sign - --deep "$APP_BUNDLE" >/dev/null 2>&1 && /usr/bin/codesign --verify --deep --strict "$APP_BUNDLE" >/dev/null 2>&1; then
+    echo "Verified strict app signature after removing Finder metadata"
+  else
+    echo "Warning: strict app signature verification failed; the app is not distribution-ready." >&2
+  fi
 fi
 
 open_app() {

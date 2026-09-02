@@ -174,7 +174,8 @@ final class AppState: ObservableObject {
         renderProgress = "Starting render…"
         errorMessage = ""
 
-        Task {
+        Task { @MainActor [weak self, renderer, renderPlan, keepSuccessfulDiagnostics] in
+            guard let self else { return }
             do {
                 let result = try await renderer.render(plan: renderPlan, keepSuccessfulDiagnostics: keepSuccessfulDiagnostics) { [weak self] state in
                     Task { @MainActor in
@@ -187,6 +188,8 @@ final class AppState: ObservableObject {
                     self.lastDiagnosticsURL = result.diagnosticsURL
                     if let plexOutputURL = result.plexOutputURL {
                         self.renderProgress = "Finished: \(result.outputURL.lastPathComponent) and \(plexOutputURL.lastPathComponent)"
+                    } else if let plexWarning = result.plexWarning {
+                        self.renderProgress = "Finished: \(result.outputURL.lastPathComponent). \(plexWarning)"
                     } else {
                         self.renderProgress = "Finished: \(result.outputURL.lastPathComponent)"
                     }
@@ -224,7 +227,7 @@ final class AppState: ObservableObject {
         do {
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-            try encoder.encode(projectDocument).write(to: sidecarURL)
+            try encoder.encode(projectDocument).write(to: sidecarURL, options: .atomic)
         } catch {
             errorMessage = error.localizedDescription
         }

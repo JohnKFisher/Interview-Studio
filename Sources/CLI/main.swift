@@ -88,10 +88,14 @@ struct YearlyInterviewStudioCLI {
         let sessions = try store.listSessions()
         guard !sessions.isEmpty else { throw InterviewStudioPackageError.invalidPackage("The package contains no interview sessions.") }
         try createNewDirectory(outputURL)
+        let stagingRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("InterviewStudio-Manifest-\\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: stagingRoot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: stagingRoot) }
         let builder = ManifestPublicationBuilder()
         var rows: [ManifestRow] = []
         for session in sessions {
-            let result = try await builder.build(project: project, session: session, store: store, buildRoot: outputURL.appendingPathComponent(".staging", isDirectory: true))
+            let result = try await builder.build(project: project, session: session, store: store, buildRoot: stagingRoot)
             for row in result.rows {
                 let source = result.buildRoot.appendingPathComponent(row.outputFile)
                 let destination = outputURL.appendingPathComponent(row.outputFile)
