@@ -3,3 +3,4 @@
 .build-codex
 dist
 DerivedData
+graphify-out/
