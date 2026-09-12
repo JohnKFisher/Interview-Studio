@@ -3,6 +3,7 @@ import AVKit
 import AppKit
 import Core
 import SwiftUI
+import UniformTypeIdentifiers
 
 private final class PlayerObservationLifetime {
     var player: AVPlayer?
@@ -32,10 +33,14 @@ final class InterviewStudioWorkspaceModel: ObservableObject {
     @Published var errorMessage: String?
     @Published var progressMessage: String?
     @Published var isBusy = false
+    @Published var isRenderingFinalMovie = false
     @Published var renderPlan: RenderPlan?
+    @Published var lastFinalMovieURL: URL?
     @Published var waveform: WaveformData?
     @Published var isLoadingWaveform = false
     @Published var waveformMessage: String?
+    @Published var isRefiningBoundaries = false
+    @Published var boundaryRefinementMessage: String?
     @Published var isTranscribing = false
     @Published var isBulkTranscribing = false
     @Published var transcriptionMessage: String?
@@ -44,6 +49,11 @@ final class InterviewStudioWorkspaceModel: ObservableObject {
     weak var document: InterviewStudioDocument?
     private var transcriptionTask: Task<Void, Never>?
     private var bulkTranscriptionTask: Task<Void, Never>?
+    private var boundaryRefinementTask: Task<Void, Never>?
+    private var boundaryRefinementRequestID: UUID?
+    private var waveformCache: [String: WaveformData] = [:]
+    private var loadedPlayerURL: URL?
+    private var loadedPlayerAnalysisID: String?
     private let speechTranscriber = SpeechTranscriptionService()
     let newInterviewYearDraft = NewInterviewYearDraft()
     private let playerObservation = PlayerObservationLifetime()
@@ -104,12 +114,22 @@ final class InterviewStudioWorkspaceModel: ObservableObject {
     }
 
     var selectedRecordingURL: URL? {
-        guard let store = document?.packageStore, let recording = selectedRecording else { return nil }
-        return try? store.resolve(relativePath: recording.packageRelativePath)
+        guard let recording = selectedRecording else { return nil }
+        return document?.recordingURL(for: recording)
     }
 
     var mediaAnalysisID: String {
         "\(selectedSessionID?.uuidString ?? "none"):\(selectedQuestionKey ?? "none"):\(selectedRecording?.id.uuidString ?? "none")"
+    }
+
+    var recordingAnalysisID: String {
+        guard let recording = selectedRecording else { return "none" }
+        return "\(recording.id.uuidString):\(recording.mediaSignature.sha256)"
+    }
+
+    private var mediaAnalysisCacheKey: String? {
+        guard let recording = selectedRecording else { return nil }
+        return recording.mediaSignature.sha256.isEmpty ? recording.id.uuidString : recording.mediaSignature.sha256
     }
 
     var selectedTranscript: AnswerTranscript? {
@@ -135,30 +155,155 @@ final class InterviewStudioWorkspaceModel: ObservableObject {
     func prepareMediaAnalysis() async {
         transcriptionTask?.cancel()
         transcriptionTask = nil
+        boundaryRefinementTask?.cancel()
+        boundaryRefinementTask = nil
+        boundaryRefinementRequestID = nil
+        isRefiningBoundaries = false
+        boundaryRefinementMessage = nil
         isTranscribing = false
         isLoadingWaveform = false
-        waveform = nil
+        let analysisID = recordingAnalysisID
+        let cacheKey = mediaAnalysisCacheKey
+        waveform = waveformCache[analysisID]
         waveformMessage = nil
         transcriptionMessage = nil
 
         guard let url = selectedRecordingURL else { return }
-        let analysisID = mediaAnalysisID
+        if waveform != nil {
+            isLoadingWaveform = false
+            return
+        }
         isLoadingWaveform = true
         do {
-            let waveform = try await Task.detached(priority: .userInitiated) {
-                try await AudioWaveformAnalyzer().analyze(url: url)
-            }.value
-            guard analysisID == mediaAnalysisID else { return }
+            let worker = Task.detached(priority: .userInitiated) {
+                try await AudioWaveformAnalyzer().analyze(url: url, cacheKey: cacheKey)
+            }
+            let waveform = try await withTaskCancellationHandler(operation: {
+                try await worker.value
+            }, onCancel: {
+                worker.cancel()
+            })
+            try Task.checkCancellation()
+            guard analysisID == recordingAnalysisID else { return }
+            waveformCache[analysisID] = waveform
             self.waveform = waveform
         } catch is CancellationError {
             return
         } catch {
-            guard analysisID == mediaAnalysisID else { return }
+            guard analysisID == recordingAnalysisID else { return }
             waveformMessage = error.localizedDescription
         }
-        if analysisID == mediaAnalysisID {
+        if analysisID == recordingAnalysisID {
             isLoadingWaveform = false
         }
+    }
+
+    private func startBoundaryRefinementIfNeeded(force: Bool = false) {
+        guard let sessionID = selectedSessionID,
+              let questionKey = selectedQuestionKey,
+              let recording = selectedRecording,
+              let url = selectedRecordingURL,
+              let part = selectedAnswerPart,
+              let answer = selectedAnswer,
+              let take = answer.selectedTake,
+              let answerStart = part.rawMarkers.answerStart,
+              let answerEnd = part.rawMarkers.answerEnd,
+              answerEnd > answerStart,
+              let durationUS = waveform?.durationUS ?? recording.mediaSignature.durationMicroseconds,
+              durationUS > 0,
+              answerStart.microseconds >= 0,
+              answerEnd.microseconds <= durationUS,
+              document?.isPackageReadOnly != true else {
+            boundaryRefinementTask?.cancel()
+            boundaryRefinementTask = nil
+            boundaryRefinementRequestID = nil
+            isRefiningBoundaries = false
+            return
+        }
+        if let interviewerResumes = part.rawMarkers.interviewerResumes?.microseconds,
+           !(0 ... durationUS).contains(interviewerResumes) {
+            boundaryRefinementTask?.cancel()
+            boundaryRefinementTask = nil
+            boundaryRefinementRequestID = nil
+            isRefiningBoundaries = false
+            return
+        }
+        guard force || part.refinedBoundaries == nil else { return }
+
+        boundaryRefinementTask?.cancel()
+        let requestID = UUID()
+        boundaryRefinementRequestID = requestID
+        let markers = part.rawMarkers
+        let recordingID = recording.id
+        let cacheKey = mediaAnalysisCacheKey
+        let takeID = take.id
+        let partID = part.id
+        isRefiningBoundaries = true
+        boundaryRefinementMessage = nil
+
+        boundaryRefinementTask = Task { @MainActor [weak self, requestID, sessionID, questionKey, recordingID, takeID, partID, url, markers] in
+            defer {
+                if let self, self.boundaryRefinementRequestID == requestID {
+                    self.isRefiningBoundaries = false
+                    self.boundaryRefinementTask = nil
+                }
+            }
+            do {
+                let worker = Task.detached(priority: .userInitiated) {
+                    try await AudioWaveformAnalyzer().refine(url: url, markers: markers, cacheKey: cacheKey)
+                }
+                let result = try await withTaskCancellationHandler(operation: {
+                    try await worker.value
+                }, onCancel: {
+                    worker.cancel()
+                })
+                guard let self,
+                      self.boundaryRefinementRequestID == requestID,
+                      self.matchesBoundaryRefinementContext(
+                        sessionID: sessionID,
+                        questionKey: questionKey,
+                        recordingID: recordingID,
+                        takeID: takeID,
+                        partID: partID,
+                        markers: markers
+                      ) else { return }
+
+                guard let sessionIndex = self.sessions.firstIndex(where: { $0.id == sessionID }),
+                      var answer = self.sessions[sessionIndex].answers[questionKey],
+                      let takeIndex = answer.takes.firstIndex(where: { $0.id == takeID }),
+                      let partIndex = answer.takes[takeIndex].parts.firstIndex(where: { $0.id == partID }),
+                      answer.takes[takeIndex].parts[partIndex].rawMarkers == markers else { return }
+                answer.takes[takeIndex].parts[partIndex].refinedBoundaries = result.boundaries
+                self.sessions[sessionIndex].answers[questionKey] = answer
+                self.flushToDocument()
+                guard self.boundaryRefinementRequestID == requestID else { return }
+                self.boundaryRefinementMessage = result.needsReview
+                    ? "Automatic refinement completed with low confidence; review the buffer markers."
+                    : nil
+            } catch is CancellationError {
+                return
+            } catch {
+                guard let self, self.boundaryRefinementRequestID == requestID else { return }
+                self.boundaryRefinementMessage = "Automatic refinement failed: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    private func matchesBoundaryRefinementContext(
+        sessionID: UUID,
+        questionKey: String,
+        recordingID: UUID,
+        takeID: UUID,
+        partID: UUID,
+        markers: RawAnswerMarkers
+    ) -> Bool {
+        guard selectedSessionID == sessionID,
+              selectedQuestionKey == questionKey,
+              selectedRecording?.id == recordingID,
+              let answer = selectedAnswer,
+              let take = answer.takes.first(where: { $0.id == takeID }),
+              let part = take.parts.first(where: { $0.id == partID }) else { return false }
+        return part.sourceRecordingID == recordingID && part.rawMarkers == markers
     }
 
     func transcribeSelectedRecording() {
@@ -177,6 +322,7 @@ final class InterviewStudioWorkspaceModel: ObservableObject {
 
         transcriptionTask?.cancel()
         let analysisID = mediaAnalysisID
+        let cacheKey = mediaAnalysisCacheKey
         isTranscribing = true
         transcriptionMessage = nil
         transcriptionTask = Task { @MainActor [weak self] in
@@ -192,7 +338,8 @@ final class InterviewStudioWorkspaceModel: ObservableObject {
                 let transcript = try await self.speechTranscriber.transcribe(
                     url: url,
                     sourceRecordingID: recording.id,
-                    localeIdentifier: self.project.person.localeIdentifier
+                    localeIdentifier: self.project.person.localeIdentifier,
+                    cacheKey: cacheKey
                 )
                 guard self.mediaAnalysisID == analysisID,
                       let sessionIndex = self.sessions.firstIndex(where: { $0.id == self.selectedSessionID }) else { return }
@@ -201,9 +348,6 @@ final class InterviewStudioWorkspaceModel: ObservableObject {
                 self.sessions[sessionIndex].answers[questionKey] = answer
                 self.flushToDocument()
 
-                if self.document?.packageStore != nil {
-                    try await self.persist(session: self.sessions[sessionIndex])
-                }
             } catch is CancellationError {
                 return
             } catch {
@@ -268,7 +412,10 @@ final class InterviewStudioWorkspaceModel: ObservableObject {
                     let transcript = try await self.speechTranscriber.transcribe(
                         url: candidate.url,
                         sourceRecordingID: candidate.recording.id,
-                        localeIdentifier: self.project.person.localeIdentifier
+                        localeIdentifier: self.project.person.localeIdentifier,
+                        cacheKey: candidate.recording.mediaSignature.sha256.isEmpty
+                            ? candidate.recording.id.uuidString
+                            : candidate.recording.mediaSignature.sha256
                     )
                     guard let sessionIndex = self.sessions.firstIndex(where: { $0.id == candidate.sessionID }) else { continue }
                     var answer = self.sessions[sessionIndex].answers[candidate.questionKey]
@@ -277,7 +424,6 @@ final class InterviewStudioWorkspaceModel: ObservableObject {
                     answer.transcript = transcript
                     self.sessions[sessionIndex].answers[candidate.questionKey] = answer
                     self.flushToDocument()
-                    try await self.persist(session: self.sessions[sessionIndex])
                     completedCount += 1
                     self.progressMessage = "Transcribing \(completedCount) of \(plan.candidates.count) missing answers…"
                 } catch is CancellationError {
@@ -297,7 +443,7 @@ final class InterviewStudioWorkspaceModel: ObservableObject {
     }
 
     private func makeMissingTranscriptionPlan() -> MissingTranscriptionPlan {
-        guard let store = document?.packageStore else {
+        guard let document else {
             return MissingTranscriptionPlan(candidates: [], skippedCount: 0)
         }
 
@@ -317,8 +463,7 @@ final class InterviewStudioWorkspaceModel: ObservableObject {
                 guard answer.transcript == nil, answer.state != .skipped else { continue }
                 guard let part = answer.selectedTake?.parts.first,
                       let recording = session.recordings.first(where: { $0.id == part.sourceRecordingID }),
-                      let url = try? store.resolve(relativePath: recording.packageRelativePath),
-                      FileManager.default.isReadableFile(atPath: url.path) else {
+                      let url = document.recordingURL(for: recording) else {
                     skippedCount += 1
                     continue
                 }
@@ -337,14 +482,6 @@ final class InterviewStudioWorkspaceModel: ObservableObject {
         return MissingTranscriptionPlan(candidates: candidates, skippedCount: skippedCount)
     }
 
-    private func persist(session: InterviewSession) async throws {
-        guard let store = document?.packageStore else { return }
-        try await Task.detached(priority: .utility) {
-            try store.writeSession(session)
-            try store.rebuildInventory()
-        }.value
-    }
-
     func seek(to timeUS: Int64) {
         guard let player else { return }
         let clamped = max(0, timeUS)
@@ -353,8 +490,11 @@ final class InterviewStudioWorkspaceModel: ObservableObject {
     }
 
     func replacePlayer(with url: URL) {
+        guard loadedPlayerURL != url || loadedPlayerAnalysisID != recordingAnalysisID else { return }
         removePlaybackObservers()
         let newPlayer = AVPlayer(url: url)
+        loadedPlayerURL = url
+        loadedPlayerAnalysisID = recordingAnalysisID
         player = newPlayer
         playerObservation.player = newPlayer
         playerObservation.periodic = newPlayer.addPeriodicTimeObserver(forInterval: CMTime(value: 50_000, timescale: 1_000_000), queue: .main) { [weak self] time in
@@ -364,6 +504,11 @@ final class InterviewStudioWorkspaceModel: ObservableObject {
                 self.currentTimeUS = max(0, Int64((time.seconds * 1_000_000).rounded()))
             }
         }
+    }
+
+    func stopPreviewForSelectionChange() {
+        removeRangeBoundaryObserver()
+        player?.pause()
     }
 
     func playFullRecording() {
@@ -423,6 +568,139 @@ final class InterviewStudioWorkspaceModel: ObservableObject {
         document?.save(nil)
     }
 
+    func moveQuestions(from source: IndexSet, to destination: Int) {
+        var activeQuestions = project.activeQuestions
+        activeQuestions.move(fromOffsets: source, toOffset: destination)
+        applyActiveQuestionOrder(activeQuestions)
+    }
+
+    var canMoveSelectedQuestionUp: Bool {
+        guard let selectedQuestionKey,
+              let index = project.activeQuestions.firstIndex(where: { $0.questionKey == selectedQuestionKey }) else { return false }
+        return index > 0
+    }
+
+    var canMoveSelectedQuestionDown: Bool {
+        guard let selectedQuestionKey,
+              let index = project.activeQuestions.firstIndex(where: { $0.questionKey == selectedQuestionKey }) else { return false }
+        return index < project.activeQuestions.count - 1
+    }
+
+    func moveSelectedQuestion(by offset: Int) {
+        guard let selectedQuestionKey else { return }
+        var activeQuestions = project.activeQuestions
+        guard let index = activeQuestions.firstIndex(where: { $0.questionKey == selectedQuestionKey }) else { return }
+        let destination = min(max(index + offset, 0), activeQuestions.count - 1)
+        guard destination != index else { return }
+        activeQuestions.swapAt(index, destination)
+        applyActiveQuestionOrder(activeQuestions)
+    }
+
+    @discardableResult
+    func moveQuestion(_ sourceQuestionKey: String, before targetQuestionKey: String) -> Bool {
+        var activeQuestions = project.activeQuestions
+        guard let sourceIndex = activeQuestions.firstIndex(where: { $0.questionKey == sourceQuestionKey }),
+              let targetIndex = activeQuestions.firstIndex(where: { $0.questionKey == targetQuestionKey }),
+              sourceIndex != targetIndex else { return false }
+        let movedQuestion = activeQuestions.remove(at: sourceIndex)
+        let insertionIndex = activeQuestions.firstIndex(where: { $0.questionKey == targetQuestionKey }) ?? activeQuestions.count
+        activeQuestions.insert(movedQuestion, at: insertionIndex)
+        applyActiveQuestionOrder(activeQuestions)
+        selectedQuestionKey = sourceQuestionKey
+        return true
+    }
+
+    private func applyActiveQuestionOrder(_ activeQuestions: [InterviewQuestion]) {
+        let orderByKey = Dictionary(uniqueKeysWithValues: activeQuestions.enumerated().map { ($0.element.questionKey, $0.offset) })
+        var updatedProject = project
+        for index in updatedProject.questions.indices {
+            if let order = orderByKey[updatedProject.questions[index].questionKey] {
+                updatedProject.questions[index].order = order
+            }
+        }
+        updatedProject.updatedAt = Date()
+        project = updatedProject
+        flushToDocument()
+    }
+
+    func applyProductionQuestionOrder() {
+        var updatedProject = project
+        updatedProject.questions = InterviewProductionQuestionOrder.ordered(updatedProject.questions)
+        updatedProject.updatedAt = Date()
+        project = updatedProject
+        flushToDocument()
+    }
+
+    func renderFinalMovie() {
+        guard !isRenderingFinalMovie else { return }
+        guard !sessions.isEmpty, sessions.allSatisfy({ $0.lifecycle == .locked }) else {
+            errorMessage = "Lock every interview year before rendering the final movie."
+            return
+        }
+        guard document?.hasPendingRecordingImports != true else {
+            errorMessage = "Save the project to finish importing recordings before rendering the final movie."
+            return
+        }
+        guard let store = document?.packageStore else {
+            errorMessage = "Save the project before rendering the final movie."
+            return
+        }
+
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = "\(InterviewStudioKey.safeFilenameComponent(project.person.displayName, fallback: "Interview")) Final.mov"
+        panel.canCreateDirectories = true
+        panel.allowedContentTypes = [.movie]
+        panel.message = "Choose where to save the validated HDR master movie."
+        guard panel.runModal() == .OK, let destinationURL = panel.url else { return }
+        guard !FileManager.default.fileExists(atPath: destinationURL.path) else {
+            errorMessage = "That movie already exists. Choose a new filename so the existing file is not overwritten."
+            return
+        }
+
+        isRenderingFinalMovie = true
+        errorMessage = nil
+        progressMessage = "Preparing all locked interview years…"
+        flushToDocument()
+        let project = self.project
+        let sessions = self.sessions
+        let buildRoot = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
+            .appendingPathComponent("YearlyInterviewStudio/FinalRenders", isDirectory: true)
+        let renderer = Renderer()
+        Task { @MainActor [weak self, renderer, project, sessions, store, buildRoot, destinationURL] in
+            guard let self else { return }
+            do {
+                let publication = try await ManifestPublicationBuilder().buildAggregate(
+                    project: project,
+                    sessions: sessions,
+                    store: store,
+                    buildRoot: buildRoot
+                )
+                self.renderPlan = publication.renderPlan
+                let result = try await renderer.render(plan: publication.renderPlan, outputURL: destinationURL) { [weak self] state in
+                    Task { @MainActor in
+                        self?.progressMessage = "\(state.phase.capitalized): \(state.detail)"
+                    }
+                }
+                self.lastFinalMovieURL = result.outputURL
+                self.document?.stage(publication: publication.publication)
+                self.progressMessage = "Finished: \(result.outputURL.path)"
+                self.isRenderingFinalMovie = false
+            } catch is CancellationError {
+                self.progressMessage = "Final render cancelled."
+                self.isRenderingFinalMovie = false
+            } catch {
+                self.errorMessage = error.localizedDescription
+                self.progressMessage = "Final render failed."
+                self.isRenderingFinalMovie = false
+            }
+        }
+    }
+
+    func revealFinalMovie() {
+        guard let lastFinalMovieURL else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([lastFinalMovieURL])
+    }
+
     func addYear(age: Double) {
         let ageDisplay = age.formatted(.number.precision(.fractionLength(0...2)))
         let ageLabel = age == 1 ? "1 Year Old" : "\(ageDisplay) Years Old"
@@ -440,7 +718,8 @@ final class InterviewStudioWorkspaceModel: ObservableObject {
     }
 
     func importFinderRecordings() {
-        guard let store = document?.packageStore else {
+        guard !isBusy else { return }
+        guard document?.packageStore != nil else {
             errorMessage = "Save the project before importing source recordings."
             return
         }
@@ -448,44 +727,77 @@ final class InterviewStudioWorkspaceModel: ObservableObject {
             errorMessage = "Add or select an interview year first."
             return
         }
+        let session = sessions[sessionIndex]
+        isBusy = true
+        progressMessage = "Choose recordings to import…"
+        guard document != nil else {
+            isBusy = false
+            progressMessage = nil
+            errorMessage = "The project document is no longer available."
+            return
+        }
+        presentFinderRecordingPanel(for: session)
+    }
+
+    private func presentFinderRecordingPanel(for session: InterviewSession) {
         let panel = NSOpenPanel()
         panel.allowsMultipleSelection = true
         panel.canChooseFiles = true
         panel.canChooseDirectories = false
         panel.allowedContentTypes = [.movie, .mpeg4Movie, .quickTimeMovie]
-        guard panel.runModal() == .OK else { return }
-        let session = sessions[sessionIndex]
+        guard panel.runModal() == .OK else {
+            isBusy = false
+            progressMessage = nil
+            return
+        }
         let recordingURLs = panel.urls
-        let storeForImport = store
-        isBusy = true
+        let stagingRoot = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
+            .appendingPathComponent("YearlyInterviewStudio/ImportStaging", isDirectory: true)
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
         progressMessage = "Staging \(recordingURLs.count) recording(s)…"
+        guard let store = document?.packageStore else {
+            isBusy = false
+            progressMessage = nil
+            errorMessage = "Save the project before importing source recordings."
+            return
+        }
         let importTask = Task.detached(priority: .userInitiated) {
+            var completed = false
+            defer {
+                if !completed {
+                    try? FileManager.default.removeItem(at: stagingRoot)
+                }
+            }
             var updated = session
+            var stagedImports: [StagedRecordingImport] = []
             for (index, url) in recordingURLs.enumerated() {
-                let imported = try await storeForImport.importRecording(
+                let stagedImport = try await store.stageRecordingImport(
                     from: url,
                     ageKey: session.ageKey,
                     ageLabel: session.ageLabel,
                     source: .finder,
+                    stagingRoot: stagingRoot,
                     order: updated.recordings.count + index
                 )
-                if imported.duplicateOf == nil {
-                    updated.recordings.append(imported.recording)
+                if stagedImport.imported.duplicateOf == nil {
+                    updated.recordings.append(stagedImport.imported.recording)
+                    stagedImports.append(stagedImport)
                 }
             }
-            try storeForImport.writeSession(updated)
-            try storeForImport.rebuildInventory()
-            return updated
+            completed = true
+            return (updated, stagedImports)
         }
         Task { @MainActor [weak self] in
             guard let self else { return }
             do {
-                let updated = try await importTask.value
+                let importResult = try await importTask.value
+                let updated = importResult.0
                 guard let currentIndex = self.sessions.firstIndex(where: { $0.id == session.id }) else { return }
                 self.sessions[currentIndex] = updated
                 self.selectedRecordingID = updated.recordings.first?.id
-                self.progressMessage = "Recording import complete."
+                self.progressMessage = "Recording ready. Save the project to persist it."
                 self.isBusy = false
+                self.document?.stage(recordingImports: importResult.1)
                 self.flushToDocument()
             } catch {
                 self.errorMessage = error.localizedDescription
@@ -545,12 +857,17 @@ final class InterviewStudioWorkspaceModel: ObservableObject {
             guard let self else { return }
             do {
                 let result = try await finishTask.value
-                self.sessions = try store.listSessions()
+                guard let lockedSession = result.stagedSession,
+                      let currentIndex = self.sessions.firstIndex(where: { $0.id == lockedSession.id }) else {
+                    throw InterviewStudioPackageError.invalidPackage("The lock operation did not return updated session state.")
+                }
+                self.sessions[currentIndex] = lockedSession
                 self.renderPlan = result.renderPlan
                 self.selectedSessionID = selectedSession.id
                 self.isBusy = false
                 self.progressMessage = "Year locked. Assembly is ready for inspection; rendering was not started."
                 self.flushToDocument()
+                self.document?.stage(publication: result.publication)
             } catch {
                 self.errorMessage = error.localizedDescription
                 self.progressMessage = "The year remains open; no lock was committed."
@@ -560,8 +877,8 @@ final class InterviewStudioWorkspaceModel: ObservableObject {
     }
 
     func unlockSelectedYear() {
-        guard let store = document?.packageStore, let index = sessions.firstIndex(where: { $0.id == selectedSessionID }) else { return }
-        var unlockedSession = sessions[index]
+        guard let currentIndex = sessions.firstIndex(where: { $0.id == selectedSessionID }) else { return }
+        var unlockedSession = sessions[currentIndex]
         do {
             try unlockedSession.unlock()
         } catch {
@@ -569,28 +886,9 @@ final class InterviewStudioWorkspaceModel: ObservableObject {
             return
         }
 
-        isBusy = true
-        progressMessage = "Unlocking year…"
-        let unlockTask = Task.detached(priority: .utility) {
-            try store.writeSession(unlockedSession)
-            try store.rebuildInventory()
-            return unlockedSession
-        }
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            do {
-                let persistedSession = try await unlockTask.value
-                guard let currentIndex = self.sessions.firstIndex(where: { $0.id == persistedSession.id }) else { return }
-                self.sessions[currentIndex] = persistedSession
-                self.isBusy = false
-                self.progressMessage = "Year unlocked."
-                self.flushToDocument()
-            } catch {
-                self.isBusy = false
-                self.progressMessage = nil
-                self.errorMessage = error.localizedDescription
-            }
-        }
+        sessions[currentIndex] = unlockedSession
+        progressMessage = "Year unlocked."
+        flushToDocument()
     }
 
     private enum Marker {
@@ -629,9 +927,11 @@ final class InterviewStudioWorkspaceModel: ObservableObject {
         case .noResume:
             answer.takes[takeIndex].parts[partIndex].rawMarkers.noFollowingInterviewerSpeech = true
         }
+        answer.takes[takeIndex].parts[partIndex].refinedBoundaries = nil
         answer.state = .inProgress
         sessions[sessionIndex].answers[questionKey] = answer
         flushToDocument()
+        startBoundaryRefinementIfNeeded(force: true)
     }
 }
 
@@ -677,12 +977,18 @@ struct DocumentWorkspaceView: View {
     @ObservedObject var model: InterviewStudioWorkspaceModel
 
     var body: some View {
-        NavigationSplitView {
-            projectSidebar
-        } content: {
-            questionList
-        } detail: {
-            editor
+        VStack(spacing: 0) {
+            // Keep document actions in the content area below the native
+            // window toolbar. NavigationSplitView toolbars can otherwise
+            // overlap column content on macOS.
+            questionOrderControls
+            NavigationSplitView {
+                projectSidebar
+            } content: {
+                questionList
+            } detail: {
+                editor
+            }
         }
         .frame(minWidth: 1_100, minHeight: 680)
         .alert("Project issue", isPresented: Binding(get: { model.errorMessage != nil }, set: { if !$0 { model.errorMessage = nil } })) {
@@ -734,7 +1040,9 @@ struct DocumentWorkspaceView: View {
         .toolbar {
             ToolbarItemGroup {
                 Button("New Year", systemImage: "plus") { model.isAddingYear = true }
+                    .labelStyle(.titleAndIcon)
                 Button("Save", systemImage: "square.and.arrow.down") { model.save() }
+                    .labelStyle(.titleAndIcon)
             }
         }
     }
@@ -755,18 +1063,61 @@ struct DocumentWorkspaceView: View {
                     Image(systemName: state == .complete ? "checkmark.circle.fill" : state == .skipped ? "forward.end.circle" : "circle")
                 }
                 .tag(question.questionKey)
+                .draggable(question.questionKey)
+                .dropDestination(for: String.self) { droppedKeys, _ in
+                    guard let sourceQuestionKey = droppedKeys.first else { return false }
+                    return model.moveQuestion(sourceQuestionKey, before: question.questionKey)
+                    }
             }
         }
         .navigationTitle("Questions")
-        .toolbar {
-            ToolbarItemGroup {
+    }
+
+    private var questionOrderControls: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                Menu {
+                    Button("Apply Production Order", systemImage: "list.number") {
+                        model.applyProductionQuestionOrder()
+                    }
+                    Divider()
+                    Button("Move Selected Up", systemImage: "arrow.up") {
+                        model.moveSelectedQuestion(by: -1)
+                    }
+                    .disabled(!model.canMoveSelectedQuestionUp)
+                    Button("Move Selected Down", systemImage: "arrow.down") {
+                        model.moveSelectedQuestion(by: 1)
+                    }
+                    .disabled(!model.canMoveSelectedQuestionDown)
+                } label: {
+                    Label("Order", systemImage: "arrow.up.arrow.down")
+                }
+
+                Button("Up", systemImage: "arrow.up") { model.moveSelectedQuestion(by: -1) }
+                    .disabled(!model.canMoveSelectedQuestionUp)
+                    .help("Move the selected question up")
+                Button("Down", systemImage: "arrow.down") { model.moveSelectedQuestion(by: 1) }
+                    .disabled(!model.canMoveSelectedQuestionDown)
+                    .help("Move the selected question down")
+
+                Divider()
+
                 Button("Import Recordings", systemImage: "square.and.arrow.down") { model.importFinderRecordings() }
+                    .disabled(model.isBusy)
+                    .help("Choose video recordings to add to the selected interview year")
                 Button("Lock Year", systemImage: "lock") { model.finishAndLock() }
                     .disabled(model.selectedSession?.lifecycle == .locked || model.isBusy)
-                Button("Unlock", systemImage: "lock.open") { model.unlockSelectedYear() }
+                Button("Unlock Year", systemImage: "lock.open") { model.unlockSelectedYear() }
                     .disabled(model.selectedSession?.lifecycle != .locked || model.isBusy)
+                Button("Render Final Movie", systemImage: "film") { model.renderFinalMovie() }
+                    .disabled(model.isBusy || model.isRenderingFinalMovie)
             }
+            .labelStyle(.titleAndIcon)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 6)
         }
+        .background(.bar)
+        .frame(height: 36)
     }
 
     @ViewBuilder
@@ -786,12 +1137,24 @@ struct DocumentWorkspaceView: View {
                     RecordingPlayer(model: model)
                     markerControls
                     answerStatus
+                    if model.renderPlan == nil {
+                        Text("After every interview year is locked, choose Render Final Movie to build the complete production in question order and save the validated HDR master.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
                     if let progressMessage = model.progressMessage {
                         Label(progressMessage, systemImage: model.isBusy ? "arrow.triangle.2.circlepath" : "checkmark.circle")
                             .foregroundStyle(.secondary)
                     }
                     if let renderPlan = model.renderPlan {
                         AssemblySummaryView(renderPlan: renderPlan)
+                        HStack {
+                            Button("Render Final Movie", systemImage: "film") { model.renderFinalMovie() }
+                                .buttonStyle(.borderedProminent)
+                                .disabled(model.isBusy || model.isRenderingFinalMovie)
+                            Button("Reveal Final Movie", systemImage: "magnifyingglass") { model.revealFinalMovie() }
+                                .disabled(model.lastFinalMovieURL == nil)
+                        }
                     }
                 }
                 .padding(20)
@@ -911,6 +1274,13 @@ private struct NewInterviewYearSheet: View {
                         model.replacePlayer(with: newValue)
                         model.currentTimeUS = 0
                     }
+                    .onChange(of: model.mediaAnalysisID) { _, _ in
+                        model.stopPreviewForSelectionChange()
+                        if let currentURL = model.selectedRecordingURL {
+                            model.replacePlayer(with: currentURL)
+                        }
+                        model.currentTimeUS = 0
+                    }
                 if model.isLoadingWaveform {
                     ProgressView("Building waveform…")
                         .controlSize(.small)
@@ -921,6 +1291,15 @@ private struct NewInterviewYearSheet: View {
                     if let range = model.selectedTimelineRange {
                         Text(timelineSummary(range))
                             .font(.caption.monospaced())
+                            .foregroundStyle(.secondary)
+                    }
+                    if model.isRefiningBoundaries {
+                        ProgressView("Refining answer boundaries…")
+                            .controlSize(.small)
+                    }
+                    if let boundaryRefinementMessage = model.boundaryRefinementMessage {
+                        Label(boundaryRefinementMessage, systemImage: "waveform.badge.exclamationmark")
+                            .font(.caption)
                             .foregroundStyle(.secondary)
                     }
                 } else if let waveformMessage = model.waveformMessage {
@@ -946,7 +1325,7 @@ private struct NewInterviewYearSheet: View {
                     TextField("Source seconds", value: Binding(get: { Double(model.currentTimeUS) / 1_000_000 }, set: { model.currentTimeUS = Int64(($0 * 1_000_000).rounded()) }), format: .number)
                         .frame(width: 120)
                 }
-                .task(id: model.mediaAnalysisID) {
+                .task(id: model.recordingAnalysisID) {
                     await model.prepareMediaAnalysis()
                 }
             } else if model.selectedRecording?.importSource == .legacy {
@@ -969,6 +1348,9 @@ private struct NewInterviewYearSheet: View {
 
     private func timelineSummary(_ range: SelectedTimelineRange) -> String {
         let answer = String(format: "Answer %.2f–%.2fs", Double(range.visibleStartUS) / 1_000_000, Double(range.visibleEndUS) / 1_000_000)
+        if model.isRefiningBoundaries {
+            return "\(answer) · refining leading/trailing buffers…"
+        }
         guard let start = range.safeLeadingStartUS, let end = range.safeTrailingEndUS else {
             return "\(answer) · leading/trailing buffers unavailable until refined"
         }
@@ -1006,7 +1388,7 @@ private struct AssemblySummaryView: View {
                     .font(.headline)
                 Text("Questions \(renderPlan.summary.questionCount) · Answers \(renderPlan.summary.answerClipCount) · Blockers \(renderPlan.summary.blockerCount) · Warnings \(renderPlan.summary.warningCount)")
                     .foregroundStyle(.secondary)
-                Text("The final renderer remains manual: choose a Save-panel destination after reviewing the Sequence and Issues windows.")
+                Text("Review the Sequence and Issues windows, then choose Render Final Movie. The app will publish all locked interview years in the saved question order and validate the HDR master.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

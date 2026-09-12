@@ -132,6 +132,28 @@ final class Phase2CoreTests: XCTestCase {
         XCTAssertEqual(InterviewStudioKey.safeFilenameComponent("..", fallback: "question"), "question")
     }
 
+    func testProductionQuestionOrderIsStableAndPreservesUnknownQuestions() {
+        let questions = [
+            InterviewQuestion(questionKey: "unknown", displayText: "A later custom question", order: 0),
+            InterviewQuestion(questionKey: "color", displayText: "What’s your favorite color?", order: 1),
+            InterviewQuestion(questionKey: "what-is-your-name", displayText: "What is Your Name?", order: 2),
+            InterviewQuestion(questionKey: "book", displayText: "What's your favorite book?", order: 3),
+            InterviewQuestion(questionKey: "whats-your-favorite-part-of-school", displayText: "What's your favorite part of school?", order: 4),
+            InterviewQuestion(questionKey: "is-there-anything-you-want-to-tell-me", displayText: "Is there anything you want to tell me?", order: 5)
+        ]
+
+        let ordered = InterviewProductionQuestionOrder.ordered(questions)
+        XCTAssertEqual(ordered.map(\.questionKey), [
+            "what-is-your-name",
+            "color",
+            "book",
+            "whats-your-favorite-part-of-school",
+            "is-there-anything-you-want-to-tell-me",
+            "unknown"
+        ])
+        XCTAssertEqual(ordered.map(\.order), [0, 1, 2, 3, 4, 5])
+    }
+
     func testManifestPathResolverRejectsTraversalAndExternalAbsoluteMedia() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("manifest-path-\(UUID().uuidString)", isDirectory: true)
         let outside = FileManager.default.temporaryDirectory.appendingPathComponent("outside-\(UUID().uuidString).mov")

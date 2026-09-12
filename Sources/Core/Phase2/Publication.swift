@@ -31,13 +31,18 @@ public struct PublicationBuildResult: Sendable {
     public var manifestURL: URL
     public var rows: [ManifestRow]
     public var renderPlan: RenderPlan
+    /// The session state produced by finish-and-lock, when this result came
+    /// from that operation. It is returned to the document layer so the
+    /// document, rather than the background service, owns package persistence.
+    public var stagedSession: InterviewSession?
 
-    public init(publication: PublicationRecord, buildRoot: URL, manifestURL: URL, rows: [ManifestRow], renderPlan: RenderPlan) {
+    public init(publication: PublicationRecord, buildRoot: URL, manifestURL: URL, rows: [ManifestRow], renderPlan: RenderPlan, stagedSession: InterviewSession? = nil) {
         self.publication = publication
         self.buildRoot = buildRoot
         self.manifestURL = manifestURL
         self.rows = rows
         self.renderPlan = renderPlan
+        self.stagedSession = stagedSession
     }
 }
 
@@ -84,7 +89,7 @@ public struct NativeAnswerPublisher: Sendable {
             throw NativePublishingError.exportFailed("The system does not provide \(preset).")
         }
         let stagedURL = outputURL.deletingLastPathComponent()
-            .appendingPathComponent(".\\(outputURL.lastPathComponent).\\(UUID().uuidString).interviewstudio-staging")
+            .appendingPathComponent(".\(outputURL.lastPathComponent).\(UUID().uuidString).interviewstudio-staging")
         defer { try? FileManager.default.removeItem(at: stagedURL) }
         exporter.shouldOptimizeForNetworkUse = false
         do {
@@ -143,9 +148,50 @@ public struct ManifestPublicationBuilder: Sendable {
         store: InterviewStudioPackageStore,
         buildRoot: URL
     ) async throws -> PublicationBuildResult {
-        guard session.lifecycle == .open || session.lifecycle == .locked else { throw NativePublishingError.sessionMustBeOpenOrLocked }
-        let encodedSession = try JSONEncoder.interviewStudio.encode(session)
-        let fingerprint = sha256(data: encodedSession)
+        try await build(
+            project: project,
+            sessions: [session],
+            store: store,
+            buildRoot: buildRoot,
+            publicationSessionID: session.id,
+            publicationRevision: session.revision
+        )
+    }
+
+    public func buildAggregate(
+        project: InterviewStudioProject,
+        sessions: [InterviewSession],
+        store: InterviewStudioPackageStore,
+        buildRoot: URL
+    ) async throws -> PublicationBuildResult {
+        let orderedSessions = sessions.sorted {
+            ($0.ageSortValue ?? .greatestFiniteMagnitude) < ($1.ageSortValue ?? .greatestFiniteMagnitude)
+        }
+        guard let firstSession = orderedSessions.first else {
+            throw NativePublishingError.manifestBlocked("No interview years are available for the final movie.")
+        }
+        return try await build(
+            project: project,
+            sessions: orderedSessions,
+            store: store,
+            buildRoot: buildRoot,
+            publicationSessionID: firstSession.id,
+            publicationRevision: orderedSessions.map(\.revision).max() ?? firstSession.revision
+        )
+    }
+
+    private func build(
+        project: InterviewStudioProject,
+        sessions: [InterviewSession],
+        store: InterviewStudioPackageStore,
+        buildRoot: URL,
+        publicationSessionID: UUID,
+        publicationRevision: Int
+    ) async throws -> PublicationBuildResult {
+        guard !sessions.isEmpty else { throw NativePublishingError.manifestBlocked("No interview years are available for publication.") }
+        guard sessions.allSatisfy({ $0.lifecycle == .open || $0.lifecycle == .locked }) else { throw NativePublishingError.sessionMustBeOpenOrLocked }
+        let encodedSessions = try JSONEncoder.interviewStudio.encode(sessions)
+        let fingerprint = sha256(data: encodedSessions)
         let publicationID = UUID()
         let root = buildRoot.appendingPathComponent(project.projectID.uuidString, isDirectory: true).appendingPathComponent(publicationID.uuidString, isDirectory: true)
         let answersRoot = root.appendingPathComponent("Answers", isDirectory: true)
@@ -153,71 +199,75 @@ public struct ManifestPublicationBuilder: Sendable {
 
         var rows: [ManifestRow] = []
         var clipNumber = 1
-        for (questionIndex, question) in project.activeQuestions.enumerated() {
-            guard let answer = session.answers[question.questionKey] else { continue }
-            if answer.state == .skipped { continue }
-            guard answer.state == .complete else { throw NativePublishingError.manifestBlocked("Question \(question.questionKey) is \(answer.state.rawValue).") }
-            guard let take = answer.selectedTake else { throw NativePublishingError.missingSelectedTake(question.questionKey) }
-            if take.isMultiPart || take.parts.count > 1 { throw NativePublishingError.unsupportedMultiPart(question.questionKey) }
-            guard let part = take.parts.first else { throw NativePublishingError.missingSelectedTake(question.questionKey) }
-            guard let recording = session.recordings.first(where: { $0.id == part.sourceRecordingID }) else { throw NativePublishingError.sourceMissing(part.sourceRecordingID.uuidString) }
-            let sourceURL = try store.resolve(relativePath: recording.packageRelativePath)
-            guard FileManager.default.fileExists(atPath: sourceURL.path) else { throw NativePublishingError.sourceMissing(recording.packageRelativePath) }
-            let safeQuestionKey = InterviewStudioKey.safeFilenameComponent(question.questionKey, fallback: "question")
-            let safePersonKey = InterviewStudioKey.safeFilenameComponent(project.person.readableKey, fallback: "person")
-            let safeAgeKey = InterviewStudioKey.safeFilenameComponent(session.ageKey, fallback: "age")
-            let relativeOutput = "Answers/\(safeQuestionKey)/\(safePersonKey)--\(safeAgeKey)--\(safeQuestionKey).mov"
-            let outputURL = root.appendingPathComponent(relativeOutput).standardizedFileURL
-            guard outputURL.path.hasPrefix(root.standardizedFileURL.path + "/") else {
-                throw NativePublishingError.manifestBlocked("The generated answer path escaped the publication root.")
-            }
-            let outputInspection = try await answerPublisher.generate(part: part, sourceURL: sourceURL, outputURL: outputURL)
-            let duration = outputInspection.duration.microseconds
-            let boundaries = part.refinedBoundaries
-            let outputSignature = ManifestVideoSignature(entries: [
-                .init(
-                    colorSpace: outputInspection.colorMatrix,
-                    colorTransfer: outputInspection.colorTransfer,
-                    colorPrimaries: outputInspection.colorPrimaries,
-                    sideDataTypes: outputInspection.hdrMetadataSummary.map { [$0] } ?? []
+        for session in sessions {
+            for (questionIndex, question) in project.activeQuestions.enumerated() {
+                guard let answer = session.answers[question.questionKey] else { continue }
+                if answer.state == .skipped { continue }
+                guard answer.state == .complete else { throw NativePublishingError.manifestBlocked("Question \(question.questionKey) for \(session.ageLabel) is \(answer.state.rawValue).") }
+                guard let take = answer.selectedTake else { throw NativePublishingError.missingSelectedTake(question.questionKey) }
+                if take.isMultiPart || take.parts.count > 1 { throw NativePublishingError.unsupportedMultiPart(question.questionKey) }
+                guard let part = take.parts.first else { throw NativePublishingError.missingSelectedTake(question.questionKey) }
+                guard let recording = session.recordings.first(where: { $0.id == part.sourceRecordingID }) else { throw NativePublishingError.sourceMissing(part.sourceRecordingID.uuidString) }
+                let sourceURL = try store.resolve(relativePath: recording.packageRelativePath)
+                guard FileManager.default.fileExists(atPath: sourceURL.path) else { throw NativePublishingError.sourceMissing(recording.packageRelativePath) }
+                let safeQuestionKey = InterviewStudioKey.safeFilenameComponent(question.questionKey, fallback: "question")
+                let safePersonKey = InterviewStudioKey.safeFilenameComponent(project.person.readableKey, fallback: "person")
+                let safeAgeKey = InterviewStudioKey.safeFilenameComponent(session.ageKey, fallback: "age")
+                let relativeOutput = sessions.count == 1
+                    ? "Answers/\(safeQuestionKey)/\(safePersonKey)--\(safeAgeKey)--\(safeQuestionKey).mov"
+                    : "Answers/\(safeAgeKey)/\(safeQuestionKey)/\(safePersonKey)--\(safeAgeKey)--\(safeQuestionKey).mov"
+                let outputURL = root.appendingPathComponent(relativeOutput).standardizedFileURL
+                guard outputURL.path.hasPrefix(root.standardizedFileURL.path + "/") else {
+                    throw NativePublishingError.manifestBlocked("The generated answer path escaped the publication root.")
+                }
+                let outputInspection = try await answerPublisher.generate(part: part, sourceURL: sourceURL, outputURL: outputURL)
+                let duration = outputInspection.duration.microseconds
+                let boundaries = part.refinedBoundaries
+                let outputSignature = ManifestVideoSignature(entries: [
+                    .init(
+                        colorSpace: outputInspection.colorMatrix,
+                        colorTransfer: outputInspection.colorTransfer,
+                        colorPrimaries: outputInspection.colorPrimaries,
+                        sideDataTypes: outputInspection.hdrMetadataSummary.map { [$0] } ?? []
+                    )
+                ])
+                let row = ManifestRow(
+                    clipNumber: String(clipNumber),
+                    sequenceIndex: questionIndex,
+                    person: project.person.displayName,
+                    personKey: project.person.readableKey,
+                    question: question.displayText,
+                    questionKey: question.questionKey,
+                    questionOriginalIndex: question.order,
+                    age: session.ageLabel,
+                    ageRawText: session.ageLabel,
+                    ageKey: session.ageKey,
+                    ageYears: session.ageSortValue,
+                    ageSortKey: session.ageSortValue,
+                    outputFile: relativeOutput,
+                    exportStatus: "exported",
+                    status: "ready",
+                    parserConfidence: take.confidence.map { $0 >= 0.8 ? .high : .medium },
+                    notes: "Native Phase 2 answer clip re-inspected after export; source SHA-256 \(recording.mediaSignature.sha256).",
+                    sourceIsDolby: (recording.mediaSignature.colorTransfer ?? "").localizedCaseInsensitiveContains("2084"),
+                    hdrDolbyValidation: "pending_owner_validation",
+                    outputVideoSignature: outputSignature,
+                    requestedHandleBeforeUS: boundaries.map { max(0, $0.visibleStart.microseconds - $0.safeLeadingStart.microseconds) } ?? 0,
+                    requestedHandleAfterUS: boundaries.map { max(0, $0.safeTrailingEnd.microseconds - $0.visibleEnd.microseconds) } ?? 0,
+                    actualHandleBeforeUS: boundaries.map { max(0, $0.visibleStart.microseconds - $0.safeLeadingStart.microseconds) } ?? 0,
+                    actualHandleAfterUS: boundaries.map { max(0, $0.safeTrailingEnd.microseconds - $0.visibleEnd.microseconds) } ?? 0,
+                    handleBeforeStatus: "derived_from_validated_export_range",
+                    handleAfterStatus: "derived_from_validated_export_range",
+                    realMediaStartInOutputUS: boundaries?.visibleStart.microseconds ?? 0,
+                    realMediaEndInOutputUS: boundaries?.visibleEnd.microseconds ?? duration,
+                    answerStartInOutputUS: boundaries?.visibleStart.microseconds ?? 0,
+                    answerEndInOutputUS: boundaries?.visibleEnd.microseconds ?? duration,
+                    sourcePartCount: 1,
+                    sourceParts: [SourcePart(partIndex: 0, sourceFile: recording.packageRelativePath, sourceUUID: recording.id.uuidString, parsedSourceInUS: part.rawMarkers.answerStart?.microseconds, parsedSourceOutUS: part.rawMarkers.answerEnd?.microseconds)]
                 )
-            ])
-            let row = ManifestRow(
-                clipNumber: String(clipNumber),
-                sequenceIndex: questionIndex,
-                person: project.person.displayName,
-                personKey: project.person.readableKey,
-                question: question.displayText,
-                questionKey: question.questionKey,
-                questionOriginalIndex: question.order,
-                age: session.ageLabel,
-                ageRawText: session.ageLabel,
-                ageKey: session.ageKey,
-                ageYears: session.ageSortValue,
-                ageSortKey: session.ageSortValue,
-                outputFile: relativeOutput,
-                exportStatus: "exported",
-                status: "ready",
-                parserConfidence: take.confidence.map { $0 >= 0.8 ? .high : .medium },
-                notes: "Native Phase 2 answer clip re-inspected after export; source SHA-256 \(recording.mediaSignature.sha256).",
-                sourceIsDolby: (recording.mediaSignature.colorTransfer ?? "").localizedCaseInsensitiveContains("2084"),
-                hdrDolbyValidation: "pending_owner_validation",
-                outputVideoSignature: outputSignature,
-                requestedHandleBeforeUS: boundaries.map { max(0, $0.visibleStart.microseconds - $0.safeLeadingStart.microseconds) } ?? 0,
-                requestedHandleAfterUS: boundaries.map { max(0, $0.safeTrailingEnd.microseconds - $0.visibleEnd.microseconds) } ?? 0,
-                actualHandleBeforeUS: boundaries.map { max(0, $0.visibleStart.microseconds - $0.safeLeadingStart.microseconds) } ?? 0,
-                actualHandleAfterUS: boundaries.map { max(0, $0.safeTrailingEnd.microseconds - $0.visibleEnd.microseconds) } ?? 0,
-                handleBeforeStatus: "derived_from_validated_export_range",
-                handleAfterStatus: "derived_from_validated_export_range",
-                realMediaStartInOutputUS: boundaries?.visibleStart.microseconds ?? 0,
-                realMediaEndInOutputUS: boundaries?.visibleEnd.microseconds ?? duration,
-                answerStartInOutputUS: boundaries?.visibleStart.microseconds ?? 0,
-                answerEndInOutputUS: boundaries?.visibleEnd.microseconds ?? duration,
-                sourcePartCount: 1,
-                sourceParts: [SourcePart(partIndex: 0, sourceFile: recording.packageRelativePath, sourceUUID: recording.id.uuidString, parsedSourceInUS: part.rawMarkers.answerStart?.microseconds, parsedSourceOutUS: part.rawMarkers.answerEnd?.microseconds)]
-            )
-            rows.append(row)
-            clipNumber += 1
+                rows.append(row)
+                clipNumber += 1
+            }
         }
 
         let manifestURL = root.appendingPathComponent("final_manifest.json")
@@ -238,7 +288,7 @@ public struct ManifestPublicationBuilder: Sendable {
         if renderPlan.summary.blockerCount > 0 {
             throw NativePublishingError.manifestBlocked("Phase 1 render plan contains \(renderPlan.summary.blockerCount) blocker(s).")
         }
-        let publication = PublicationRecord(projectID: project.projectID, sessionID: session.id, revision: session.revision, fingerprint: fingerprint, manifestRelativePath: "final_manifest.json", recipe: answerPublisher.recipe, answerCount: rows.count)
+        let publication = PublicationRecord(projectID: project.projectID, sessionID: publicationSessionID, revision: publicationRevision, fingerprint: fingerprint, manifestRelativePath: "final_manifest.json", recipe: answerPublisher.recipe, answerCount: rows.count)
         try JSONEncoder.interviewStudio.encode(publication).write(to: root.appendingPathComponent("publication.json"), options: .atomic)
         return PublicationBuildResult(publication: publication, buildRoot: root, manifestURL: manifestURL, rows: rows, renderPlan: renderPlan)
     }
@@ -254,14 +304,12 @@ public struct FinishAndLockService: Sendable {
     public func finishAndLock(project: InterviewStudioProject, session: InterviewSession, store: InterviewStudioPackageStore, buildRoot: URL) async throws -> PublicationBuildResult {
         var staged = session
         staged.lifecycle = .open
-        let result = try await publicationBuilder.build(project: project, session: staged, store: store, buildRoot: buildRoot)
+        var result = try await publicationBuilder.build(project: project, session: staged, store: store, buildRoot: buildRoot)
         staged.lifecycle = .locked
         staged.revision += 1
         staged.publicationFingerprint = result.publication.fingerprint
         staged.appendAudit("lock", detail: "Published \(result.rows.count) answer(s) as \(result.publication.id.uuidString).")
-        try store.writeSession(staged)
-        try store.writePublication(result.publication)
-        try store.rebuildInventory()
+        result.stagedSession = staged
         return result
     }
 }

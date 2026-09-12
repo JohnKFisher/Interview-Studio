@@ -24,6 +24,7 @@ public enum RendererError: LocalizedError {
     case missingSequenceNode(String)
     case ffmpegPreflightFailed(String)
     case outputPathUnavailable
+    case outputAlreadyExists(URL)
     case renderFailed(message: String, diagnosticsURL: URL?)
 
     public var errorDescription: String? {
@@ -36,6 +37,8 @@ public enum RendererError: LocalizedError {
             return message
         case .outputPathUnavailable:
             return "The renderer could not determine a final output path."
+        case .outputAlreadyExists(let url):
+            return "The renderer will not overwrite an existing output: \(url.path)"
         case .renderFailed(let message, _):
             return message
         }
@@ -55,6 +58,7 @@ public final class Renderer: @unchecked Sendable {
         plan: RenderPlan,
         diagnosticsRoot: URL? = nil,
         outputRoot: URL? = nil,
+        outputURL requestedOutputURL: URL? = nil,
         keepSuccessfulDiagnostics: Bool = false,
         progress: @escaping @Sendable (RenderJobState) -> Void
     ) async throws -> RenderResult {
@@ -172,7 +176,7 @@ public final class Renderer: @unchecked Sendable {
             let concatBody = finalSegments.map { "file '\($0.path.replacingOccurrences(of: "'", with: "'\\''"))'" }.joined(separator: "\n")
             try Data(concatBody.utf8).write(to: workspace.concatFileURL)
 
-            let outputURL = try finalOutputURL(for: plan, outputRoot: outputRoot)
+            let outputURL = try finalOutputURL(for: plan, requestedOutputURL: requestedOutputURL, outputRoot: outputRoot)
             try FileManager.default.createDirectory(at: outputURL.deletingLastPathComponent(), withIntermediateDirectories: true)
             let stagedMasterURL = stagingURL(for: outputURL)
             stagedOutputURLs.append(stagedMasterURL)
@@ -768,7 +772,18 @@ public final class Renderer: @unchecked Sendable {
         }
     }
 
-    private func finalOutputURL(for plan: RenderPlan, outputRoot: URL?) throws -> URL {
+    private func finalOutputURL(for plan: RenderPlan, requestedOutputURL: URL?, outputRoot: URL?) throws -> URL {
+        if let requestedOutputURL {
+            let outputURL = requestedOutputURL.standardizedFileURL
+            guard outputURL.pathExtension.lowercased() == plan.exportProfile.containerExtension.lowercased() else {
+                throw RendererError.outputPathUnavailable
+            }
+            guard !FileManager.default.fileExists(atPath: outputURL.path) else {
+                throw RendererError.outputAlreadyExists(outputURL)
+            }
+            return outputURL
+        }
+
         let root = outputRoot ?? FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Movies/Yearly Interview Studio/\(plan.project.projectName)", isDirectory: true)
         let sanitizedBase = sanitizeFilename(plan.project.projectName)

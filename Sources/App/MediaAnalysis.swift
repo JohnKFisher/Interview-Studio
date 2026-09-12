@@ -1,5 +1,6 @@
 import AVFoundation
 import Core
+import CryptoKit
 import Foundation
 import Speech
 import SwiftUI
@@ -40,7 +41,19 @@ enum MediaAnalysisError: LocalizedError, Sendable {
 }
 
 struct MediaAudioExtractor: Sendable {
-    func extract(from url: URL) async throws -> URL {
+    private static let cacheVersion = "audio-v1"
+
+    func extract(from url: URL, cacheKey: String? = nil) async throws -> URL {
+        let cachedURL = cacheKey.map(cacheURL(for:))
+        if let cachedURL,
+           FileManager.default.fileExists(atPath: cachedURL.path),
+           (try? FileManager.default.attributesOfItem(atPath: cachedURL.path)[.size] as? NSNumber)?.int64Value ?? 0 > 0 {
+            if let tracks = try? await AVURLAsset(url: cachedURL).loadTracks(withMediaType: .audio), !tracks.isEmpty {
+                return cachedURL
+            }
+            try? FileManager.default.removeItem(at: cachedURL)
+        }
+
         let asset = AVURLAsset(url: url)
         guard try await asset.loadTracks(withMediaType: .audio).first != nil else {
             throw MediaAnalysisError.missingAudio(url)
@@ -56,18 +69,36 @@ struct MediaAudioExtractor: Sendable {
 
         do {
             try await exporter.export(to: outputURL, as: .m4a)
-            return outputURL
+            guard let cachedURL else { return outputURL }
+            try FileManager.default.createDirectory(at: cachedURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+            do {
+                try FileManager.default.moveItem(at: outputURL, to: cachedURL)
+            } catch CocoaError.fileWriteFileExists {
+                try? FileManager.default.removeItem(at: outputURL)
+            }
+            return cachedURL
         } catch {
             try? FileManager.default.removeItem(at: outputURL)
             throw MediaAnalysisError.conversionFailed(url, error.localizedDescription)
         }
     }
+
+    private func cacheURL(for key: String) -> URL {
+        let identity = SHA256.hash(data: Data("\(Self.cacheVersion):\(key)".utf8))
+            .map { String(format: "%02x", $0) }
+            .joined()
+        return FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
+            .appendingPathComponent("YearlyInterviewStudio/MediaAnalysis/Audio", isDirectory: true)
+            .appendingPathComponent("\(identity).m4a")
+    }
 }
 
 struct AudioWaveformAnalyzer: Sendable {
-    func analyze(url: URL, bucketCount: Int = 240) async throws -> WaveformData {
-        let audioURL = try await MediaAudioExtractor().extract(from: url)
-        defer { try? FileManager.default.removeItem(at: audioURL) }
+    func analyze(url: URL, bucketCount: Int = 240, cacheKey: String? = nil) async throws -> WaveformData {
+        let audioURL = try await MediaAudioExtractor().extract(from: url, cacheKey: cacheKey)
+        defer {
+            if cacheKey == nil { try? FileManager.default.removeItem(at: audioURL) }
+        }
 
         do {
             let file = try AVAudioFile(forReading: audioURL, commonFormat: .pcmFormatFloat32, interleaved: false)
@@ -118,6 +149,111 @@ struct AudioWaveformAnalyzer: Sendable {
             throw MediaAnalysisError.unreadableAudio(url)
         }
     }
+
+    func refine(url: URL, markers: RawAnswerMarkers, cacheKey: String? = nil) async throws -> BoundaryRefinementResult {
+        let audioURL = try await MediaAudioExtractor().extract(from: url, cacheKey: cacheKey)
+        defer {
+            if cacheKey == nil { try? FileManager.default.removeItem(at: audioURL) }
+        }
+
+        do {
+            let file = try AVAudioFile(forReading: audioURL, commonFormat: .pcmFormatFloat32, interleaved: false)
+            let sampleRate = file.processingFormat.sampleRate
+            let totalFrames = Int(file.length)
+            let channelCount = Int(file.processingFormat.channelCount)
+            guard totalFrames > 0, sampleRate > 0, channelCount > 0 else {
+                throw MediaAnalysisError.emptyAudio(url)
+            }
+
+            guard let answerStart = markers.answerStart?.microseconds,
+                  let answerEnd = markers.answerEnd?.microseconds,
+                  answerEnd > answerStart else {
+                throw MediaAnalysisError.unreadableAudio(url)
+            }
+            let durationUS = Int64((Double(totalFrames) / sampleRate * 1_000_000).rounded())
+            let searchStartUS = max(0, answerStart - 2_500_000)
+            let searchEndUS = min(durationUS, answerEnd + 250_000)
+            guard searchEndUS > searchStartUS else {
+                throw MediaAnalysisError.unreadableAudio(url)
+            }
+            if let interviewerResumes = markers.interviewerResumes?.microseconds,
+               !(0 ... durationUS).contains(interviewerResumes) {
+                throw MediaAnalysisError.unreadableAudio(url)
+            }
+
+            let startFrame = min(max(Int((Double(searchStartUS) / 1_000_000 * sampleRate).rounded()), 0), totalFrames)
+            let endFrame = min(max(Int((Double(searchEndUS) / 1_000_000 * sampleRate).rounded()), startFrame), totalFrames)
+            let regionFrameCount = endFrame - startFrame
+            guard regionFrameCount > 0 else { throw MediaAnalysisError.emptyAudio(url) }
+
+            file.framePosition = AVAudioFramePosition(startFrame)
+            var samples: [Float] = []
+            samples.reserveCapacity(regionFrameCount)
+            let frameCapacity: AVAudioFrameCount = 4_096
+            var frameOffset = 0
+
+            while frameOffset < regionFrameCount {
+                try Task.checkCancellation()
+                let framesToRead = min(Int(frameCapacity), regionFrameCount - frameOffset)
+                guard let buffer = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: AVAudioFrameCount(framesToRead)) else {
+                    throw MediaAnalysisError.unreadableAudio(url)
+                }
+                try file.read(into: buffer, frameCount: AVAudioFrameCount(framesToRead))
+                guard let channels = buffer.floatChannelData, buffer.frameLength > 0 else {
+                    frameOffset += framesToRead
+                    continue
+                }
+
+                for frameIndex in 0 ..< Int(buffer.frameLength) {
+                    var sum: Float = 0
+                    for channelIndex in 0 ..< channelCount {
+                        sum += channels[channelIndex][frameIndex]
+                    }
+                    samples.append(sum / Float(channelCount))
+                }
+                frameOffset += Int(buffer.frameLength)
+            }
+
+            let offsetUS = searchStartUS
+            let localMarkers = RawAnswerMarkers(
+                answerStart: .microseconds(answerStart - offsetUS),
+                answerEnd: .microseconds(answerEnd - offsetUS),
+                interviewerResumes: markers.interviewerResumes.map { .microseconds($0.microseconds - offsetUS) },
+                noFollowingInterviewerSpeech: markers.noFollowingInterviewerSpeech
+            )
+            let localResult = AnswerBoundaryRefiner().refine(
+                markers: localMarkers,
+                audio: AudioAnalysisBuffer(samples: samples, sampleRate: sampleRate),
+                duration: .microseconds(searchEndUS - offsetUS)
+            )
+            let shift = { (time: MediaTime) in MediaTime.microseconds(time.microseconds + offsetUS) }
+            let localBoundaries = localResult.boundaries
+            let boundaries = RefinedBoundaries(
+                visibleStart: shift(localBoundaries.visibleStart),
+                visibleEnd: shift(localBoundaries.visibleEnd),
+                safeLeadingStart: shift(localBoundaries.safeLeadingStart),
+                safeTrailingEnd: shift(localBoundaries.safeTrailingEnd),
+                confidence: localBoundaries.confidence,
+                reasons: localBoundaries.reasons,
+                algorithmIdentifier: localBoundaries.algorithmIdentifier,
+                algorithmVersion: localBoundaries.algorithmVersion,
+                manualOverride: localBoundaries.manualOverride
+            )
+            return BoundaryRefinementResult(
+                boundaries: boundaries,
+                noiseFloorDBFS: localResult.noiseFloorDBFS,
+                speechThresholdDBFS: localResult.speechThresholdDBFS,
+                windows: localResult.windows,
+                needsReview: localResult.needsReview
+            )
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch let error as MediaAnalysisError {
+            throw error
+        } catch {
+            throw MediaAnalysisError.unreadableAudio(url)
+        }
+    }
 }
 
 enum SpeechTranscriptionError: LocalizedError, Sendable {
@@ -157,7 +293,7 @@ enum SpeechTranscriptionError: LocalizedError, Sendable {
 
 @MainActor
 final class SpeechTranscriptionService {
-    func transcribe(url: URL, sourceRecordingID: UUID, localeIdentifier: String) async throws -> AnswerTranscript {
+    func transcribe(url: URL, sourceRecordingID: UUID, localeIdentifier: String, cacheKey: String? = nil) async throws -> AnswerTranscript {
         guard let recognizer = SFSpeechRecognizer(locale: Locale(identifier: localeIdentifier)) else {
             throw SpeechTranscriptionError.unavailable
         }
@@ -183,8 +319,10 @@ final class SpeechTranscriptionService {
             throw SpeechTranscriptionError.onDeviceUnavailable(localeIdentifier)
         }
 
-        let audioURL = try await MediaAudioExtractor().extract(from: url)
-        defer { try? FileManager.default.removeItem(at: audioURL) }
+        let audioURL = try await MediaAudioExtractor().extract(from: url, cacheKey: cacheKey)
+        defer {
+            if cacheKey == nil { try? FileManager.default.removeItem(at: audioURL) }
+        }
 
         let request = SFSpeechURLRecognitionRequest(url: audioURL)
         request.requiresOnDeviceRecognition = true

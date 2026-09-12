@@ -8,6 +8,7 @@ BUNDLE_ID="com.jkfisher.yearlyinterviewstudio"
 MIN_SYSTEM_VERSION="26.0"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+DIST_DIR="$ROOT_DIR/dist"
 VERSION_FILE="$ROOT_DIR/VERSION"
 BUILD_NUMBER_FILE="$ROOT_DIR/BUILD_NUMBER"
 MARKETING_VERSION="$(tr -d '[:space:]' < "$VERSION_FILE")"
@@ -17,9 +18,8 @@ if [[ -z "$MARKETING_VERSION" || ! "$CURRENT_BUILD_NUMBER" =~ ^[0-9]+$ ]]; then
   exit 1
 fi
 BUILD_NUMBER="$((CURRENT_BUILD_NUMBER + 1))"
-PACKAGE_DIR="${TMPDIR:-/tmp}/YearlyInterviewStudio-package-$BUILD_NUMBER"
 SCRATCH_PATH="${TMPDIR:-/tmp}/interview-studio-build-$RANDOM"
-APP_BUNDLE="$PACKAGE_DIR/$BUNDLE_NAME.app"
+APP_BUNDLE="$DIST_DIR/$BUNDLE_NAME.app"
 APP_CONTENTS="$APP_BUNDLE/Contents"
 APP_MACOS="$APP_CONTENTS/MacOS"
 APP_RESOURCES="$APP_CONTENTS/Resources"
@@ -96,6 +96,7 @@ with path.open("wb") as handle:
                 {
                     "CFBundleTypeName": "Yearly Interview Studio Project",
                     "CFBundleTypeRole": "Editor",
+                    "NSDocumentClass": "YearlyInterviewStudioApp.InterviewStudioDocument",
                     "LSItemContentTypes": ["com.jkfisher.yearly-interview-studio.project"],
                 }
             ],
@@ -137,6 +138,14 @@ if ! /usr/bin/codesign --verify --deep --strict "$APP_BUNDLE" >/dev/null 2>&1; t
   else
     echo "Warning: strict app signature verification failed; the app is not distribution-ready." >&2
   fi
+fi
+
+# FileProvider can reattach root Finder metadata after the signing pass. Clear
+# it once more so the bundle produced in dist remains strictly verifiable.
+/usr/bin/xattr -d com.apple.FinderInfo "$APP_BUNDLE" 2>/dev/null || true
+/usr/bin/xattr -d 'com.apple.fileprovider.fpfs#P' "$APP_BUNDLE" 2>/dev/null || true
+if ! /usr/bin/codesign --verify --deep --strict "$APP_BUNDLE" >/dev/null 2>&1; then
+  echo "Warning: Finder/FileProvider metadata was reattached in dist; the local app bundle was built, but strict codesign verification is not distribution proof." >&2
 fi
 
 open_app() {

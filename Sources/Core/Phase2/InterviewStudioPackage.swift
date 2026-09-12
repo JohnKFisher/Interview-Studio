@@ -68,6 +68,16 @@ public struct ImportedRecording: Sendable {
     }
 }
 
+public struct StagedRecordingImport: Sendable {
+    public var imported: ImportedRecording
+    public var stagedURL: URL?
+
+    public init(imported: ImportedRecording, stagedURL: URL? = nil) {
+        self.imported = imported
+        self.stagedURL = stagedURL
+    }
+}
+
 public struct InterviewStudioPackageStore: Sendable {
     public static let projectFilename = "interview_studio_project.json"
     public static let inventoryFilename = "package_inventory.json"
@@ -191,8 +201,23 @@ public struct InterviewStudioPackageStore: Sendable {
         try readJSON(PublicationRecord.self, from: publicationHistoryURL(for: id))
     }
 
-    public func rebuildInventory() throws {
-        let entries = try inventoryEntries()
+    public func rebuildInventory(
+        changedPaths: Set<String>? = nil,
+        trustedEntries: [PackageInventoryEntry] = []
+    ) throws {
+        let reusableEntries: [String: PackageInventoryEntry]
+        if changedPaths != nil,
+           let inventoryData = try? Data(contentsOf: inventoryURL),
+           let inventory = try? JSONDecoder.interviewStudio.decode(PackageInventory.self, from: inventoryData) {
+            reusableEntries = Dictionary(uniqueKeysWithValues: inventory.entries.map { ($0.relativePath, $0) })
+        } else {
+            reusableEntries = [:]
+        }
+        let entries = try inventoryEntries(
+            reusing: reusableEntries,
+            changedPaths: changedPaths ?? [],
+            trustedEntries: Dictionary(uniqueKeysWithValues: trustedEntries.map { ($0.relativePath, $0) })
+        )
         let inventory = PackageInventory(packageID: try readProjectAllowingReadOnly().projectID, entries: entries)
         let data = try encoded(inventory)
         try writeDataAtomically(data, to: inventoryURL)
@@ -222,6 +247,79 @@ public struct InterviewStudioPackageStore: Sendable {
                 throw InterviewStudioPackageError.inventoryMismatch("\(entry.relativePath) has changed bytes.")
             }
         }
+    }
+
+    public func stageRecordingImport(
+        from sourceURL: URL,
+        ageKey: String,
+        ageLabel: String,
+        source: RecordingImportSource,
+        stagingRoot: URL,
+        photosLocalIdentifier: String? = nil,
+        captureDate: Date? = nil,
+        order: Int = 0,
+        firstQuestionHint: String? = nil
+    ) async throws -> StagedRecordingImport {
+        let sourceURL = sourceURL.standardizedFileURL
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: sourceURL.path, isDirectory: &isDirectory), !isDirectory.boolValue else {
+            throw InterviewStudioPackageError.invalidPackage("Only a readable local video file can be imported: \(sourceURL.path)")
+        }
+
+        let sourceHash = sha256(fileURL: sourceURL)
+        if let duplicate = try existingRecording(withSHA256: sourceHash) {
+            return StagedRecordingImport(imported: ImportedRecording(recording: duplicate, duplicateOf: duplicate))
+        }
+
+        let recordingID = UUID()
+        let safeAge = InterviewStudioKey.safeFilenameComponent(ageKey, fallback: "age")
+        let safeFilename = InterviewStudioKey.safeFilenameComponent(sourceURL.lastPathComponent, fallback: "recording.mov")
+        let relativePath = "Source Recordings/\(safeAge)/\(recordingID.uuidString)--\(safeFilename)"
+        let stagedURL = stagingRoot.appendingPathComponent(relativePath).standardizedFileURL
+        guard stagedURL.path.hasPrefix(stagingRoot.standardizedFileURL.path + "/") else {
+            throw InterviewStudioPackageError.unsafeRelativePath(relativePath)
+        }
+        try FileManager.default.createDirectory(at: stagedURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try FileManager.default.copyItem(at: sourceURL, to: stagedURL)
+        var keepStagedFile = false
+        defer {
+            if !keepStagedFile {
+                try? FileManager.default.removeItem(at: stagedURL)
+            }
+        }
+        guard sha256(fileURL: stagedURL) == sourceHash else { throw InterviewStudioPackageError.checksumMismatch(sourceURL) }
+
+        var signature = MediaSignature(byteCount: fileByteCount(stagedURL), sha256: sourceHash)
+        if let inspection = try? await NativeMediaInspector().inspect(url: stagedURL) {
+            signature.durationMicroseconds = inspection.duration.microseconds
+            signature.width = inspection.width
+            signature.height = inspection.height
+            signature.nominalFrameRate = inspection.nominalFrameRate
+            signature.actualFrameRate = inspection.actualFrameRate
+            signature.audioChannels = inspection.audioChannels
+            signature.colorPrimaries = inspection.colorPrimaries
+            signature.colorTransfer = inspection.colorTransfer
+            signature.colorMatrix = inspection.colorMatrix
+        }
+
+        let recording = SourceRecording(
+            id: recordingID,
+            ageKey: ageKey,
+            ageLabel: ageLabel,
+            packageRelativePath: relativePath,
+            originalFilename: sourceURL.lastPathComponent,
+            importSource: source,
+            photosLocalIdentifier: photosLocalIdentifier,
+            captureDate: captureDate,
+            order: order,
+            firstQuestionHint: firstQuestionHint,
+            mediaSignature: signature
+        )
+        keepStagedFile = true
+        return StagedRecordingImport(
+            imported: ImportedRecording(recording: recording),
+            stagedURL: stagedURL
+        )
     }
 
     public func importRecording(
@@ -285,7 +383,6 @@ public struct InterviewStudioPackageStore: Sendable {
             firstQuestionHint: firstQuestionHint,
             mediaSignature: signature
         )
-        try rebuildInventory()
         return ImportedRecording(recording: recording)
     }
 
@@ -315,7 +412,11 @@ public struct InterviewStudioPackageStore: Sendable {
         return nil
     }
 
-    private func inventoryEntries() throws -> [PackageInventoryEntry] {
+    private func inventoryEntries(
+        reusing reusableEntries: [String: PackageInventoryEntry] = [:],
+        changedPaths: Set<String> = [],
+        trustedEntries: [String: PackageInventoryEntry] = [:]
+    ) throws -> [PackageInventoryEntry] {
         let paths = try FileManager.default.subpathsOfDirectory(atPath: rootURL.path)
         var entries: [PackageInventoryEntry] = []
         for relative in paths.sorted() {
@@ -326,7 +427,16 @@ public struct InterviewStudioPackageStore: Sendable {
             let item = rootURL.appendingPathComponent(relative)
             var isDirectory: ObjCBool = false
             guard FileManager.default.fileExists(atPath: item.path, isDirectory: &isDirectory), !isDirectory.boolValue else { continue }
-            entries.append(PackageInventoryEntry(relativePath: relative, byteCount: fileByteCount(item), sha256: sha256(fileURL: item), kind: entryKind(for: relative)))
+            let byteCount = fileByteCount(item)
+            if let trustedEntry = trustedEntries[relative], trustedEntry.byteCount == byteCount {
+                entries.append(trustedEntry)
+            } else if !changedPaths.contains(relative),
+               let reusableEntry = reusableEntries[relative],
+               reusableEntry.byteCount == byteCount {
+                entries.append(reusableEntry)
+            } else {
+                entries.append(PackageInventoryEntry(relativePath: relative, byteCount: byteCount, sha256: sha256(fileURL: item), kind: entryKind(for: relative)))
+            }
         }
         return entries
     }

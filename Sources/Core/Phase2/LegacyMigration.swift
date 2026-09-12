@@ -189,10 +189,23 @@ public struct LegacyMigrationService: Sendable {
         }
         let personKey = InterviewStudioKey.readableKey(from: analysis.personName)
         let rows = analysis.rows.filter(\.isUsableStatus)
-        let questionRows = Dictionary(grouping: rows, by: \.questionKey)
-        let questions = questionRows.enumerated().map { index, item in
-            InterviewQuestion(questionKey: item.key, displayText: item.value.first?.question.nonEmpty ?? item.key, order: index)
-        }.sorted { $0.order < $1.order }
+        var questionRows: [String: [ManifestRow]] = [:]
+        var questionKeys: [String] = []
+        for row in rows {
+            if questionRows[row.questionKey] == nil {
+                questionKeys.append(row.questionKey)
+            }
+            questionRows[row.questionKey, default: []].append(row)
+        }
+        let questions = InterviewProductionQuestionOrder.ordered(
+            questionKeys.enumerated().map { index, key in
+                InterviewQuestion(
+                    questionKey: key,
+                    displayText: questionRows[key]?.first?.question.nonEmpty ?? key,
+                    order: index
+                )
+            }
+        )
         var settings = AssemblySettings()
         if let sidecarURL = analysis.sidecarURL, let data = try? Data(contentsOf: sidecarURL), let legacy = try? JSONDecoder.interviewStudio.decode(ProjectDocument.self, from: data) {
             settings = AssemblySettings(renderSettings: legacy.renderSettings, plexMetadata: legacy.plexMetadata, openingTitle: legacy.openingTitle, closingTitle: legacy.closingTitle)
@@ -203,7 +216,7 @@ public struct LegacyMigrationService: Sendable {
             throw InterviewStudioPackageError.fileExists(destination)
         }
         let stagingURL = destination.deletingLastPathComponent()
-            .appendingPathComponent(".\\(destination.lastPathComponent).\\(UUID().uuidString).interviewstudio-staging", isDirectory: true)
+            .appendingPathComponent(".\(destination.lastPathComponent).\(UUID().uuidString).interviewstudio-staging", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: stagingURL) }
         let store = try InterviewStudioPackageStore.create(project: project, at: stagingURL)
         let legacyRoot = store.rootURL.appendingPathComponent("Legacy Import/Original", isDirectory: true)
@@ -341,6 +354,10 @@ public struct LegacyMigrationService: Sendable {
             throw InterviewStudioPackageError.fileExists(destination)
         }
         try FileManager.default.moveItem(at: stagingURL, to: destination)
+        var destinationResourceValues = URLResourceValues()
+        destinationResourceValues.isHidden = false
+        var visibleDestination = destination
+        try visibleDestination.setResourceValues(destinationResourceValues)
         return LegacyImportResult(packageURL: destination, analysis: analysis, migrationRecord: record)
     }
 }

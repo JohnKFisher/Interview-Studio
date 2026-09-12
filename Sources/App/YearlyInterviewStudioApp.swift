@@ -20,6 +20,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return false
     }
 
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        true
+    }
+
     @objc func newProject(_ sender: Any?) {
         let document = InterviewStudioDocument()
         NSDocumentController.shared.addDocument(document)
@@ -88,7 +92,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc func saveDocument(_ sender: Any?) {
-        NSDocumentController.shared.currentDocument?.save(nil)
+        guard let document = NSDocumentController.shared.currentDocument else {
+            showAlert(title: "No open project", message: "Open an Interview Studio project before saving.")
+            return
+        }
+        document.save(nil)
+    }
+
+    @objc func exportFinalMovie(_ sender: Any?) {
+        guard let document = NSDocumentController.shared.currentDocument as? InterviewStudioDocument else {
+            showAlert(title: "No open project", message: "Open an Interview Studio project before exporting the final movie.")
+            return
+        }
+        document.renderFinalMovie()
     }
 
     @objc func verifyPackage(_ sender: Any?) {
@@ -163,15 +179,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func openDocument(at url: URL) {
-        do {
-            let document = InterviewStudioDocument()
-            try document.read(from: url, ofType: "com.jkfisher.yearly-interview-studio.project")
-            NSDocumentController.shared.addDocument(document)
-            document.makeWindowControllers()
-            document.showWindows()
-            closeWelcome()
-        } catch {
-            showAlert(title: "Open failed", message: error.localizedDescription)
+        NSDocumentController.shared.openDocument(withContentsOf: url, display: true) { [weak self] document, _, error in
+            guard let self else { return }
+            if let error {
+                self.showAlert(title: "Open failed", message: error.localizedDescription)
+            } else {
+                (document as? InterviewStudioDocument)?.finishOpening()
+                self.closeWelcome()
+            }
         }
     }
 
@@ -191,7 +206,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         fileMenu.addItem(withTitle: "Open Project…", action: #selector(openProject(_:)), keyEquivalent: "o")
         fileMenu.addItem(withTitle: "Import Legacy Project…", action: #selector(importLegacyProject(_:)), keyEquivalent: "i")
         fileMenu.addItem(.separator())
-        fileMenu.addItem(withTitle: "Save", action: #selector(saveDocument(_:)), keyEquivalent: "s")
+        let saveItem = fileMenu.addItem(withTitle: "Save", action: #selector(saveDocument(_:)), keyEquivalent: "s")
+        saveItem.target = self
+        fileMenu.addItem(withTitle: "Export Final Movie…", action: #selector(exportFinalMovie(_:)), keyEquivalent: "e")
         fileMenu.addItem(withTitle: "Verify Package", action: #selector(verifyPackage(_:)), keyEquivalent: "v")
         fileMenu.addItem(withTitle: "Close", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
         fileItem.submenu = fileMenu

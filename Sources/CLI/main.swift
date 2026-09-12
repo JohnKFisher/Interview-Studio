@@ -89,7 +89,7 @@ struct YearlyInterviewStudioCLI {
         guard !sessions.isEmpty else { throw InterviewStudioPackageError.invalidPackage("The package contains no interview sessions.") }
         try createNewDirectory(outputURL)
         let stagingRoot = FileManager.default.temporaryDirectory
-            .appendingPathComponent("InterviewStudio-Manifest-\\(UUID().uuidString)", isDirectory: true)
+            .appendingPathComponent("InterviewStudio-Manifest-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: stagingRoot, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: stagingRoot) }
         let builder = ManifestPublicationBuilder()
