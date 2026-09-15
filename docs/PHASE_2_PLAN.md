@@ -1,24 +1,28 @@
 # Phase 2 Plan — Clip Factory
 
-Status: active prototype; incomplete and not release-ready.
+Status: active prototype; the recording-first workflow is implemented in the current checkout, but the phase is not release-ready until real-media round-trip verification and the remaining reliability work are complete.
 
 Phase 1 is the Assembly Studio: it takes prepared clips and a prepared `final_manifest.json` and creates the finished movie. Phase 2 is the front half of that workflow: a package-backed Clip Factory prototype that turns local interview source media into candidate clips and a manifest that Phase 1 can understand.
 
 The original detailed plan is preserved in [Historical/yearly_interview_studio_codex_plan.md](Historical/yearly_interview_studio_codex_plan.md). This file is the current working checklist and should be updated as decisions are made.
 
-## Current implementation snapshot — 2026-08-07
+## Current implementation snapshot — 2026-09-13
 
 Implemented in the current prototype:
 
 - Finder recording import into app-owned project packages with checksums and media inspection.
 - Native source playback, waveform review, answer markers, optional on-device transcription, and session persistence.
 - Single-part native answer publication with safe output names, no-overwrite behavior, output media reinspection, and a generated manifest.
+- A recording-first, per-age workspace with Capture, Refine, Assign, and Finish stages; legacy question-first sessions remain supported.
+- Multiple recordings per age with permanent recording/clip labels, nondestructive internal cuts, safe-buffer-aware preview/export, one-to-one candidate/question assignment, and lock-with-warnings readiness.
+- Transactional recording staging with checksums, package-local recovery journaling, atomic promotion, and inventory updates.
+- Reversible age correction and optional metadata-only age archiving; archived entries are excluded from future renders without deleting source media.
 
 Still required before this phase can be called complete:
 
 - Real birthday-project source → answer clip → manifest → Phase 1 round-trip verification.
 - Cancellation/retry and duplicate-publication UX.
-- Multipart answers, incremental manifest editing, and deeper boundary/handle QA.
+- Real-media verification of multipart answers, incremental manifest editing, and deeper boundary/handle QA.
 - Broader playback and library validation of generated media and metadata.
 
 ## Phase 2 outcome
@@ -29,32 +33,32 @@ Given long yearly interview source media, the app should let the user identify a
 
 ### 1. Define the Clip Factory workflow
 
-- [ ] Decide how users add one or more long source videos to a project.
+- [x] Decide how users add one or more long source videos to a project.
 - [ ] Decide whether Phase 2 supports one person only at first or introduces multi-person projects.
-- [ ] Define the source-media browser and the answer-selection workflow.
-- [ ] Define how questions are selected, added, renamed, and ordered.
-- [ ] Define how age/year and person metadata are assigned to each clip.
-- [ ] Define how projects save unfinished clip selections without changing the source media.
+- [x] Define the source-media browser and the answer-selection workflow.
+- [x] Define how questions are selected, added, renamed, and ordered.
+- [x] Define how age/year and person metadata are assigned to each clip.
+- [x] Define how projects save unfinished clip selections without changing the source media.
 
 ### 2. Build source-media review
 
-- [ ] Import and inspect long source videos with useful metadata and validation errors.
-- [ ] Add reliable playback controls: play/pause, seek, time display, and scrubbing.
-- [ ] Support precise in/out selection for an answer, including enough context to choose clean boundaries.
-- [ ] Provide a preview of the selected range before export.
-- [ ] Decide whether handles are user-adjustable, automatically suggested, or both.
+- [x] Import and inspect long source videos with useful metadata and validation errors.
+- [x] Add reliable playback controls: play/pause, seek, time display, and scrubbing.
+- [x] Support precise in/out selection for an answer, including enough context to choose clean boundaries.
+- [x] Provide a preview of the selected range before export.
+- [x] Decide whether handles are user-adjustable, automatically suggested, or both.
 
 ### 3. Create answer clips
 
-- [ ] Export one or more selected answer ranges as individual clips.
+- [x] Export one or more selected answer ranges as individual clips.
 - [ ] Use stable, human-readable names and a predictable project-folder layout.
-- [ ] Preserve the metadata needed by Phase 1: identity, question grouping, age sorting, output path, answer timing, handle data, video/color signature, and validation status.
+- [x] Preserve the metadata needed by Phase 1: identity, question grouping, age sorting, output path, answer timing, handle data, video/color signature, and validation status.
 - [ ] Handle cancellation, retry, duplicate output names, missing source media, and partial exports safely.
-- [ ] Keep source media untouched and make the generated clips replaceable.
+- [x] Keep source media untouched and make the generated clips replaceable.
 
 ### 4. Create and maintain the manifest
 
-- [ ] Generate a new `final_manifest.json` for a Clip Factory project.
+- [x] Generate a new `final_manifest.json` for a Clip Factory project.
 - [ ] Support adding or revising clips without losing existing valid rows.
 - [ ] Validate generated rows before marking them usable by Phase 1.
 - [ ] Resolve generated paths using the same rules as the current Phase 1 importer.
@@ -62,10 +66,10 @@ Given long yearly interview source media, the app should let the user identify a
 
 ### 5. Connect the handoff to Phase 1
 
-- [ ] Open a generated project folder directly in the existing Assembly Studio.
+- [x] Open a generated project folder directly in the existing Assembly Studio.
 - [ ] Show clear errors when generated clips or manifest fields are not ready for assembly.
 - [ ] Run a real-media round trip: source video → selected clip → manifest → Phase 1 render.
-- [ ] Add deterministic tests for manifest generation, path resolution, metadata, and boundary/handle calculations.
+- [x] Add deterministic tests for manifest generation, path resolution, metadata, and boundary/handle calculations.
 
 ## Supporting work that may belong in Phase 2
 
@@ -75,7 +79,7 @@ These are useful parts of the broader workflow, but should not expand the first 
 - [ ] Per-clip exclusion/reinclude controls.
 - [ ] Better boundary review and confidence explanations.
 - [ ] Progress and diagnostics for long clip-export batches.
-- [ ] Multiple source files or merged source parts per answer.
+- [x] Multiple source files or merged source parts per answer.
 
 ## Explicit non-goals for the initial Phase 2 slice
 

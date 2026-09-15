@@ -44,3 +44,15 @@ Package inventory verification enumerates every visible non-hidden package file,
 
 ## 2026-09-02 - Use root files for app version identity
 VERSION and BUILD_NUMBER are the source-controlled version contract. The packaged app reads the generated bundle values, and script/build_and_run.sh increments BUILD_NUMBER exactly once per packaged app build. Status: approved.
+
+## 2026-09-13 - Add an explicit recording-first workflow for per-age entries
+New age entries use an explicit recording-first workflow with Capture, Refine, Assign, and Finish stages. Age is the canonical identity and calendar year is secondary repeatable metadata. Existing sessions without the workflow field continue to use the question-first path, while unknown workflow values open read-only. Status: approved and implemented in the current checkout.
+
+## 2026-09-13 - Treat captured clips as durable candidates before assignment
+Recording-first In/Out pairs create permanent source-scoped candidate labels and remain editable, discardable, restorable, and unassigned until approved. A candidate can be assigned to at most one question and a question can have at most one candidate; replacement requires an explicit comparison. Internal cuts remain nondestructive and publication adds safe buffers only at retained outer boundaries. Status: approved and implemented in the current checkout.
+
+## 2026-09-13 - Make recording imports recoverable package transactions
+Recording-first imports are copied into package-local staging, journaled with source identity and checksums, verified before atomic promotion, and included in the package inventory only after successful consolidation. Recovery keeps pending work available after interruption and never deletes source media implicitly. Status: approved and implemented in the current checkout.
+
+## 2026-09-13 - Keep age archiving reversible and metadata-only
+Archiving removes an age entry from active selection and future renders without deleting recordings, candidates, assignments, or previous publications. Restore returns the same session identity; permanent deletion and archive-management UI remain out of scope for this slice. Status: approved and implemented in the current checkout.

@@ -190,6 +190,45 @@ public struct MediaSignature: Codable, Hashable, Sendable {
     }
 }
 
+public enum SessionWorkflowKind: Codable, Hashable, Sendable {
+    case questionFirstV1
+    case recordingFirstV1
+    case unsupported(String)
+
+    public init(from decoder: Decoder) throws {
+        let value = try decoder.singleValueContainer().decode(String.self)
+        switch value {
+        case "question_first_v1": self = .questionFirstV1
+        case "recording_first_v1": self = .recordingFirstV1
+        default: self = .unsupported(value)
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        switch self {
+        case .questionFirstV1: try container.encode("question_first_v1")
+        case .recordingFirstV1: try container.encode("recording_first_v1")
+        case .unsupported(let value): try container.encode(value)
+        }
+    }
+
+    public var rawValue: String {
+        switch self {
+        case .questionFirstV1: return "question_first_v1"
+        case .recordingFirstV1: return "recording_first_v1"
+        case .unsupported(let value): return value
+        }
+    }
+}
+
+public enum SourceRecordingState: String, Codable, Hashable, Sendable {
+    case notStarted = "not_started"
+    case inProgress = "in_progress"
+    case finished
+}
+public typealias RecordingProgressState = SourceRecordingState
+
 public struct SourceRecording: Codable, Hashable, Sendable, Identifiable {
     public var id: UUID
     public var ageKey: String
@@ -200,6 +239,9 @@ public struct SourceRecording: Codable, Hashable, Sendable, Identifiable {
     public var photosLocalIdentifier: String?
     public var captureDate: Date?
     public var order: Int
+    public var recordingNumber: Int
+    public var recordingState: RecordingProgressState
+    public var provisionalInPointUS: Int64?
     public var firstQuestionHint: String?
     public var mediaSignature: MediaSignature
     public var extensions: [String: JSONValue]
@@ -214,6 +256,9 @@ public struct SourceRecording: Codable, Hashable, Sendable, Identifiable {
         photosLocalIdentifier: String? = nil,
         captureDate: Date? = nil,
         order: Int = 0,
+        recordingNumber: Int? = nil,
+        recordingState: RecordingProgressState = .notStarted,
+        provisionalInPointUS: Int64? = nil,
         firstQuestionHint: String? = nil,
         mediaSignature: MediaSignature,
         extensions: [String: JSONValue] = [:]
@@ -227,9 +272,26 @@ public struct SourceRecording: Codable, Hashable, Sendable, Identifiable {
         self.photosLocalIdentifier = photosLocalIdentifier
         self.captureDate = captureDate
         self.order = order
+        self.recordingNumber = recordingNumber ?? order + 1
+        self.recordingState = recordingState
+        self.provisionalInPointUS = provisionalInPointUS
         self.firstQuestionHint = firstQuestionHint
         self.mediaSignature = mediaSignature
         self.extensions = extensions
+    }
+
+    private enum CodingKeys: String, CodingKey { case id, ageKey, ageLabel, packageRelativePath, originalFilename, importSource, photosLocalIdentifier, captureDate, order, recordingNumber, recordingState, provisionalInPointUS, firstQuestionHint, mediaSignature, extensions }
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(UUID.self, forKey: .id); ageKey = try c.decode(String.self, forKey: .ageKey); ageLabel = try c.decode(String.self, forKey: .ageLabel)
+        packageRelativePath = try c.decode(String.self, forKey: .packageRelativePath); originalFilename = try c.decode(String.self, forKey: .originalFilename)
+        importSource = try c.decode(RecordingImportSource.self, forKey: .importSource); photosLocalIdentifier = try c.decodeIfPresent(String.self, forKey: .photosLocalIdentifier)
+        captureDate = try c.decodeIfPresent(Date.self, forKey: .captureDate); order = try c.decodeIfPresent(Int.self, forKey: .order) ?? 0
+        recordingNumber = try c.decodeIfPresent(Int.self, forKey: .recordingNumber) ?? order + 1
+        recordingState = try c.decodeIfPresent(RecordingProgressState.self, forKey: .recordingState) ?? .notStarted
+        provisionalInPointUS = try c.decodeIfPresent(Int64.self, forKey: .provisionalInPointUS)
+        firstQuestionHint = try c.decodeIfPresent(String.self, forKey: .firstQuestionHint); mediaSignature = try c.decode(MediaSignature.self, forKey: .mediaSignature)
+        extensions = try c.decodeIfPresent([String: JSONValue].self, forKey: .extensions) ?? [:]
     }
 }
 
@@ -334,6 +396,82 @@ public struct AnswerTake: Codable, Hashable, Sendable, Identifiable {
     }
 }
 
+public enum CandidateReviewState: String, Codable, Hashable, Sendable {
+    case unreviewed
+    case inProgress = "in_progress"
+    case needsReview = "needs_review"
+    case approved
+    case skipped
+    case discarded
+}
+
+public struct CandidateSegment: Codable, Hashable, Sendable {
+    public var start: MediaTime
+    public var end: MediaTime
+
+    public init(start: MediaTime, end: MediaTime) { self.start = start; self.end = end }
+    public var isValid: Bool { end > start }
+    public var duration: MediaTime { MediaTime.microseconds(max(0, end.microseconds - start.microseconds)) }
+    public var range: ClosedRange<MediaTime> { start...end }
+    public func clamped(to duration: MediaTime) -> CandidateSegment { .init(start: MediaTime.microseconds(max(0, min(start.microseconds, duration.microseconds))), end: MediaTime.microseconds(max(0, min(end.microseconds, duration.microseconds)))) }
+}
+
+public struct AnswerCandidate: Codable, Hashable, Sendable, Identifiable {
+    public var id: UUID
+    public var sourceRecordingID: UUID
+    public var recordingNumber: Int
+    public var clipNumber: Int
+    public var sourceOrder: Int
+    public var rawMarkers: RawAnswerMarkers
+    public var refinedBoundaries: RefinedBoundaries?
+    public var retainedSegments: [CandidateSegment]
+    public var reviewState: CandidateReviewState
+    public var transcript: AnswerTranscript?
+    public var createdAt: Date
+    public var updatedAt: Date
+    public var extensions: [String: JSONValue]
+
+    public init(id: UUID = UUID(), sourceRecordingID: UUID, recordingNumber: Int, clipNumber: Int, sourceOrder: Int = 0, rawMarkers: RawAnswerMarkers, refinedBoundaries: RefinedBoundaries? = nil, retainedSegments: [CandidateSegment] = [], reviewState: CandidateReviewState = .unreviewed, transcript: AnswerTranscript? = nil, createdAt: Date = Date(), updatedAt: Date = Date(), extensions: [String: JSONValue] = [:]) {
+        self.id = id; self.sourceRecordingID = sourceRecordingID; self.recordingNumber = recordingNumber; self.clipNumber = clipNumber; self.sourceOrder = sourceOrder; self.rawMarkers = rawMarkers; self.refinedBoundaries = refinedBoundaries
+        self.retainedSegments = retainedSegments.sorted { $0.start < $1.start }; self.reviewState = reviewState; self.transcript = transcript; self.createdAt = createdAt; self.updatedAt = updatedAt; self.extensions = extensions
+    }
+    public var label: String { "Recording \(recordingNumber) · Clip \(clipNumber)" }
+    public var visibleRange: CandidateSegment? { if let b = refinedBoundaries { return .init(start: b.visibleStart, end: b.visibleEnd) }; guard let s = rawMarkers.answerStart, let e = rawMarkers.answerEnd else { return nil }; return .init(start: s, end: e) }
+    public var safeRange: CandidateSegment? { guard let b = refinedBoundaries else { return visibleRange }; return .init(start: b.safeLeadingStart, end: b.safeTrailingEnd) }
+}
+
+public struct NormalizedAge: Codable, Hashable, Sendable {
+    public var key: String
+    public var label: String
+    public var sortValue: Double?
+    public init(key: String, label: String, sortValue: Double?) { self.key = key; self.label = label; self.sortValue = sortValue }
+}
+
+public enum AgeNormalization {
+    public static func normalize(key: String, label: String, sortValue: Double? = nil) -> NormalizedAge {
+        let value = sortValue ?? firstNumericValue(in: label)
+        let display = value.map { String(format: "%.2f", locale: Locale(identifier: "en_US_POSIX"), $0).trimmingCharacters(in: CharacterSet(charactersIn: "0")).trimmingCharacters(in: CharacterSet(charactersIn: ".")) }
+        let normalizedLabel = display.map { "\($0) \($0 == "1" ? "Year" : "Years") Old" } ?? label.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedKey = value.map { "age_\(String(format: "%.2f", locale: Locale(identifier: "en_US_POSIX"), $0).trimmingCharacters(in: CharacterSet(charactersIn: "0")).trimmingCharacters(in: CharacterSet(charactersIn: ".")))" } ?? key
+        return NormalizedAge(key: normalizedKey, label: normalizedLabel, sortValue: value)
+    }
+
+    private static func firstNumericValue(in text: String) -> Double? {
+        let allowed = CharacterSet(charactersIn: "0123456789.")
+        var token = ""
+        var sawDigit = false
+        for scalar in text.unicodeScalars {
+            if allowed.contains(scalar) {
+                token.unicodeScalars.append(scalar)
+                sawDigit = sawDigit || (scalar.value >= 48 && scalar.value <= 57)
+            } else if sawDigit {
+                break
+            }
+        }
+        return sawDigit ? Double(token) : nil
+    }
+}
+
 public struct TranscriptSegment: Codable, Hashable, Sendable, Identifiable {
     public var id: UUID
     public var text: String
@@ -372,6 +510,7 @@ public struct AnswerTranscript: Codable, Hashable, Sendable {
 
 public struct InterviewAnswer: Codable, Hashable, Sendable {
     public var questionKey: String
+    public var assignedCandidateID: UUID?
     public var selectedTakeID: UUID?
     public var takes: [AnswerTake]
     public var state: QuestionProgressState
@@ -379,14 +518,24 @@ public struct InterviewAnswer: Codable, Hashable, Sendable {
     public var transcript: AnswerTranscript?
     public var extensions: [String: JSONValue]
 
-    public init(questionKey: String, selectedTakeID: UUID? = nil, takes: [AnswerTake] = [], state: QuestionProgressState = .notStarted, lastReviewedAt: Date? = nil, transcript: AnswerTranscript? = nil, extensions: [String: JSONValue] = [:]) {
+    public init(questionKey: String, assignedCandidateID: UUID? = nil, selectedTakeID: UUID? = nil, takes: [AnswerTake] = [], state: QuestionProgressState = .notStarted, lastReviewedAt: Date? = nil, transcript: AnswerTranscript? = nil, extensions: [String: JSONValue] = [:]) {
         self.questionKey = questionKey
+        self.assignedCandidateID = assignedCandidateID
         self.selectedTakeID = selectedTakeID
         self.takes = takes
         self.state = state
         self.lastReviewedAt = lastReviewedAt
         self.transcript = transcript
         self.extensions = extensions
+    }
+
+    private enum CodingKeys: String, CodingKey { case questionKey, assignedCandidateID, selectedTakeID, takes, state, lastReviewedAt, transcript, extensions }
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        questionKey = try c.decode(String.self, forKey: .questionKey); assignedCandidateID = try c.decodeIfPresent(UUID.self, forKey: .assignedCandidateID)
+        selectedTakeID = try c.decodeIfPresent(UUID.self, forKey: .selectedTakeID); takes = try c.decodeIfPresent([AnswerTake].self, forKey: .takes) ?? []
+        state = try c.decodeIfPresent(QuestionProgressState.self, forKey: .state) ?? .notStarted; lastReviewedAt = try c.decodeIfPresent(Date.self, forKey: .lastReviewedAt)
+        transcript = try c.decodeIfPresent(AnswerTranscript.self, forKey: .transcript); extensions = try c.decodeIfPresent([String: JSONValue].self, forKey: .extensions) ?? [:]
     }
 
     public var selectedTake: AnswerTake? {
@@ -418,6 +567,7 @@ public struct InterviewSession: Codable, Hashable, Sendable, Identifiable {
     public var schema: SchemaDescriptor
     public var capabilities: CapabilityDeclarations
     public var id: UUID
+    public var workflowKind: SessionWorkflowKind
     public var ageKey: String
     public var ageLabel: String
     public var ageSortValue: Double?
@@ -426,24 +576,32 @@ public struct InterviewSession: Codable, Hashable, Sendable, Identifiable {
     public var revision: Int
     public var recordings: [SourceRecording]
     public var answers: [String: InterviewAnswer]
+    public var candidates: [AnswerCandidate]
+    public var calendarYear: Int?
+    public var isArchived: Bool
     public var auditEvents: [SessionAuditEvent]
     public var publicationFingerprint: String?
     public var extensions: [String: JSONValue]
 
     public init(
         id: UUID = UUID(),
+        workflowKind: SessionWorkflowKind = .questionFirstV1,
         ageKey: String,
         ageLabel: String,
         ageSortValue: Double? = nil,
         interviewDate: Date? = nil,
         recordings: [SourceRecording] = [],
         answers: [String: InterviewAnswer] = [:],
+        candidates: [AnswerCandidate] = [],
+        calendarYear: Int? = nil,
+        isArchived: Bool = false,
         auditEvents: [SessionAuditEvent] = [],
         extensions: [String: JSONValue] = [:]
     ) {
-        self.schema = SchemaDescriptor(name: InterviewStudioSchema.session, requiredFeatures: [InterviewStudioFeature.nativeSessionV1])
-        self.capabilities = CapabilityDeclarations(required: [InterviewStudioFeature.nativeSessionV1])
+        self.schema = SchemaDescriptor(name: InterviewStudioSchema.session, requiredFeatures: [InterviewStudioFeature.nativeSessionV1] + (workflowKind == .recordingFirstV1 ? [InterviewStudioFeature.recordingFirstV1] : []))
+        self.capabilities = CapabilityDeclarations(required: [InterviewStudioFeature.nativeSessionV1] + (workflowKind == .recordingFirstV1 ? [InterviewStudioFeature.recordingFirstV1] : []))
         self.id = id
+        self.workflowKind = workflowKind
         self.ageKey = ageKey
         self.ageLabel = ageLabel
         self.ageSortValue = ageSortValue
@@ -452,9 +610,29 @@ public struct InterviewSession: Codable, Hashable, Sendable, Identifiable {
         self.revision = 0
         self.recordings = recordings
         self.answers = answers
+        self.candidates = candidates
+        self.calendarYear = calendarYear
+        self.isArchived = isArchived
         self.auditEvents = auditEvents
         self.publicationFingerprint = nil
         self.extensions = extensions
+    }
+
+    private enum CodingKeys: String, CodingKey { case schema, capabilities, id, workflowKind, ageKey, ageLabel, ageSortValue, interviewDate, lifecycle, revision, recordings, answers, candidates, calendarYear, isArchived, auditEvents, publicationFingerprint, extensions }
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        schema = try c.decodeIfPresent(SchemaDescriptor.self, forKey: .schema) ?? SchemaDescriptor(name: InterviewStudioSchema.session)
+        capabilities = try c.decodeIfPresent(CapabilityDeclarations.self, forKey: .capabilities) ?? .init(required: [InterviewStudioFeature.nativeSessionV1])
+        id = try c.decode(UUID.self, forKey: .id); workflowKind = try c.decodeIfPresent(SessionWorkflowKind.self, forKey: .workflowKind) ?? .questionFirstV1
+        if case .unsupported(let rawValue) = workflowKind {
+            if !schema.requiredFeatures.contains(rawValue) { schema.requiredFeatures.append(rawValue) }
+            if !capabilities.required.contains(rawValue) { capabilities.required.append(rawValue) }
+        }
+        ageKey = try c.decode(String.self, forKey: .ageKey); ageLabel = try c.decode(String.self, forKey: .ageLabel); ageSortValue = try c.decodeIfPresent(Double.self, forKey: .ageSortValue)
+        interviewDate = try c.decodeIfPresent(Date.self, forKey: .interviewDate); lifecycle = try c.decodeIfPresent(SessionLifecycle.self, forKey: .lifecycle) ?? .open; revision = try c.decodeIfPresent(Int.self, forKey: .revision) ?? 0
+        recordings = try c.decodeIfPresent([SourceRecording].self, forKey: .recordings) ?? []; answers = try c.decodeIfPresent([String: InterviewAnswer].self, forKey: .answers) ?? [:]
+        candidates = try c.decodeIfPresent([AnswerCandidate].self, forKey: .candidates) ?? []; calendarYear = try c.decodeIfPresent(Int.self, forKey: .calendarYear); isArchived = try c.decodeIfPresent(Bool.self, forKey: .isArchived) ?? false
+        auditEvents = try c.decodeIfPresent([SessionAuditEvent].self, forKey: .auditEvents) ?? []; publicationFingerprint = try c.decodeIfPresent(String.self, forKey: .publicationFingerprint); extensions = try c.decodeIfPresent([String: JSONValue].self, forKey: .extensions) ?? [:]
     }
 
     public var compatibility: SchemaCompatibility { schema.compatibility() }
@@ -462,12 +640,73 @@ public struct InterviewSession: Codable, Hashable, Sendable, Identifiable {
     public var incompleteQuestionKeys: [String] {
         answers.values.filter { $0.state == .inProgress || $0.state == .needsReview || $0.state == .notStarted }.map(\.questionKey).sorted()
     }
+    public var isLocked: Bool { lifecycle == .locked }
+    public var isActive: Bool { !isArchived }
+    public var activeRecordings: [SourceRecording] { recordings.sorted { $0.order < $1.order } }
+    public var activeCandidates: [AnswerCandidate] { candidates.filter { $0.reviewState != .discarded } }
+    public var archivedCandidates: [AnswerCandidate] { candidates.filter { $0.reviewState == .discarded } }
+    public var nextRecordingNumber: Int { (recordings.map(\.recordingNumber).max() ?? 0) + 1 }
+    public func nextClipNumber(for recordingID: UUID) -> Int { (candidates.filter { $0.sourceRecordingID == recordingID }.map(\.clipNumber).max() ?? 0) + 1 }
+    public func normalizedAge() -> NormalizedAge { AgeNormalization.normalize(key: ageKey, label: ageLabel, sortValue: ageSortValue) }
+    public mutating func changeAge(key: String, label: String, sortValue: Double? = nil) throws {
+        guard compatibility.isWritable else { throw InterviewStudioCompatibilityError.readOnly("The session uses an unsupported schema or workflow.") }
+        guard isActive else { throw InterviewStudioCompatibilityError.invalid("Restore the archived session before changing its age.") }
+        guard lifecycle == .open else { throw InterviewStudioCompatibilityError.invalid("Unlock the session before changing its age.") }
+        ageKey = key
+        ageLabel = label
+        ageSortValue = sortValue
+        for index in recordings.indices {
+            recordings[index].ageKey = key
+            recordings[index].ageLabel = label
+        }
+        revision += 1
+        publicationFingerprint = nil
+        appendAudit("change_age", detail: label)
+    }
+    public mutating func archive() throws {
+        guard compatibility.isWritable else { throw InterviewStudioCompatibilityError.readOnly("The session uses an unsupported schema or workflow.") }
+        guard isActive else { return }
+        guard lifecycle == .open else { throw InterviewStudioCompatibilityError.invalid("Unlock the age entry before archiving it.") }
+        isArchived = true
+        revision += 1
+        publicationFingerprint = nil
+        appendAudit("archive")
+    }
+    public mutating func restore() throws {
+        guard compatibility.isWritable else { throw InterviewStudioCompatibilityError.readOnly("The session uses an unsupported schema or workflow.") }
+        guard isArchived else { return }
+        isArchived = false
+        revision += 1
+        publicationFingerprint = nil
+        appendAudit("restore")
+    }
+    public mutating func lockWithWarnings() throws -> [String] {
+        guard compatibility.isWritable else { throw InterviewStudioCompatibilityError.readOnly("The session uses an unsupported schema or workflow.") }
+        guard isActive else { throw InterviewStudioCompatibilityError.invalid("Restore the archived session before locking it.") }
+        guard lifecycle == .open else { return [] }
+        let readiness = RecordingFirstWorkflow.readiness(for: self)
+        guard readiness.blockers.isEmpty else {
+            throw InterviewStudioCompatibilityError.invalid(readiness.blockers.joined(separator: "\n"))
+        }
+        let warnings = candidates.filter { $0.reviewState == .unreviewed || $0.reviewState == .needsReview || $0.reviewState == .skipped }.map { "Candidate \($0.label) still needs review." }
+        let assignmentProblems = RecordingFirstWorkflow.validateAssignments(in: self)
+        guard assignmentProblems.isEmpty else {
+            throw InterviewStudioCompatibilityError.invalid(assignmentProblems.joined(separator: "\n"))
+        }
+        lifecycle = .locked
+        revision += 1
+        publicationFingerprint = nil
+        appendAudit("lock_with_warnings", detail: warnings.isEmpty ? "No unresolved candidate warnings." : warnings.joined(separator: " "))
+        return warnings
+    }
 
     public mutating func appendAudit(_ action: String, detail: String = "") {
         auditEvents.append(SessionAuditEvent(action: action, detail: detail))
     }
 
     public mutating func unlock() throws {
+        guard compatibility.isWritable else { throw InterviewStudioCompatibilityError.readOnly("The session uses an unsupported schema or workflow.") }
+        guard isActive else { throw InterviewStudioCompatibilityError.invalid("Restore the archived session before unlocking it.") }
         guard lifecycle == .locked else { return }
         lifecycle = .open
         revision += 1
@@ -476,6 +715,8 @@ public struct InterviewSession: Codable, Hashable, Sendable, Identifiable {
     }
 
     public mutating func lock() throws {
+        guard compatibility.isWritable else { throw InterviewStudioCompatibilityError.readOnly("The session uses an unsupported schema or workflow.") }
+        guard isActive else { throw InterviewStudioCompatibilityError.invalid("Restore the archived session before locking it.") }
         guard lifecycle == .open else { return }
         let incomplete = incompleteQuestionKeys
         if !incomplete.isEmpty {

@@ -78,10 +78,59 @@ public struct StagedRecordingImport: Sendable {
     }
 }
 
+public enum RecordingConsolidationPhase: String, Codable, Hashable, Sendable {
+    case staged
+    case mediaPromoted
+    case metadataCommitted
+    case inventoryCommitted
+}
+
+public struct RecordingConsolidationJournal: Codable, Hashable, Sendable {
+    public struct Entry: Codable, Hashable, Sendable, Identifiable {
+        public var id: UUID
+        public var relativePath: String
+        public var byteCount: Int64
+        public var sha256: String
+        public var sessionID: UUID?
+        public var recording: SourceRecording?
+        public var stagedRelativePath: String?
+
+        public init(id: UUID, relativePath: String, byteCount: Int64, sha256: String, sessionID: UUID? = nil, recording: SourceRecording? = nil, stagedRelativePath: String? = nil) {
+            self.id = id
+            self.relativePath = relativePath
+            self.byteCount = byteCount
+            self.sha256 = sha256
+            self.sessionID = sessionID
+            self.recording = recording
+            self.stagedRelativePath = stagedRelativePath
+        }
+    }
+
+    public var startedAt: Date
+    public var phase: RecordingConsolidationPhase
+    public var entries: [Entry]
+
+    public init(startedAt: Date = Date(), phase: RecordingConsolidationPhase = .staged, entries: [Entry]) {
+        self.startedAt = startedAt
+        self.phase = phase
+        self.entries = entries
+    }
+
+    private enum CodingKeys: String, CodingKey { case startedAt, phase, entries }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        startedAt = try container.decodeIfPresent(Date.self, forKey: .startedAt) ?? Date()
+        phase = try container.decodeIfPresent(RecordingConsolidationPhase.self, forKey: .phase) ?? .staged
+        entries = try container.decodeIfPresent([Entry].self, forKey: .entries) ?? []
+    }
+}
+
 public struct InterviewStudioPackageStore: Sendable {
     public static let projectFilename = "interview_studio_project.json"
     public static let inventoryFilename = "package_inventory.json"
     public static let inventoryDigestFilename = "package_inventory.sha256"
+    private static let consolidationJournalFilename = ".recording-consolidation-journal.json"
 
     public let rootURL: URL
 
@@ -103,6 +152,7 @@ public struct InterviewStudioPackageStore: Sendable {
     public var projectURL: URL { rootURL.appendingPathComponent(Self.projectFilename) }
     public var inventoryURL: URL { rootURL.appendingPathComponent(Self.inventoryFilename) }
     public var inventoryDigestURL: URL { rootURL.appendingPathComponent(Self.inventoryDigestFilename) }
+    public var consolidationJournalURL: URL { rootURL.appendingPathComponent(Self.consolidationJournalFilename) }
 
     public func sessionURL(for id: UUID) -> URL {
         rootURL.appendingPathComponent("Sessions", isDirectory: true).appendingPathComponent(id.uuidString, isDirectory: true)
@@ -187,10 +237,65 @@ public struct InterviewStudioPackageStore: Sendable {
     public func listSessions() throws -> [InterviewSession] {
         let sessionsRoot = rootURL.appendingPathComponent("Sessions", isDirectory: true)
         guard let urls = try? FileManager.default.contentsOfDirectory(at: sessionsRoot, includingPropertiesForKeys: [.isDirectoryKey]) else { return [] }
-        return urls.filter { $0.hasDirectoryPath }.compactMap { url in
-            guard let id = UUID(uuidString: url.lastPathComponent) else { return nil }
-            return try? readSession(id: id)
-        }.sorted { ($0.ageSortValue ?? .greatestFiniteMagnitude) < ($1.ageSortValue ?? .greatestFiniteMagnitude) }
+        var sessions: [InterviewSession] = []
+        for url in urls.filter({ $0.hasDirectoryPath }) {
+            guard let id = UUID(uuidString: url.lastPathComponent) else { continue }
+            do {
+                sessions.append(try readSession(id: id))
+            } catch {
+                throw InterviewStudioPackageError.invalidPackage("Could not read session \(url.lastPathComponent): \(error.localizedDescription)")
+            }
+        }
+        return sessions.sorted {
+            let left = ($0.ageSortValue ?? .greatestFiniteMagnitude, $0.id.uuidString)
+            let right = ($1.ageSortValue ?? .greatestFiniteMagnitude, $1.id.uuidString)
+            return left < right
+        }
+    }
+
+    public func readConsolidationJournal() throws -> RecordingConsolidationJournal? {
+        guard FileManager.default.fileExists(atPath: consolidationJournalURL.path) else { return nil }
+        return try readJSON(RecordingConsolidationJournal.self, from: consolidationJournalURL)
+    }
+
+    public func writeConsolidationJournal(_ journal: RecordingConsolidationJournal) throws {
+        try writeJSON(journal, to: consolidationJournalURL)
+    }
+
+    public func removeConsolidationJournal() throws {
+        guard FileManager.default.fileExists(atPath: consolidationJournalURL.path) else { return }
+        try FileManager.default.removeItem(at: consolidationJournalURL)
+    }
+
+    public func consolidateStagedRecording(from stagedURL: URL, recording: SourceRecording) throws {
+        guard FileManager.default.isReadableFile(atPath: stagedURL.path) else {
+            throw InterviewStudioPackageError.invalidPackage("The staged recording is no longer readable: \(stagedURL.path)")
+        }
+        let destinationURL = try resolve(relativePath: recording.packageRelativePath)
+        let expectedBytes = recording.mediaSignature.byteCount
+        let expectedHash = recording.mediaSignature.sha256
+        let destinationDirectory = destinationURL.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: destinationDirectory, withIntermediateDirectories: true)
+
+        if FileManager.default.fileExists(atPath: destinationURL.path) {
+            guard fileByteCount(destinationURL) == expectedBytes,
+                  sha256(fileURL: destinationURL) == expectedHash else {
+                throw InterviewStudioPackageError.checksumMismatch(destinationURL)
+            }
+            return
+        }
+
+        let temporaryURL = destinationDirectory.appendingPathComponent(".\(destinationURL.lastPathComponent).\(UUID().uuidString).tmp")
+        defer { try? FileManager.default.removeItem(at: temporaryURL) }
+        try FileManager.default.copyItem(at: stagedURL, to: temporaryURL)
+        guard fileByteCount(temporaryURL) == expectedBytes,
+              sha256(fileURL: temporaryURL) == expectedHash else {
+            throw InterviewStudioPackageError.checksumMismatch(stagedURL)
+        }
+        guard !FileManager.default.fileExists(atPath: destinationURL.path) else {
+            throw InterviewStudioPackageError.fileExists(destinationURL)
+        }
+        try FileManager.default.moveItem(at: temporaryURL, to: destinationURL)
     }
 
     public func writePublication(_ publication: PublicationRecord) throws {
@@ -258,6 +363,7 @@ public struct InterviewStudioPackageStore: Sendable {
         photosLocalIdentifier: String? = nil,
         captureDate: Date? = nil,
         order: Int = 0,
+        recordingNumber: Int? = nil,
         firstQuestionHint: String? = nil
     ) async throws -> StagedRecordingImport {
         let sourceURL = sourceURL.standardizedFileURL
@@ -312,6 +418,7 @@ public struct InterviewStudioPackageStore: Sendable {
             photosLocalIdentifier: photosLocalIdentifier,
             captureDate: captureDate,
             order: order,
+            recordingNumber: recordingNumber,
             firstQuestionHint: firstQuestionHint,
             mediaSignature: signature
         )
@@ -330,6 +437,7 @@ public struct InterviewStudioPackageStore: Sendable {
         photosLocalIdentifier: String? = nil,
         captureDate: Date? = nil,
         order: Int = 0,
+        recordingNumber: Int? = nil,
         firstQuestionHint: String? = nil
     ) async throws -> ImportedRecording {
         let sourceURL = sourceURL.standardizedFileURL
@@ -380,6 +488,7 @@ public struct InterviewStudioPackageStore: Sendable {
             photosLocalIdentifier: photosLocalIdentifier,
             captureDate: captureDate,
             order: order,
+            recordingNumber: recordingNumber,
             firstQuestionHint: firstQuestionHint,
             mediaSignature: signature
         )
@@ -401,6 +510,13 @@ public struct InterviewStudioPackageStore: Sendable {
             throw InterviewStudioPackageError.unsafeRelativePath(relativePath)
         }
         return url
+    }
+
+    public func packageRelativePath(for url: URL) -> String? {
+        let root = rootURL.standardizedFileURL.path.hasSuffix("/") ? rootURL.standardizedFileURL.path : rootURL.standardizedFileURL.path + "/"
+        let path = url.standardizedFileURL.path
+        guard path.hasPrefix(root) else { return nil }
+        return String(path.dropFirst(root.count))
     }
 
     private func existingRecording(withSHA256 hash: String) throws -> SourceRecording? {

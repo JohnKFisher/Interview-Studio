@@ -45,6 +45,19 @@ final class InterviewStudioWorkspaceModel: ObservableObject {
     @Published var isBulkTranscribing = false
     @Published var transcriptionMessage: String?
     @Published var isAddingYear = false
+    @Published var recordingFirstStage: RecordingFirstStage = .capture
+    @Published var recordingFirstSelectedCandidateID: UUID?
+    @Published var recordingFirstCutStartUS: Int64?
+    @Published var recordingFirstCutEndUS: Int64?
+    @Published var playbackRate: Float = 1.0
+    @Published var isShowingManageQuestions = false
+    @Published var isShowingArchivedAges = false
+    @Published var recordingFirstCaptureState = RecordingCaptureState()
+    @Published var recordingFirstNeedsFinishConfirmation = false
+    @Published var recordingFirstPreviewIsComposed = false
+    @Published var recordingFirstPendingAgeChange: Double?
+    @Published var recordingFirstComparison: CandidateComparison?
+    @Published var recordingFirstComparisonQuestionKey: String?
 
     weak var document: InterviewStudioDocument?
     private var transcriptionTask: Task<Void, Never>?
@@ -62,9 +75,9 @@ final class InterviewStudioWorkspaceModel: ObservableObject {
         self.document = document
         self.project = document.project
         self.sessions = document.sessions
-        self.selectedSessionID = document.sessions.first?.id
+        self.selectedSessionID = document.sessions.first(where: { $0.isActive })?.id ?? document.sessions.first?.id
         self.selectedQuestionKey = document.project.activeQuestions.first?.questionKey
-        self.selectedRecordingID = document.sessions.first?.recordings.first?.id
+        self.selectedRecordingID = document.sessions.first(where: { $0.isActive })?.recordings.first?.id ?? document.sessions.first?.recordings.first?.id
     }
 
     var selectedSession: InterviewSession? {
@@ -493,6 +506,8 @@ final class InterviewStudioWorkspaceModel: ObservableObject {
         guard loadedPlayerURL != url || loadedPlayerAnalysisID != recordingAnalysisID else { return }
         removePlaybackObservers()
         let newPlayer = AVPlayer(url: url)
+        newPlayer.defaultRate = playbackRate
+        recordingFirstPreviewIsComposed = false
         loadedPlayerURL = url
         loadedPlayerAnalysisID = recordingAnalysisID
         player = newPlayer
@@ -528,7 +543,7 @@ final class InterviewStudioWorkspaceModel: ObservableObject {
         playRange(startUS: start, endUS: end)
     }
 
-    private func playRange(startUS: Int64, endUS: Int64) {
+    func playRange(startUS: Int64, endUS: Int64) {
         guard let player, endUS > startUS else { return }
         removeRangeBoundaryObserver()
         let capturedPlayer = player
@@ -550,6 +565,25 @@ final class InterviewStudioWorkspaceModel: ObservableObject {
                 capturedPlayer.play()
             }
         }
+    }
+
+    func playComposition(_ composition: AVComposition) {
+        removePlaybackObservers()
+        let newPlayer = AVPlayer(playerItem: AVPlayerItem(asset: composition))
+        newPlayer.defaultRate = playbackRate
+        loadedPlayerURL = nil
+        loadedPlayerAnalysisID = nil
+        recordingFirstPreviewIsComposed = true
+        player = newPlayer
+        playerObservation.player = newPlayer
+        playerObservation.periodic = newPlayer.addPeriodicTimeObserver(forInterval: CMTime(value: 50_000, timescale: 1_000_000), queue: .main) { [weak self] time in
+            guard time.isNumeric else { return }
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.currentTimeUS = max(0, Int64((time.seconds * 1_000_000).rounded()))
+            }
+        }
+        newPlayer.play()
     }
 
     private func removeRangeBoundaryObserver() {
@@ -633,7 +667,8 @@ final class InterviewStudioWorkspaceModel: ObservableObject {
 
     func renderFinalMovie() {
         guard !isRenderingFinalMovie else { return }
-        guard !sessions.isEmpty, sessions.allSatisfy({ $0.lifecycle == .locked }) else {
+        let activeSessions = sessions.filter(\.isActive)
+        guard !activeSessions.isEmpty, activeSessions.allSatisfy({ $0.lifecycle == .locked }) else {
             errorMessage = "Lock every interview year before rendering the final movie."
             return
         }
@@ -701,20 +736,42 @@ final class InterviewStudioWorkspaceModel: ObservableObject {
         NSWorkspace.shared.activateFileViewerSelecting([lastFinalMovieURL])
     }
 
-    func addYear(age: Double) {
-        let ageDisplay = age.formatted(.number.precision(.fractionLength(0...2)))
-        let ageLabel = age == 1 ? "1 Year Old" : "\(ageDisplay) Years Old"
-        let ageKey = InterviewStudioKey.readableKey(
-            from: "age \(ageDisplay)",
-            existing: Set(sessions.map(\.ageKey))
+    @discardableResult
+    func addYear(age: Double, calendarYear: Int? = nil) -> Bool {
+        guard document?.isPackageReadOnly != true else {
+            errorMessage = "This project is read-only because it contains an unsupported workflow or package format."
+            return false
+        }
+        guard let normalized = RecordingFirstWorkflow.normalizedAge(value: age),
+              !sessions.contains(where: { !$0.isArchived && RecordingFirstWorkflow.sameAge($0, normalized: normalized) }) else {
+            errorMessage = "An active age entry for that age already exists. Select it instead of creating a duplicate."
+            return false
+        }
+        let session = InterviewSession(
+            id: UUID(),
+            workflowKind: .recordingFirstV1,
+            ageKey: normalized.key,
+            ageLabel: normalized.label,
+            ageSortValue: normalized.sortValue,
+            calendarYear: calendarYear
         )
-        let session = InterviewSession(id: UUID(), ageKey: ageKey, ageLabel: ageLabel, ageSortValue: age)
         sessions.append(session)
-        sessions.sort { ($0.ageSortValue ?? .greatestFiniteMagnitude) < ($1.ageSortValue ?? .greatestFiniteMagnitude) }
+        sortSessions()
         selectedSessionID = session.id
         selectedRecordingID = nil
         selectedQuestionKey = project.activeQuestions.first?.questionKey
+        recordingFirstStage = .capture
+        recordingFirstCaptureState = .init()
         flushToDocument()
+        return true
+    }
+
+    private func sortSessions() {
+        sessions.sort {
+            let left = ($0.ageSortValue ?? .greatestFiniteMagnitude, $0.id.uuidString)
+            let right = ($1.ageSortValue ?? .greatestFiniteMagnitude, $1.id.uuidString)
+            return left.0 == right.0 ? left.1 < right.1 : left.0 < right.0
+        }
     }
 
     func importFinderRecordings() {
@@ -751,16 +808,16 @@ final class InterviewStudioWorkspaceModel: ObservableObject {
             return
         }
         let recordingURLs = panel.urls
-        let stagingRoot = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
-            .appendingPathComponent("YearlyInterviewStudio/ImportStaging", isDirectory: true)
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        progressMessage = "Staging \(recordingURLs.count) recording(s)…"
         guard let store = document?.packageStore else {
             isBusy = false
             progressMessage = nil
             errorMessage = "Save the project before importing source recordings."
             return
         }
+        let stagingRoot = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
+            .appendingPathComponent("YearlyInterviewStudio/ImportStaging", isDirectory: true)
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        progressMessage = "Staging \(recordingURLs.count) recording(s)…"
         let importTask = Task.detached(priority: .userInitiated) {
             var completed = false
             defer {
@@ -940,9 +997,9 @@ struct TranscriptionBatchSummary: Sendable {
     let skippedCount: Int
 
     var confirmationMessage: String {
-        var message = "(candidateCount) answer(s) have a selected recording and no saved transcript."
+        var message = "\(candidateCount) answer(s) have a selected recording and no saved transcript."
         if skippedCount > 0 {
-            message += "\n\n(skippedCount) other answer(s) will be left unchanged because they have no usable selected recording."
+            message += "\n\n\(skippedCount) other answer(s) will be left unchanged because they have no usable selected recording."
         }
         message += "\n\nExisting transcripts will not be overwritten."
         return message
@@ -965,10 +1022,12 @@ private struct TranscriptionCandidate {
 @MainActor
 final class NewInterviewYearDraft: ObservableObject {
     @Published var ageText = ""
+    @Published var calendarYearText = ""
     @Published var validationMessage: String?
 
     func reset() {
         ageText = ""
+        calendarYearText = ""
         validationMessage = nil
     }
 }
@@ -977,6 +1036,29 @@ struct DocumentWorkspaceView: View {
     @ObservedObject var model: InterviewStudioWorkspaceModel
 
     var body: some View {
+        Group {
+            if model.document?.isPackageReadOnly == true {
+                RecordingFirstReadOnlyView(model: model, title: "Read-Only Project", message: "This project contains an unsupported workflow or package format. Its contents remain available for inspection, but editing and saving are disabled.", allowsRestore: false)
+            } else if let session = model.selectedSession {
+                if session.isArchived {
+                    RecordingFirstReadOnlyView(model: model, title: "Archived Age Entry", message: "This age entry is archived and excluded from future renders. Restore it to continue editing.", allowsRestore: true)
+                } else {
+                    switch session.workflowKind {
+                    case .recordingFirstV1:
+                        RecordingFirstWorkspaceView(model: model)
+                    case .unsupported(let rawValue):
+                        RecordingFirstReadOnlyView(model: model, title: "Unsupported Workflow", message: "This age entry uses an unsupported workflow version (\(rawValue)). It is available for inspection only.", allowsRestore: false)
+                    case .questionFirstV1:
+                        legacyWorkspaceBody
+                    }
+                }
+            } else {
+                legacyWorkspaceBody
+            }
+        }
+    }
+
+    private var legacyWorkspaceBody: some View {
         VStack(spacing: 0) {
             // Keep document actions in the content area below the native
             // window toolbar. NavigationSplitView toolbars can otherwise
@@ -997,9 +1079,10 @@ struct DocumentWorkspaceView: View {
             Text(model.errorMessage ?? "")
         }
         .sheet(isPresented: $model.isAddingYear) {
-            NewInterviewYearSheet(draft: model.newInterviewYearDraft) { age in
-                model.addYear(age: age)
-                model.isAddingYear = false
+            NewInterviewYearSheet(draft: model.newInterviewYearDraft) { age, calendarYear in
+                if model.addYear(age: age, calendarYear: calendarYear) {
+                    model.isAddingYear = false
+                }
             }
         }
     }
@@ -1021,7 +1104,7 @@ struct DocumentWorkspaceView: View {
                 }
             }
             Section("Interview Years") {
-                ForEach(model.sessions) { session in
+                ForEach(model.sessions.filter(\.isActive)) { session in
                     Label {
                         VStack(alignment: .leading) {
                             Text(session.ageLabel)
@@ -1039,7 +1122,7 @@ struct DocumentWorkspaceView: View {
         .navigationTitle("Project")
         .toolbar {
             ToolbarItemGroup {
-                Button("New Year", systemImage: "plus") { model.isAddingYear = true }
+                Button("New Age Entry", systemImage: "plus") { model.isAddingYear = true }
                     .labelStyle(.titleAndIcon)
                 Button("Save", systemImage: "square.and.arrow.down") { model.save() }
                     .labelStyle(.titleAndIcon)
@@ -1172,7 +1255,9 @@ struct DocumentWorkspaceView: View {
                     .font(.caption.monospaced())
                 HStack {
                     Button("Mark Start (I)") { model.markStart() }
+                        .keyboardShortcut("i", modifiers: [])
                     Button("Mark End (O)") { model.markEnd() }
+                        .keyboardShortcut("o", modifiers: [])
                     Button("Interviewer Resumes (;) ") { model.markResume() }
                     Button("No Following Speech") { model.markNoResume() }
                 }
@@ -1203,9 +1288,9 @@ struct DocumentWorkspaceView: View {
     }
 }
 
-private struct NewInterviewYearSheet: View {
+struct NewInterviewYearSheet: View {
     @ObservedObject var draft: NewInterviewYearDraft
-    let onCreate: (Double) -> Void
+    let onCreate: (Double, Int?) -> Void
 
     @Environment(\.dismiss) private var dismiss
 
@@ -1217,13 +1302,15 @@ private struct NewInterviewYearSheet: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            Text("New Interview Year")
+            Text("New Age Entry")
                 .font(.title2.weight(.semibold))
-            Text("Enter the person’s age for this interview. Half-years are supported, such as 2.5.")
+            Text("Enter the person’s age for this interview. Half-years are supported, such as 2.5. Calendar year is optional context.")
                 .foregroundStyle(.secondary)
             TextField("Age in years", text: $draft.ageText)
                 .textFieldStyle(.roundedBorder)
                 .onSubmit(createYear)
+            TextField("Calendar year (optional)", text: $draft.calendarYearText)
+                .textFieldStyle(.roundedBorder)
             if let validationMessage = draft.validationMessage {
                 Text(validationMessage)
                     .font(.caption)
@@ -1233,7 +1320,7 @@ private struct NewInterviewYearSheet: View {
                 Spacer()
                 Button("Cancel", role: .cancel) { dismiss() }
                     .keyboardShortcut(.cancelAction)
-                Button("Create Year", action: createYear)
+                Button("Create Age Entry", action: createYear)
                     .keyboardShortcut(.defaultAction)
                     .disabled(parsedAge == nil)
             }
@@ -1250,7 +1337,13 @@ private struct NewInterviewYearSheet: View {
             draft.validationMessage = "Enter a number such as 5 or 2.5."
             return
         }
-        onCreate(age)
+        let yearText = draft.calendarYearText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let year = Int(yearText)
+        if !yearText.isEmpty, year == nil || !(1900...3000).contains(year!) {
+            draft.validationMessage = "Enter a four-digit calendar year or leave it blank."
+            return
+        }
+        onCreate(age, year)
     }
 }
 

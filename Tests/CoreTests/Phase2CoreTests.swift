@@ -26,6 +26,52 @@ final class Phase2CoreTests: XCTestCase {
         XCTAssertEqual(try store.listSessions().map(\.ageKey), ["age_5"])
     }
 
+    func testRecordingConsolidationJournalPromotesBytesBeforeInventory() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("journal-\(UUID().uuidString).interviewstudio", isDirectory: true)
+        let sourceURL = FileManager.default.temporaryDirectory.appendingPathComponent("recording-\(UUID().uuidString).mov")
+        defer {
+            try? FileManager.default.removeItem(at: root)
+            try? FileManager.default.removeItem(at: sourceURL)
+        }
+        try Data("recording bytes".utf8).write(to: sourceURL)
+        let project = InterviewStudioProject(person: InterviewPerson(readableKey: "ellie", displayName: "Ellie"))
+        let store = try InterviewStudioPackageStore.create(project: project, at: root)
+        let stagingRoot = root.appendingPathComponent(".recording-staging/test", isDirectory: true)
+        let staged = try await store.stageRecordingImport(
+            from: sourceURL,
+            ageKey: "age_5",
+            ageLabel: "Age 5",
+            source: .finder,
+            stagingRoot: stagingRoot,
+            recordingNumber: 1
+        )
+        let recording = staged.imported.recording
+        let stagedURL = try XCTUnwrap(staged.stagedURL)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: stagedURL.path))
+
+        let session = InterviewSession(
+            workflowKind: .recordingFirstV1,
+            ageKey: "age_5",
+            ageLabel: "Age 5",
+            ageSortValue: 5,
+            recordings: [recording]
+        )
+        try store.writeConsolidationJournal(.init(entries: [
+            .init(id: recording.id, relativePath: recording.packageRelativePath, byteCount: recording.mediaSignature.byteCount, sha256: recording.mediaSignature.sha256, sessionID: session.id, recording: recording, stagedRelativePath: store.packageRelativePath(for: stagedURL))
+        ]))
+        try store.consolidateStagedRecording(from: stagedURL, recording: recording)
+        try FileManager.default.removeItem(at: stagedURL)
+        try store.writeSession(session)
+        try store.rebuildInventory()
+        try store.removeConsolidationJournal()
+        try store.verifyInventory()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: stagedURL.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: try store.resolve(relativePath: recording.packageRelativePath).path))
+
+        try Data("not json".utf8).write(to: store.consolidationJournalURL)
+        XCTAssertThrowsError(try store.readConsolidationJournal())
+    }
+
     func testLockGateRequiresCompleteOrSkippedAnswers() throws {
         var session = InterviewSession(ageKey: "age_6", ageLabel: "6 Years Old", ageSortValue: 6)
         session.answers["favorite_memory"] = InterviewAnswer(questionKey: "favorite_memory", state: .inProgress)
@@ -331,5 +377,207 @@ final class Phase2CoreTests: XCTestCase {
             "real_media_start_in_output_us": .number(500_000),
             "real_media_end_in_output_us": .number(4_500_000)
         ]))
+    }
+
+    func testRecordingFirstCaptureUsesDirectTimestampsAndCommitsProvisionalPair() throws {
+        var state = RecordingCaptureState()
+        XCTAssertNil(try RecordingFirstWorkflow.captureIO(timestamp: .microseconds(1_000_000), state: &state, mark: "i"))
+        XCTAssertEqual(state.inPoint?.microseconds, 1_000_000)
+        XCTAssertThrowsError(try RecordingFirstWorkflow.captureIO(timestamp: .microseconds(900_000), state: &state, mark: "o"))
+        XCTAssertNil(try RecordingFirstWorkflow.captureIO(timestamp: .microseconds(4_000_000), state: &state, mark: "o"))
+        let completed = try XCTUnwrap(try RecordingFirstWorkflow.captureIO(timestamp: .microseconds(5_000_000), state: &state, mark: "i"))
+        XCTAssertEqual(completed.start.microseconds, 1_000_000)
+        XCTAssertEqual(completed.end.microseconds, 4_000_000)
+        XCTAssertEqual(state.inPoint?.microseconds, 5_000_000)
+        XCTAssertThrowsError(try RecordingFirstWorkflow.commitProvisional(&state), "The second mark is still provisional and must not be fabricated into a valid range.")
+    }
+
+    func testRecordingFirstRetainedSegmentsKeepDisjointPiecesAndRejectOverlappingCuts() throws {
+        let outer = CandidateSegment(start: .microseconds(0), end: .microseconds(10_000_000))
+        let retained = try RecordingFirstWorkflow.retainedSegments(
+            for: outer,
+            removing: [
+                CandidateSegment(start: .microseconds(2_000_000), end: .microseconds(3_000_000)),
+                CandidateSegment(start: .microseconds(7_000_000), end: .microseconds(8_000_000))
+            ]
+        )
+        XCTAssertEqual(retained.map { $0.start.microseconds }, [0, 3_000_000, 8_000_000])
+        XCTAssertEqual(retained.map { $0.end.microseconds }, [2_000_000, 7_000_000, 10_000_000])
+        XCTAssertThrowsError(try RecordingFirstWorkflow.retainedSegments(for: outer, removing: [
+            CandidateSegment(start: .microseconds(2_000_000), end: .microseconds(4_000_000)),
+            CandidateSegment(start: .microseconds(3_000_000), end: .microseconds(5_000_000))
+        ]))
+    }
+
+    func testRecordingFirstPublicationSegmentsAddBuffersOnlyAtRetainedBoundaries() {
+        let candidate = AnswerCandidate(
+            sourceRecordingID: UUID(), recordingNumber: 1, clipNumber: 1,
+            rawMarkers: .init(answerStart: .microseconds(2_000_000), answerEnd: .microseconds(8_000_000)),
+            refinedBoundaries: .init(
+                visibleStart: .microseconds(2_000_000), visibleEnd: .microseconds(8_000_000),
+                safeLeadingStart: .microseconds(1_000_000), safeTrailingEnd: .microseconds(9_000_000), confidence: 0.8
+            ),
+            retainedSegments: [
+                CandidateSegment(start: .microseconds(2_000_000), end: .microseconds(4_000_000)),
+                CandidateSegment(start: .microseconds(6_000_000), end: .microseconds(8_000_000))
+            ]
+        )
+
+        let preview = RecordingFirstWorkflow.previewSegments(for: candidate, withBuffers: false)
+        XCTAssertEqual(preview.map { $0.start.microseconds }, [2_000_000, 6_000_000])
+        XCTAssertEqual(preview.map { $0.end.microseconds }, [4_000_000, 8_000_000])
+
+        let publication = RecordingFirstWorkflow.publicationSegments(for: candidate)
+        XCTAssertEqual(publication.map { $0.start.microseconds }, [1_000_000, 6_000_000])
+        XCTAssertEqual(publication.map { $0.end.microseconds }, [4_000_000, 9_000_000])
+
+        let timeline = RecordingFirstWorkflow.publicationTimeline(for: candidate)
+        XCTAssertEqual(timeline.duration.microseconds, 5_880_000)
+        XCTAssertEqual(timeline.visibleOutputRange(for: candidate)?.start.microseconds, 1_000_000)
+        XCTAssertEqual(timeline.visibleOutputRange(for: candidate)?.end.microseconds, 4_880_000)
+    }
+
+    func testRecordingFirstPublisherExportsAndReinspectsInternalCuts() async throws {
+        let workspace = try TestWorkspace.make()
+        defer { try? FileManager.default.removeItem(at: workspace.rootURL) }
+        let sourceURL = workspace.rootURL
+            .appendingPathComponent("Ellie - What is Your Name", isDirectory: true)
+            .appendingPathComponent("Ellie-What-is-Your-Name-5-Years-Old.mov")
+        let outputURL = workspace.rootURL.appendingPathComponent("recording-first-answer.mov")
+        let candidate = AnswerCandidate(
+            sourceRecordingID: UUID(), recordingNumber: 1, clipNumber: 1,
+            rawMarkers: .init(answerStart: .microseconds(500_000), answerEnd: .microseconds(1_500_000)),
+            refinedBoundaries: .init(
+                visibleStart: .microseconds(500_000), visibleEnd: .microseconds(1_500_000),
+                safeLeadingStart: .microseconds(250_000), safeTrailingEnd: .microseconds(1_750_000), confidence: 0.9
+            ),
+            retainedSegments: [
+                CandidateSegment(start: .microseconds(500_000), end: .microseconds(750_000)),
+                CandidateSegment(start: .microseconds(800_000), end: .microseconds(1_050_000)),
+                CandidateSegment(start: .microseconds(1_100_000), end: .microseconds(1_500_000))
+            ],
+            reviewState: .approved
+        )
+
+        let timeline = RecordingFirstWorkflow.publicationTimeline(for: candidate)
+        XCTAssertEqual(timeline.duration.microseconds, 1_160_000)
+        let inspection = try await NativeAnswerPublisher().generate(candidate: candidate, sourceURL: sourceURL, outputURL: outputURL)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: outputURL.path))
+        XCTAssertEqual(inspection.width, 3_840)
+        XCTAssertEqual(inspection.height, 2_160)
+        XCTAssertTrue(inspection.hasVideo)
+        XCTAssertTrue(inspection.hasAudio)
+        XCTAssertGreaterThan(inspection.duration.microseconds, 0)
+        XCTAssertEqual(inspection.duration.microseconds, timeline.duration.microseconds, accuracy: 50_000)
+
+        let ffmpegPath = ProcessInfo.processInfo.environment["YEARLY_INTERVIEW_STUDIO_FFMPEG"] ?? "/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg"
+        let centerPixelProbe = Process()
+        centerPixelProbe.executableURL = URL(fileURLWithPath: ffmpegPath)
+        centerPixelProbe.arguments = [
+            "-v", "error", "-ss", "0.5", "-i", outputURL.path,
+            "-vf", "crop=1:1:1920:1080,format=rgb24", "-frames:v", "1", "-f", "rawvideo", "pipe:1"
+        ]
+        let centerPixelPipe = Pipe()
+        centerPixelProbe.standardOutput = centerPixelPipe
+        centerPixelProbe.standardError = FileHandle.nullDevice
+        try centerPixelProbe.run()
+        let centerPixel = centerPixelPipe.fileHandleForReading.readDataToEndOfFile()
+        centerPixelProbe.waitUntilExit()
+        XCTAssertEqual(centerPixelProbe.terminationStatus, 0)
+        XCTAssertGreaterThan(centerPixel.count, 2)
+        XCTAssertGreaterThan(centerPixel[0], 120, "The composed source should fill the centered 4K frame instead of remaining in the upper-left corner.")
+    }
+
+    func testRecordingFirstAssignmentsAreOneToOneAndLockAllowsWarningsOnly() throws {
+        let recording = SourceRecording(
+            ageKey: "age_5", ageLabel: "Age 5", packageRelativePath: "Source Recordings/clip.mov",
+            originalFilename: "clip.mov", importSource: .finder, order: 0, recordingNumber: 1,
+            mediaSignature: .init(byteCount: 10, sha256: "hash", durationMicroseconds: 10_000_000)
+        )
+        let candidate = AnswerCandidate(
+            sourceRecordingID: recording.id, recordingNumber: 1, clipNumber: 1,
+            rawMarkers: .init(answerStart: .microseconds(1_000_000), answerEnd: .microseconds(3_000_000)),
+            retainedSegments: [CandidateSegment(start: .microseconds(1_000_000), end: .microseconds(3_000_000))],
+            reviewState: .approved
+        )
+        var session = InterviewSession(workflowKind: .recordingFirstV1, ageKey: "age_5", ageLabel: "Age 5", ageSortValue: 5, recordings: [recording], candidates: [candidate])
+        try RecordingFirstWorkflow.assign(candidateID: candidate.id, to: "memory", in: &session)
+        XCTAssertEqual(session.answers["memory"]?.assignedCandidateID, candidate.id)
+        XCTAssertThrowsError(try RecordingFirstWorkflow.assign(candidateID: candidate.id, to: "color", in: &session))
+        XCTAssertTrue(RecordingFirstWorkflow.readiness(for: session, requiredQuestionKeys: ["memory"]).isReady)
+
+        let warnings = try session.lockWithWarnings()
+        XCTAssertTrue(warnings.isEmpty)
+        XCTAssertEqual(session.lifecycle, .locked)
+    }
+
+    func testRecordingFirstReadinessBlocksMissingOrInvalidCandidateMedia() {
+        let recording = SourceRecording(
+            ageKey: "age_5", ageLabel: "Age 5", packageRelativePath: "Source Recordings/clip.mov",
+            originalFilename: "clip.mov", importSource: .finder, order: 0, recordingNumber: 1,
+            mediaSignature: .init(byteCount: 10, sha256: "hash", durationMicroseconds: 2_000_000)
+        )
+        let missingSourceCandidate = AnswerCandidate(
+            sourceRecordingID: UUID(), recordingNumber: 1, clipNumber: 1,
+            rawMarkers: .init(answerStart: .microseconds(0), answerEnd: .microseconds(1_000_000)),
+            retainedSegments: [CandidateSegment(start: .microseconds(0), end: .microseconds(1_000_000))],
+            reviewState: .approved
+        )
+        let invalidRangeCandidate = AnswerCandidate(
+            sourceRecordingID: recording.id, recordingNumber: 1, clipNumber: 2,
+            rawMarkers: .init(answerStart: .microseconds(0), answerEnd: .microseconds(3_000_000)),
+            refinedBoundaries: .init(
+                visibleStart: .microseconds(0), visibleEnd: .microseconds(3_000_000),
+                safeLeadingStart: .zero, safeTrailingEnd: .microseconds(3_000_000), confidence: 0.5
+            ),
+            retainedSegments: [CandidateSegment(start: .microseconds(0), end: .microseconds(3_000_000))],
+            reviewState: .approved
+        )
+        let session = InterviewSession(
+            workflowKind: .recordingFirstV1, ageKey: "age_5", ageLabel: "Age 5", ageSortValue: 5,
+            recordings: [recording], candidates: [missingSourceCandidate, invalidRangeCandidate]
+        )
+        let report = RecordingFirstWorkflow.readiness(for: session)
+        XCTAssertTrue(report.blockers.contains { $0.contains("missing source recording") })
+        XCTAssertTrue(report.blockers.contains { $0.contains("extends beyond its source recording") })
+    }
+
+    func testRecordingFirstAgeIdentityAndArchiveRestoreAreStable() throws {
+        let normalized = try XCTUnwrap(RecordingFirstWorkflow.normalizedAge(value: 5))
+        XCTAssertEqual(normalized.key, "age_5")
+        XCTAssertEqual(normalized.label, "Age 5")
+        var session = InterviewSession(workflowKind: .recordingFirstV1, ageKey: normalized.key, ageLabel: normalized.label, ageSortValue: normalized.sortValue)
+        XCTAssertTrue(RecordingFirstWorkflow.sameAge(session, normalized: normalized))
+        try session.archive()
+        XCTAssertTrue(session.isArchived)
+        try session.restore()
+        XCTAssertTrue(session.isActive)
+        XCTAssertEqual(session.ageKey, "age_5")
+    }
+
+    func testRecordingFirstSchemaAddsDefaultsAndUnknownWorkflowIsReadOnly() throws {
+        let recording = SourceRecording(
+            ageKey: "age_5", ageLabel: "5 Years Old", packageRelativePath: "Source Recordings/clip.mov",
+            originalFilename: "clip.mov", importSource: .finder, mediaSignature: .init(byteCount: 1, sha256: "hash")
+        )
+        let session = InterviewSession(ageKey: "age_5", ageLabel: "5 Years Old", ageSortValue: 5, recordings: [recording])
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder.interviewStudio.encode(session)) as? [String: Any])
+        object.removeValue(forKey: "workflowKind")
+        object.removeValue(forKey: "candidates")
+        var recordingObject = try XCTUnwrap((object["recordings"] as? [[String: Any]])?.first)
+        recordingObject.removeValue(forKey: "recordingNumber")
+        recordingObject.removeValue(forKey: "recordingState")
+        recordingObject.removeValue(forKey: "provisionalInPointUS")
+        object["recordings"] = [recordingObject]
+        let oldData = try JSONSerialization.data(withJSONObject: object)
+        let decoded = try JSONDecoder.interviewStudio.decode(InterviewSession.self, from: oldData)
+        XCTAssertEqual(decoded.workflowKind, .questionFirstV1)
+        XCTAssertEqual(decoded.recordings.first?.recordingNumber, 1)
+        XCTAssertEqual(decoded.recordings.first?.recordingState, .notStarted)
+
+        object["workflowKind"] = "future_recording_workflow"
+        let futureData = try JSONSerialization.data(withJSONObject: object)
+        let future = try JSONDecoder.interviewStudio.decode(InterviewSession.self, from: futureData)
+        XCTAssertFalse(future.compatibility.isWritable)
     }
 }

@@ -16,6 +16,7 @@ public enum InterviewStudioFeature {
     public static let nativeSessionV1 = "native_session_v1"
     public static let multipartAnswerV1 = "multipart_answer_v1"
     public static let transcriptV1 = "transcript_v1"
+    public static let recordingFirstV1 = "recording_first_v1"
 }
 
 public struct SchemaDescriptor: Codable, Hashable, Sendable {
@@ -87,7 +88,8 @@ private let InterviewStudioKnownFeatures: Set<String> = [
     InterviewStudioFeature.generatedTextCard,
     InterviewStudioFeature.nativeSessionV1,
     InterviewStudioFeature.multipartAnswerV1,
-    InterviewStudioFeature.transcriptV1
+    InterviewStudioFeature.transcriptV1,
+    InterviewStudioFeature.recordingFirstV1
 ]
 
 public enum InterviewStudioCompatibilityError: LocalizedError, Sendable {

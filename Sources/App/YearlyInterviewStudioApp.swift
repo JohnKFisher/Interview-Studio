@@ -13,6 +13,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         installMenus()
         showWelcomeIfNeeded()
         NSApp.activate(ignoringOtherApps: true)
+        DispatchQueue.main.async { [weak self] in
+            self?.installMenus()
+        }
     }
 
     func applicationShouldOpenUntitledFile(_ sender: NSApplication) -> Bool {
@@ -200,27 +203,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         appMenuItem.submenu = appMenu
         mainMenu.addItem(appMenuItem)
 
-        let fileItem = NSMenuItem()
+        let fileItem = NSMenuItem(title: "File", action: nil, keyEquivalent: "")
         let fileMenu = NSMenu(title: "File")
-        fileMenu.addItem(withTitle: "New Project", action: #selector(newProject(_:)), keyEquivalent: "n")
-        fileMenu.addItem(withTitle: "Open Project…", action: #selector(openProject(_:)), keyEquivalent: "o")
-        fileMenu.addItem(withTitle: "Import Legacy Project…", action: #selector(importLegacyProject(_:)), keyEquivalent: "i")
+        let newProjectItem = fileMenu.addItem(withTitle: "New Project", action: #selector(newProject(_:)), keyEquivalent: "n")
+        newProjectItem.target = self
+        let openProjectItem = fileMenu.addItem(withTitle: "Open Project…", action: #selector(openProject(_:)), keyEquivalent: "o")
+        openProjectItem.target = self
+        // I is reserved for recording-first Capture. Legacy import remains
+        // available from File without stealing the capture shortcut globally.
+        let importLegacyItem = fileMenu.addItem(withTitle: "Import Legacy Project…", action: #selector(importLegacyProject(_:)), keyEquivalent: "")
+        importLegacyItem.target = self
         fileMenu.addItem(.separator())
         let saveItem = fileMenu.addItem(withTitle: "Save", action: #selector(saveDocument(_:)), keyEquivalent: "s")
         saveItem.target = self
-        fileMenu.addItem(withTitle: "Export Final Movie…", action: #selector(exportFinalMovie(_:)), keyEquivalent: "e")
-        fileMenu.addItem(withTitle: "Verify Package", action: #selector(verifyPackage(_:)), keyEquivalent: "v")
+        let exportItem = fileMenu.addItem(withTitle: "Export Final Movie…", action: #selector(exportFinalMovie(_:)), keyEquivalent: "e")
+        exportItem.target = self
+        let verifyItem = fileMenu.addItem(withTitle: "Verify Package", action: #selector(verifyPackage(_:)), keyEquivalent: "v")
+        verifyItem.target = self
         fileMenu.addItem(withTitle: "Close", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
         fileItem.submenu = fileMenu
         mainMenu.addItem(fileItem)
 
-        let projectItem = NSMenuItem()
+        let projectItem = NSMenuItem(title: "Project", action: nil, keyEquivalent: "")
         let projectMenu = NSMenu(title: "Project")
-        projectMenu.addItem(withTitle: "Transcribe Missing Answers…", action: #selector(transcribeMissingAnswers(_:)), keyEquivalent: "")
+        let transcribeItem = projectMenu.addItem(withTitle: "Transcribe Missing Answers…", action: #selector(transcribeMissingAnswers(_:)), keyEquivalent: "")
+        transcribeItem.target = self
         projectItem.submenu = projectMenu
         mainMenu.addItem(projectItem)
 
-        let editItem = NSMenuItem()
+        let editItem = NSMenuItem(title: "Edit", action: nil, keyEquivalent: "")
         let editMenu = NSMenu(title: "Edit")
         editMenu.addItem(withTitle: "Undo", action: #selector(undo(_:)), keyEquivalent: "z")
         editMenu.addItem(withTitle: "Redo", action: #selector(redo(_:)), keyEquivalent: "Z")
@@ -231,7 +242,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         editItem.submenu = editMenu
         mainMenu.addItem(editItem)
 
-        let windowItem = NSMenuItem()
+        let windowItem = NSMenuItem(title: "Window", action: nil, keyEquivalent: "")
         let windowMenu = NSMenu(title: "Window")
         windowMenu.addItem(withTitle: "Minimize", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m")
         windowItem.submenu = windowMenu
