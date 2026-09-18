@@ -332,6 +332,9 @@ struct ContentView: View {
             if !appState.renderProgress.isEmpty {
                 Text(appState.renderProgress)
                     .font(.subheadline)
+                    .lineLimit(3)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
     }

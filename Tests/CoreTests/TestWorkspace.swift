@@ -6,6 +6,8 @@ struct TestWorkspace {
     enum AudioProfile {
         case quietHandles
         case speechyHandles
+        case transientHandles
+        case antiPhaseTransientHandles
     }
 
     let rootURL: URL
@@ -69,6 +71,28 @@ struct TestWorkspace {
                 "-i", "sine=frequency=\(frequency):duration=2",
                 "-map", "0:v",
                 "-map", "1:a"
+            ])
+        case .transientHandles:
+            arguments.append(contentsOf: [
+                "-f", "lavfi",
+                "-i", "anullsrc=r=48000:cl=stereo:d=2",
+                "-f", "lavfi",
+                "-i", "sine=frequency=\(frequency):duration=0.001",
+                "-filter_complex", "[2:a]adelay=455|455[burst];[1:a][burst]amix=inputs=2:normalize=0:duration=first[aout]",
+                "-map", "0:v",
+                "-map", "[aout]"
+            ])
+        case .antiPhaseTransientHandles:
+            arguments.append(contentsOf: [
+                "-f", "lavfi",
+                "-i", "anullsrc=r=48000:cl=stereo:d=2",
+                "-f", "lavfi",
+                "-i", "sine=frequency=\(frequency):duration=0.001",
+                "-f", "lavfi",
+                "-i", "sine=frequency=\(frequency):duration=0.001",
+                "-filter_complex", "[2:a]adelay=455[burstL];[3:a]volume=-1,adelay=455[burstR];[burstL][burstR]amerge=inputs=2[burst];[1:a][burst]amix=inputs=2:normalize=0:duration=first[aout]",
+                "-map", "0:v",
+                "-map", "[aout]"
             ])
         }
 

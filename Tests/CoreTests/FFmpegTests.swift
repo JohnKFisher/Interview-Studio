@@ -12,7 +12,21 @@ final class FFmpegTests: XCTestCase {
         )
 
         XCTAssertFalse(capabilities.isSufficientForPhaseOne)
-        XCTAssertEqual(capabilities.missingPhaseOneCapabilities, ["zscale", "acrossfade", "libx265"])
+        XCTAssertEqual(capabilities.missingPhaseOneCapabilities, ["zscale", "acrossfade", "libx265 or hevc_videotoolbox"])
+    }
+
+    func testHardwareHEVCIsPreferredForPhaseOneWhenAvailable() {
+        let capabilities = FFmpegCapabilities(
+            hasZscale: true,
+            hasXfade: true,
+            hasAcrossfade: true,
+            hasOverlay: true,
+            hasLibx265: true,
+            hasHevcVideoToolbox: true
+        )
+
+        XCTAssertEqual(capabilities.preferredPhaseOneVideoEncoder, .hevcVideoToolbox)
+        XCTAssertTrue(capabilities.isSufficientForPhaseOne)
     }
 
     func testLocatorIncludesExecutableBundledCandidate() throws {

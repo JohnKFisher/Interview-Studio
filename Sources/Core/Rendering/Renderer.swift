@@ -1,8 +1,70 @@
 import Foundation
+#if os(macOS)
+import Darwin
+#endif
 
 public struct RenderJobState: Sendable {
     public var phase: String
     public var detail: String
+    public var completedUnits: Int?
+    public var totalUnits: Int?
+    public var elapsedSeconds: TimeInterval?
+    public var operationElapsedSeconds: TimeInterval?
+    public var isHeartbeat: Bool
+
+    public init(
+        phase: String,
+        detail: String,
+        completedUnits: Int? = nil,
+        totalUnits: Int? = nil,
+        elapsedSeconds: TimeInterval? = nil,
+        operationElapsedSeconds: TimeInterval? = nil,
+        isHeartbeat: Bool = false
+    ) {
+        self.phase = phase
+        self.detail = detail
+        self.completedUnits = completedUnits
+        self.totalUnits = totalUnits
+        self.elapsedSeconds = elapsedSeconds
+        self.operationElapsedSeconds = operationElapsedSeconds
+        self.isHeartbeat = isHeartbeat
+    }
+}
+
+private typealias RenderProcessHeartbeat = @Sendable (TimeInterval) -> Void
+
+private func renderElapsedLabel(_ seconds: TimeInterval) -> String {
+    let totalSeconds = max(Int(seconds.rounded(.down)), 0)
+    let hours = totalSeconds / 3_600
+    let minutes = (totalSeconds % 3_600) / 60
+    let remainingSeconds = totalSeconds % 60
+    if hours > 0 {
+        return String(format: "%d:%02d:%02d", hours, minutes, remainingSeconds)
+    }
+    return String(format: "%02d:%02d", minutes, remainingSeconds)
+}
+
+private func renderHeartbeat(
+    phase: String,
+    detail: String,
+    completedUnits: Int? = nil,
+    totalUnits: Int? = nil,
+    renderStartedAt: Date,
+    progress: @escaping @Sendable (RenderJobState) -> Void
+) -> RenderProcessHeartbeat {
+    { operationElapsedSeconds in
+        progress(
+            RenderJobState(
+                phase: phase,
+                detail: "\(detail) — still running (\(renderElapsedLabel(operationElapsedSeconds)) elapsed)",
+                completedUnits: completedUnits,
+                totalUnits: totalUnits,
+                elapsedSeconds: Date().timeIntervalSince(renderStartedAt),
+                operationElapsedSeconds: operationElapsedSeconds,
+                isHeartbeat: true
+            )
+        )
+    }
 }
 
 public struct RenderResult: Sendable {
@@ -22,9 +84,12 @@ public struct RenderResult: Sendable {
 public enum RendererError: LocalizedError {
     case exportBlocked([AssemblyIssue])
     case missingSequenceNode(String)
+    case invalidTiming(nodeID: String, message: String)
     case ffmpegPreflightFailed(String)
     case outputPathUnavailable
     case outputAlreadyExists(URL)
+    case chunkStreamMismatch(String)
+    case chunkDurationMismatch(chunkNumber: Int, expected: Double, observed: Double)
     case renderFailed(message: String, diagnosticsURL: URL?)
 
     public var errorDescription: String? {
@@ -33,16 +98,92 @@ public enum RendererError: LocalizedError {
             return issues.map(\.humanMessage).joined(separator: "\n")
         case .missingSequenceNode(let id):
             return "The render plan is missing a required sequence node: \(id)"
+        case .invalidTiming(_, let message):
+            return message
         case .ffmpegPreflightFailed(let message):
             return message
         case .outputPathUnavailable:
             return "The renderer could not determine a final output path."
         case .outputAlreadyExists(let url):
             return "The renderer will not overwrite an existing output: \(url.path)"
+        case .chunkStreamMismatch(let message):
+            return message
+        case .chunkDurationMismatch(let chunkNumber, let expected, let observed):
+            return "Chunk \(chunkNumber) duration mismatch: expected \(format(expected))s, observed \(format(observed))s. The chunk was shortened during assembly; inspect the chunk timing and retry after correcting the reported media/timing issue."
         case .renderFailed(let message, _):
             return message
         }
     }
+}
+
+private struct RenderTimingDiagnostic: Codable, Sendable {
+    var requestedStartSeconds: Double
+    var requestedEndSeconds: Double
+    var mediaDurationSeconds: Double
+    var frameRate: Double
+}
+
+private struct RenderFailureContext: Codable, Sendable {
+    var phase: String
+    var detail: String
+    var nodeID: String?
+    var boundaryID: String?
+    var timing: RenderTimingDiagnostic?
+
+    init(
+        phase: String = "startup",
+        detail: String = "Preparing the render.",
+        nodeID: String? = nil,
+        boundaryID: String? = nil,
+        timing: RenderTimingDiagnostic? = nil
+    ) {
+        self.phase = phase
+        self.detail = detail
+        self.nodeID = nodeID
+        self.boundaryID = boundaryID
+        self.timing = timing
+    }
+}
+
+private struct RenderFailureReport: Codable, Sendable {
+    let schemaVersion: Int
+    let occurredAt: Date
+    let phase: String
+    let detail: String
+    let nodeID: String?
+    let boundaryID: String?
+    let timing: RenderTimingDiagnostic?
+    let errorCategory: String
+    let error: String
+    let nextAction: String
+    let timeoutSeconds: Double?
+
+    enum CodingKeys: String, CodingKey {
+        case schemaVersion = "schema_version"
+        case occurredAt = "occurred_at"
+        case phase
+        case detail
+        case nodeID = "node_id"
+        case boundaryID = "boundary_id"
+        case timing
+        case errorCategory = "error_category"
+        case error
+        case nextAction = "next_action"
+        case timeoutSeconds = "timeout_seconds"
+    }
+}
+
+private struct ValidatedAnswerWindow: Sendable {
+    let startSeconds: Double
+    let endSeconds: Double
+    let durationSeconds: Double
+}
+
+private struct RenderWorkspaceMarker: Codable {
+    let schemaVersion: Int
+    let application: String
+    let createdAt: Date
+    let ownerProcessID: Int32
 }
 
 public final class Renderer: @unchecked Sendable {
@@ -51,8 +192,22 @@ public final class Renderer: @unchecked Sendable {
     private let preflight = FFmpegPreflight()
     private let inspector = MediaInspector()
     private let outputValidator = RenderOutputValidator()
+    private let chunkingPolicy: RenderChunkingPolicy
 
-    public init() {}
+    // Segment encodes should finish well before a legitimate whole-movie
+    // assembly. These are safety limits for a stuck subprocess, not estimates
+    // of normal render duration.
+    private let segmentProcessTimeout: TimeInterval = 10 * 60
+    private let assemblyProcessTimeout: TimeInterval = 45 * 60
+    private let plexProcessTimeout: TimeInterval = 15 * 60
+
+    public init() {
+        self.chunkingPolicy = RenderChunkingPolicy(targetDurationSeconds: 60)
+    }
+
+    init(chunkDurationLimitSeconds: Double) {
+        self.chunkingPolicy = RenderChunkingPolicy(targetDurationSeconds: chunkDurationLimitSeconds)
+    }
 
     public func render(
         plan: RenderPlan,
@@ -62,12 +217,15 @@ public final class Renderer: @unchecked Sendable {
         keepSuccessfulDiagnostics: Bool = false,
         progress: @escaping @Sendable (RenderJobState) -> Void
     ) async throws -> RenderResult {
+        let renderStartedAt = Date()
         let blockingIssues = plan.issues.filter { $0.severity == .blocker }
         guard blockingIssues.isEmpty else {
             throw RendererError.exportBlocked(blockingIssues)
         }
 
+        try? pruneStaleRenderWorkspaces()
         let workspace = try makeWorkspace(baseURL: diagnosticsRoot)
+        var failureContext = RenderFailureContext()
         var stagedOutputURLs: [URL] = []
         defer {
             for url in stagedOutputURLs {
@@ -75,37 +233,150 @@ public final class Renderer: @unchecked Sendable {
             }
         }
         do {
+            failureContext = .init(phase: "preflight", detail: "Saving a redacted copy of the render plan.")
             let planData = try diagnosticPlanData(plan)
             try planData.write(to: workspace.tempRootURL.appendingPathComponent("render_plan.json"))
 
+            failureContext = .init(phase: "preflight", detail: "Locating ffmpeg and verifying required filters/codecs.")
             progress(.init(phase: "preflight", detail: "Locating ffmpeg and verifying required filters/codecs."))
             let preflightResult = try locatePhaseOneFFmpeg(progress: progress)
             let binaries = preflightResult.binaries
+            guard let videoEncoder = preflightResult.capabilities.preferredPhaseOneVideoEncoder else {
+                throw RendererError.ffmpegPreflightFailed("No Phase 1 HEVC encoder is available. Install FFmpeg with hevc_videotoolbox or libx265, then try again.")
+            }
+            let outputURL = try finalOutputURL(for: plan, requestedOutputURL: requestedOutputURL, outputRoot: outputRoot)
+            try FileManager.default.createDirectory(at: outputURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+            let timeline = RenderTimeline(frameRate: plan.exportProfile.frameRate)
+            let timelineSchedule = timeline.schedule(sequence: plan.sequence, boundaries: plan.boundaries)
+            let expectedRenderDuration = timelineSchedule.total
 
             let answerNodes = plan.sequence.filter { $0.type == .answerClip }
             var inspections: [String: MediaInspectionResult] = [:]
+            var answerWindows: [String: ValidatedAnswerWindow] = [:]
             progress(.init(phase: "inspect", detail: "Inspecting source media and validating HDR readiness."))
             for node in answerNodes {
                 try Task.checkCancellation()
                 guard let clipRef = node.clipRef else { continue }
+                let timing = node.timing
+                failureContext = .init(
+                    phase: "inspect",
+                    detail: "Validating answer timing for \(node.nodeID).",
+                    nodeID: node.nodeID,
+                    timing: timing.map {
+                        RenderTimingDiagnostic(
+                            requestedStartSeconds: Double($0.answerStartInOutputUS) / 1_000_000,
+                            requestedEndSeconds: Double($0.answerEndInOutputUS) / 1_000_000,
+                            mediaDurationSeconds: 0,
+                            frameRate: 0
+                        )
+                    }
+                )
                 let inspection = try inspector.inspect(url: URL(fileURLWithPath: clipRef.resolvedPath), using: binaries)
                 inspections[node.nodeID] = inspection
+                guard let timing else {
+                    throw RendererError.missingSequenceNode(node.nodeID)
+                }
+                failureContext.timing = RenderTimingDiagnostic(
+                    requestedStartSeconds: Double(timing.answerStartInOutputUS) / 1_000_000,
+                    requestedEndSeconds: Double(timing.answerEndInOutputUS) / 1_000_000,
+                    mediaDurationSeconds: inspection.durationSeconds,
+                    frameRate: inspection.frameRate
+                )
+                answerWindows[node.nodeID] = try validatedAnswerWindow(
+                    nodeID: node.nodeID,
+                    timing: timing,
+                    inspection: inspection,
+                    frameRate: plan.exportProfile.frameRate
+                )
             }
 
             let cardSet = BuiltInTemplates.cardSet(id: plan.settings.selectedCardSetID)
             let overlayStyle = BuiltInTemplates.overlayStyle(id: plan.settings.selectedOverlayStyleID)
-            let nodeLookup = Dictionary(uniqueKeysWithValues: plan.sequence.map { ($0.nodeID, $0) })
 
             progress(.init(phase: "templates", detail: "Rendering native card and overlay assets."))
             let cardAssetPaths = try renderCardAssets(plan: plan, cardSet: cardSet, overlayStyle: overlayStyle, assetsURL: workspace.assetsURL)
 
             progress(.init(phase: "segments", detail: "Preparing answer segments, cards, and transition clips."))
-            var preparedNodeSegments: [String: URL] = [:]
+            let boundaryLookup = Dictionary(uniqueKeysWithValues: plan.boundaries.map { ("\($0.fromNodeID)->\($0.toNodeID)", $0) })
+            var currentChunk = RenderChunk(frameRate: plan.exportProfile.frameRate)
+            var chunkURLs: [URL] = []
+            var chunkIndex = 0
+            var transitionIndex = 0
+            let transitionTotal = plan.boundaries.filter {
+                $0.boundaryType == "answer_to_answer" && $0.resolved.style == "soft_crossfade"
+            }.count
+            var expectedChunkSignature: ChunkStreamSignature?
+
+            func flushCurrentChunk() throws {
+                guard !currentChunk.segmentURLs.isEmpty else { return }
+                let chunkURL = workspace.chunksURL.appendingPathComponent(String(format: "chunk-%04d.mov", chunkIndex))
+                let chunkNumber = chunkIndex + 1
+                let preparedSegmentCount = currentChunk.segmentURLs.count
+                let expectedChunkDurationSeconds = currentChunk.durationSeconds
+                let expectedChunkFrameCount = currentChunk.frameCount
+                let expectedChunkAudioSampleCount = currentChunk.audioSampleCount
+                let encoderLabel = videoEncoder == .hevcVideoToolbox ? "hardware HEVC" : "software x265"
+                let chunkDetail = "Encoding chunk \(chunkNumber) using \(encoderLabel) from \(preparedSegmentCount) prepared segments."
+                failureContext = .init(phase: "assemble", detail: chunkDetail)
+                progress(.init(phase: "assemble", detail: chunkDetail, completedUnits: chunkIndex))
+                let signature = try assembleChunk(
+                    segmentURLs: currentChunk.segmentURLs,
+                    outputURL: chunkURL,
+                    workspace: workspace,
+                    binaries: binaries,
+                    videoEncoder: videoEncoder,
+                    chunkNumber: chunkNumber,
+                    expectedDurationSeconds: expectedChunkDurationSeconds,
+                    expectedFrameCount: expectedChunkFrameCount,
+                    expectedAudioSampleCount: expectedChunkAudioSampleCount,
+                    profile: plan.exportProfile,
+                    heartbeat: renderHeartbeat(
+                        phase: "assemble",
+                        detail: chunkDetail,
+                        completedUnits: chunkIndex,
+                        renderStartedAt: renderStartedAt,
+                        progress: progress
+                    )
+                )
+                try Task.checkCancellation()
+                if let expectedChunkSignature, expectedChunkSignature != signature {
+                    throw RendererError.chunkStreamMismatch("Chunk \(chunkIndex + 1) does not match the stream parameters of the earlier chunks.")
+                }
+                expectedChunkSignature = expectedChunkSignature ?? signature
+                chunkURLs.append(chunkURL)
+                chunkIndex += 1
+                currentChunk = RenderChunk(frameRate: plan.exportProfile.frameRate)
+            }
+
             for (index, node) in plan.sequence.enumerated() {
                 try Task.checkCancellation()
                 let previousBoundary = plan.boundaries.first(where: { $0.toNodeID == node.nodeID })
                 let nextBoundary = plan.boundaries.first(where: { $0.fromNodeID == node.nodeID })
-                progress(.init(phase: "segments", detail: "Encoding segment \(index + 1) of \(plan.sequence.count): \(node.nodeID)"))
+                let nextNode = index < plan.sequence.count - 1 ? plan.sequence[index + 1] : nil
+                let boundaryAfterNode: BoundaryTransition? = {
+                    guard let nextNode,
+                          let boundary = boundaryLookup["\(node.nodeID)->\(nextNode.nodeID)"],
+                          boundary.boundaryType == "answer_to_answer",
+                          boundary.resolved.style == "soft_crossfade" else {
+                        return nil
+                    }
+                    return boundary
+                }()
+                let nodeDuration = timelineSchedule.duration(for: node)
+                let boundaryDuration = boundaryAfterNode.map { timelineSchedule.duration(for: $0) }
+                let groupDuration = nodeDuration.seconds + (boundaryDuration?.seconds ?? 0)
+                if shouldStartNewChunk(currentDuration: currentChunk.durationSeconds, nextGroupDuration: groupDuration) {
+                    try flushCurrentChunk()
+                }
+                let encoderLabel = videoEncoder == .hevcVideoToolbox ? "hardware HEVC" : "software x265"
+                let segmentDetail = "Encoding segment \(index + 1) of \(plan.sequence.count) using \(encoderLabel): \(node.nodeID)"
+                failureContext = .init(phase: "segments", detail: segmentDetail, nodeID: node.nodeID)
+                progress(.init(
+                    phase: "segments",
+                    detail: segmentDetail,
+                    completedUnits: index,
+                    totalUnits: plan.sequence.count
+                ))
 
                 switch node.type {
                 case .openingCard, .questionCard, .closingCard:
@@ -118,66 +389,125 @@ public final class Renderer: @unchecked Sendable {
                         nextBoundary: nextBoundary,
                         profile: plan.exportProfile,
                         binaries: binaries,
+                        duration: nodeDuration,
+                        videoEncoder: videoEncoder,
                         outputURL: outputURL,
-                        commandLogURL: workspace.commandLogURL
+                        commandLogURL: workspace.commandLogURL,
+                        heartbeat: renderHeartbeat(
+                            phase: "segments",
+                            detail: segmentDetail,
+                            completedUnits: index,
+                            totalUnits: plan.sequence.count,
+                            renderStartedAt: renderStartedAt,
+                            progress: progress
+                        )
                     )
-                    preparedNodeSegments[node.nodeID] = outputURL
+                    currentChunk.append(segmentURL: outputURL, duration: nodeDuration)
                 case .answerClip:
                     let outputURL = workspace.segmentsURL.appendingPathComponent("\(node.nodeID)-core.mov")
                     guard let inspection = inspections[node.nodeID] else {
                         throw RendererError.missingSequenceNode(node.nodeID)
                     }
+                    guard let timingWindow = answerWindows[node.nodeID] else {
+                        throw RendererError.missingSequenceNode(node.nodeID)
+                    }
                     try renderAnswerCoreSegment(
                         node: node,
                         inspection: inspection,
+                        timingWindow: timingWindow,
+                        duration: nodeDuration,
                         overlayAssetURL: cardAssetPaths["overlay-\(node.nodeID)"],
                         previousBoundary: previousBoundary,
                         nextBoundary: nextBoundary,
                         profile: plan.exportProfile,
                         binaries: binaries,
+                        videoEncoder: videoEncoder,
                         outputURL: outputURL,
-                        commandLogURL: workspace.commandLogURL
+                        commandLogURL: workspace.commandLogURL,
+                        heartbeat: renderHeartbeat(
+                            phase: "segments",
+                            detail: segmentDetail,
+                            completedUnits: index,
+                            totalUnits: plan.sequence.count,
+                            renderStartedAt: renderStartedAt,
+                            progress: progress
+                        )
                     )
-                    preparedNodeSegments[node.nodeID] = outputURL
+                    currentChunk.append(segmentURL: outputURL, duration: nodeDuration)
+                }
+
+                if let boundary = boundaryAfterNode, let nextNode {
+                    try Task.checkCancellation()
+                    guard let fromInspection = inspections[node.nodeID],
+                          let toInspection = inspections[nextNode.nodeID] else {
+                        throw RendererError.missingSequenceNode(boundary.boundaryID)
+                    }
+
+                    transitionIndex += 1
+                    let transitionDetail = "Encoding transition \(transitionIndex) of \(transitionTotal): \(boundary.boundaryID)"
+                    guard let fromWindow = answerWindows[node.nodeID],
+                          let toWindow = answerWindows[nextNode.nodeID] else {
+                        throw RendererError.missingSequenceNode(boundary.boundaryID)
+                    }
+                    failureContext = .init(
+                        phase: "segments",
+                        detail: transitionDetail,
+                        nodeID: node.nodeID,
+                        boundaryID: boundary.boundaryID,
+                        timing: RenderTimingDiagnostic(
+                            requestedStartSeconds: fromWindow.startSeconds,
+                            requestedEndSeconds: fromWindow.endSeconds,
+                            mediaDurationSeconds: fromInspection.durationSeconds,
+                            frameRate: fromInspection.frameRate
+                        )
+                    )
+                    progress(.init(
+                        phase: "segments",
+                        detail: transitionDetail,
+                        completedUnits: transitionIndex - 1,
+                        totalUnits: transitionTotal
+                    ))
+                    let transitionURL = workspace.segmentsURL.appendingPathComponent("\(boundary.boundaryID).mov")
+                    try renderAnswerTransitionSegment(
+                        boundary: boundary,
+                        fromNode: node,
+                        toNode: nextNode,
+                        fromInspection: fromInspection,
+                        toInspection: toInspection,
+                        fromWindow: fromWindow,
+                        toWindow: toWindow,
+                        duration: boundaryDuration ?? timelineSchedule.duration(for: boundary),
+                        fromOverlayURL: cardAssetPaths["overlay-\(node.nodeID)"],
+                        toOverlayURL: cardAssetPaths["overlay-\(nextNode.nodeID)"],
+                        profile: plan.exportProfile,
+                        binaries: binaries,
+                        videoEncoder: videoEncoder,
+                        outputURL: transitionURL,
+                        commandLogURL: workspace.commandLogURL,
+                        heartbeat: renderHeartbeat(
+                            phase: "segments",
+                            detail: transitionDetail,
+                            completedUnits: transitionIndex - 1,
+                            totalUnits: transitionTotal,
+                            renderStartedAt: renderStartedAt,
+                            progress: progress
+                        )
+                    )
+                    currentChunk.append(segmentURL: transitionURL, duration: boundaryDuration ?? timelineSchedule.duration(for: boundary))
+                }
+
+                if currentChunk.durationSeconds >= chunkingPolicy.targetDurationSeconds {
+                    try flushCurrentChunk()
                 }
             }
 
-            var transitionSegmentPaths: [String: URL] = [:]
-            let transitionBoundaries = plan.boundaries.filter { $0.boundaryType == "answer_to_answer" && $0.resolved.style == "soft_crossfade" }
-            for (index, boundary) in transitionBoundaries.enumerated() {
-                try Task.checkCancellation()
-                guard let fromNode = nodeLookup[boundary.fromNodeID],
-                      let toNode = nodeLookup[boundary.toNodeID],
-                      let fromInspection = inspections[fromNode.nodeID],
-                      let toInspection = inspections[toNode.nodeID] else {
-                    throw RendererError.missingSequenceNode(boundary.boundaryID)
-                }
+            try flushCurrentChunk()
+            try Task.checkCancellation()
+            let finalAssemblyDetail = "Joining \(chunkURLs.count) HEVC chunks into the final movie file."
+            failureContext = .init(phase: "assemble", detail: finalAssemblyDetail)
+            progress(.init(phase: "assemble", detail: finalAssemblyDetail, completedUnits: chunkURLs.count))
+            try writeConcatFile(chunkURLs, to: workspace.concatFileURL)
 
-                progress(.init(phase: "segments", detail: "Encoding transition \(index + 1) of \(transitionBoundaries.count): \(boundary.boundaryID)"))
-                let outputURL = workspace.segmentsURL.appendingPathComponent("\(boundary.boundaryID).mov")
-                try renderAnswerTransitionSegment(
-                    boundary: boundary,
-                    fromNode: fromNode,
-                    toNode: toNode,
-                    fromInspection: fromInspection,
-                    toInspection: toInspection,
-                    fromOverlayURL: cardAssetPaths["overlay-\(fromNode.nodeID)"],
-                    toOverlayURL: cardAssetPaths["overlay-\(toNode.nodeID)"],
-                    profile: plan.exportProfile,
-                    binaries: binaries,
-                    outputURL: outputURL,
-                    commandLogURL: workspace.commandLogURL
-                )
-                transitionSegmentPaths[boundary.boundaryID] = outputURL
-            }
-
-            progress(.init(phase: "assemble", detail: "Concatenating prepared segments into the final movie file."))
-            let finalSegments = orderedFinalSegments(sequence: plan.sequence, boundaries: plan.boundaries, nodeSegments: preparedNodeSegments, transitionSegments: transitionSegmentPaths)
-            let concatBody = finalSegments.map { "file '\($0.path.replacingOccurrences(of: "'", with: "'\\''"))'" }.joined(separator: "\n")
-            try Data(concatBody.utf8).write(to: workspace.concatFileURL)
-
-            let outputURL = try finalOutputURL(for: plan, requestedOutputURL: requestedOutputURL, outputRoot: outputRoot)
-            try FileManager.default.createDirectory(at: outputURL.deletingLastPathComponent(), withIntermediateDirectories: true)
             let stagedMasterURL = stagingURL(for: outputURL)
             stagedOutputURLs.append(stagedMasterURL)
             try runner.run(
@@ -185,18 +515,39 @@ public final class Renderer: @unchecked Sendable {
                 arguments: finalAssemblyArguments(
                     concatFileURL: workspace.concatFileURL,
                     outputURL: stagedMasterURL,
+                    expectedFrameCount: expectedRenderDuration.frameCount,
+                    expectedAudioSampleCount: expectedRenderDuration.audioSampleCount,
                     profile: plan.exportProfile
                 ),
-                commandLogURL: workspace.commandLogURL
+                commandLogURL: workspace.commandLogURL,
+                heartbeatInterval: 5,
+                heartbeat: renderHeartbeat(
+                    phase: "assemble",
+                    detail: finalAssemblyDetail,
+                    completedUnits: chunkURLs.count,
+                    renderStartedAt: renderStartedAt,
+                    progress: progress
+                ),
+                timeout: assemblyProcessTimeout
             )
+            try Task.checkCancellation()
             let masterInspection = try inspector.inspect(url: stagedMasterURL, using: binaries)
-            try outputValidator.validate(masterInspection, against: plan.exportProfile, expectedDurationSeconds: plan.summary.estimatedRuntimeSeconds)
+            try outputValidator.validate(
+                masterInspection,
+                against: plan.exportProfile,
+                expectedDurationSeconds: plan.summary.estimatedRuntimeSeconds,
+                expectedVideoFrameCount: expectedRenderDuration.frameCount,
+                expectedAudioSampleCount: expectedRenderDuration.audioSampleCount,
+                requireFinalOutputContract: true
+            )
+            try Task.checkCancellation()
             try promote(stagedURL: stagedMasterURL, to: outputURL)
             stagedOutputURLs.removeAll { $0 == stagedMasterURL }
 
             var plexOutputURL: URL?
             var plexWarning: String?
             if let plexMetadata = plan.plexMetadata {
+                failureContext = .init(phase: "plex", detail: "Packaging Plex-friendly MP4 companion with metadata and chapters.")
                 progress(.init(phase: "plex", detail: "Packaging Plex-friendly MP4 companion with metadata and chapters."))
                 do {
                     plexOutputURL = try packagePlexCompanion(
@@ -205,7 +556,13 @@ public final class Renderer: @unchecked Sendable {
                         masterOutputURL: outputURL,
                         workspace: workspace,
                         binaries: binaries,
-                        stagedOutputURLs: &stagedOutputURLs
+                        stagedOutputURLs: &stagedOutputURLs,
+                        heartbeat: renderHeartbeat(
+                            phase: "plex",
+                            detail: "Packaging Plex-friendly MP4 companion with metadata and chapters.",
+                            renderStartedAt: renderStartedAt,
+                            progress: progress
+                        )
                     )
                 } catch {
                     plexWarning = "Plex companion was not published; the validated HDR master is available. \(error.localizedDescription)"
@@ -213,7 +570,7 @@ public final class Renderer: @unchecked Sendable {
                 }
             }
 
-            let diagnosticsURL = keepSuccessfulDiagnostics ? try persistDiagnostics(from: workspace) : nil
+            let diagnosticsURL = keepSuccessfulDiagnostics ? try persistDiagnostics(from: workspace, failure: nil) : nil
             try cleanupTemporaryArtifacts(at: workspace.tempRootURL)
 
             progress(.init(phase: "done", detail: "Finished rendering \(outputURL.lastPathComponent)."))
@@ -222,17 +579,14 @@ public final class Renderer: @unchecked Sendable {
             try? cleanupTemporaryArtifacts(at: workspace.tempRootURL)
             throw CancellationError()
         } catch {
-            let diagnosticsURL = try? persistDiagnostics(from: workspace)
+            let report = makeFailureReport(context: failureContext, error: error)
+            let diagnosticsURL = try? persistDiagnostics(from: workspace, failure: report)
             try? cleanupTemporaryArtifacts(at: workspace.tempRootURL)
-            if let rendererError = error as? RendererError {
-                switch rendererError {
-                case .renderFailed:
-                    throw rendererError
-                default:
-                    throw RendererError.renderFailed(message: rendererError.localizedDescription, diagnosticsURL: diagnosticsURL)
-                }
-            }
-            throw RendererError.renderFailed(message: error.localizedDescription, diagnosticsURL: diagnosticsURL)
+            let diagnosticsHint = diagnosticsURL.map {
+                "Diagnostics saved to \($0.path). Inspect render_failure.json and ffmpeg_commands.txt there."
+            } ?? "The diagnostic bundle could not be saved."
+            let message = "Render failed during \(failureContext.phase): \(failureContext.detail)\n\(error.localizedDescription)\n\nNext action: \(report.nextAction)\n\(diagnosticsHint)"
+            throw RendererError.renderFailed(message: message, diagnosticsURL: diagnosticsURL)
         }
     }
 
@@ -270,31 +624,166 @@ public final class Renderer: @unchecked Sendable {
 
         let attemptSummary = attempts.isEmpty ? "No usable candidates were found." : attempts.joined(separator: "\n")
         throw RendererError.ffmpegPreflightFailed(
-            "Interview Studio found FFmpeg installations, but none provides the capabilities required for Phase 1 rendering (zscale, xfade, acrossfade, overlay, libx265).\n\nChecked:\n\(attemptSummary)\n\nInstall a compatible FFmpeg/FFprobe build, such as Homebrew ffmpeg-full, then try again."
+            "Interview Studio found FFmpeg installations, but none provides the capabilities required for Phase 1 rendering (zscale, xfade, acrossfade, overlay, and hevc_videotoolbox or libx265).\n\nChecked:\n\(attemptSummary)\n\nInstall a compatible FFmpeg/FFprobe build, such as Homebrew ffmpeg-full, then try again."
         )
     }
 
-    private func orderedFinalSegments(
-        sequence: [RenderSequenceNode],
-        boundaries: [BoundaryTransition],
-        nodeSegments: [String: URL],
-        transitionSegments: [String: URL]
-    ) -> [URL] {
-        let boundaryLookup = Dictionary(uniqueKeysWithValues: boundaries.map { ("\($0.fromNodeID)->\($0.toNodeID)", $0) })
-        var segments: [URL] = []
-        for index in sequence.indices {
-            let node = sequence[index]
-            if let url = nodeSegments[node.nodeID] {
-                segments.append(url)
-            }
-            guard index < sequence.count - 1 else { continue }
-            let next = sequence[index + 1]
-            if let boundary = boundaryLookup["\(node.nodeID)->\(next.nodeID)"],
-               let transitionURL = transitionSegments[boundary.boundaryID] {
-                segments.append(transitionURL)
-            }
+    private func validatedAnswerWindow(
+        nodeID: String,
+        timing: RenderTiming,
+        inspection: MediaInspectionResult,
+        frameRate: Double
+    ) throws -> ValidatedAnswerWindow {
+        let start = Double(timing.answerStartInOutputUS) / 1_000_000
+        let requestedEnd = Double(timing.answerEndInOutputUS) / 1_000_000
+        let mediaDuration = inspection.durationSeconds
+
+        guard start.isFinite, requestedEnd.isFinite, mediaDuration.isFinite,
+              mediaDuration > 0,
+              start >= 0,
+              requestedEnd > start else {
+            throw RendererError.invalidTiming(
+                nodeID: nodeID,
+                message: "The render plan has an invalid answer window for \(nodeID): start \(format(start))s, end \(format(requestedEnd))s, media duration \(format(mediaDuration))s. Repair or regenerate this manifest row before rendering."
+            )
         }
-        return segments
+
+        guard start < mediaDuration,
+              requestedEnd <= mediaDuration else {
+            throw RendererError.invalidTiming(
+                nodeID: nodeID,
+                message: "The render plan asks for \(nodeID) from \(format(start))s to \(format(requestedEnd))s, but its inspected output file is only \(format(mediaDuration))s. This is a manifest/media timing mismatch, not an encoding delay. Regenerate the published clip or repair answer_start_in_output_us and answer_end_in_output_us so both timestamps fall inside output_file, then render again."
+            )
+        }
+
+        let minimumFrameDuration = 1.0 / max(frameRate, 1)
+        guard requestedEnd - start >= minimumFrameDuration else {
+            throw RendererError.invalidTiming(
+                nodeID: nodeID,
+                message: "The answer window for \(nodeID) is shorter than one output frame (\(format(requestedEnd - start))s at \(format(frameRate)) fps). Repair or regenerate this manifest row before rendering."
+            )
+        }
+
+        return ValidatedAnswerWindow(startSeconds: start, endSeconds: requestedEnd, durationSeconds: requestedEnd - start)
+    }
+
+    private func makeFailureReport(context: RenderFailureContext, error: Error) -> RenderFailureReport {
+        let category: String
+        let nextAction: String
+        let timeoutSeconds: Double?
+        if case let ProcessRunnerError.timedOut(_, timeout, _) = error {
+            timeoutSeconds = timeout
+        } else {
+            timeoutSeconds = nil
+        }
+        switch error {
+        case let error as RendererError:
+            switch error {
+            case .invalidTiming:
+                category = "invalid_manifest_timing"
+                nextAction = "Repair or regenerate the named manifest row so its answer timestamps are inside the inspected output file, then retry."
+            case .chunkDurationMismatch:
+                category = "chunk_duration_mismatch"
+                nextAction = "The renderer detected a shortened chunk before final assembly. Review the named chunk and redacted FFmpeg command log; verify the chunk's segment/audio durations, then retry."
+            default:
+                category = "renderer_error"
+                nextAction = "Review the named stage and the redacted FFmpeg command log, then correct the indicated input or tool issue before retrying."
+            }
+        case is RenderOutputValidationError:
+            category = "render_output_validation"
+            nextAction = "The rendered media did not satisfy the output contract. Review the named stage and redacted FFmpeg command log; do not publish the output until the reported codec, color, audio, or timing mismatch is corrected."
+        case is ProcessRunnerError:
+            category = "ffmpeg_process_failure"
+            nextAction = "Review the operation detail and ffmpeg_commands.txt. If this was a timeout, verify the source timing and available disk space before retrying."
+        case is CancellationError:
+            category = "cancelled"
+            nextAction = "The render was cancelled; retry after confirming the source project is still available."
+        default:
+            category = "unexpected_error"
+            nextAction = "Review the stage detail and redacted command log, then retry after correcting the reported input or environment problem."
+        }
+
+        return RenderFailureReport(
+            schemaVersion: 1,
+            occurredAt: Date(),
+            phase: context.phase,
+            detail: context.detail,
+            nodeID: context.nodeID,
+            boundaryID: context.boundaryID,
+            timing: context.timing,
+            errorCategory: category,
+            error: ProcessRunner.redactDiagnosticText(error.localizedDescription),
+            nextAction: nextAction,
+            timeoutSeconds: timeoutSeconds
+        )
+    }
+
+    private func assembleChunk(
+        segmentURLs: [URL],
+        outputURL: URL,
+        workspace: RenderWorkspace,
+        binaries: FFmpegBinarySet,
+        videoEncoder: PhaseOneVideoEncoder,
+        chunkNumber: Int,
+        expectedDurationSeconds: Double,
+        expectedFrameCount: Int,
+        expectedAudioSampleCount: Int,
+        profile: ExportProfile,
+        heartbeat: RenderProcessHeartbeat?
+    ) throws -> ChunkStreamSignature {
+        try writeConcatFile(segmentURLs, to: workspace.concatFileURL)
+        try runner.run(
+            executableURL: binaries.ffmpegURL,
+            arguments: chunkAssemblyArguments(
+                concatFileURL: workspace.concatFileURL,
+                outputURL: outputURL,
+                videoEncoder: videoEncoder,
+                expectedFrameCount: expectedFrameCount,
+                expectedAudioSampleCount: expectedAudioSampleCount,
+                profile: profile
+            ),
+            commandLogURL: workspace.commandLogURL,
+            heartbeatInterval: heartbeat == nil ? nil : 5,
+            heartbeat: heartbeat,
+            timeout: assemblyProcessTimeout
+        )
+
+        let inspection = try inspector.inspect(url: outputURL, using: binaries)
+        do {
+            try outputValidator.validate(
+                inspection,
+                against: profile,
+                expectedDurationSeconds: expectedDurationSeconds,
+                expectedVideoFrameCount: expectedFrameCount,
+                expectedAudioSampleCount: expectedAudioSampleCount
+            )
+        } catch let error as RenderOutputValidationError {
+            if case .mismatch(let field, _, _) = error, field == "duration" {
+                throw RendererError.chunkDurationMismatch(
+                    chunkNumber: chunkNumber,
+                    expected: expectedDurationSeconds,
+                    observed: inspection.durationSeconds
+                )
+            }
+            throw error
+        }
+        let signature = ChunkStreamSignature(inspection: inspection)
+
+        for segmentURL in segmentURLs {
+            try cleanupTemporaryArtifacts(at: segmentURL)
+        }
+        return signature
+    }
+
+    private func writeConcatFile(_ urls: [URL], to destinationURL: URL) throws {
+        let body = urls
+            .map { "file '\($0.path.replacingOccurrences(of: "'", with: "'\\''"))'" }
+            .joined(separator: "\n")
+        try Data(body.utf8).write(to: destinationURL)
+    }
+
+    private func shouldStartNewChunk(currentDuration: Double, nextGroupDuration: Double) -> Bool {
+        chunkingPolicy.shouldStartNewChunk(currentDuration: currentDuration, nextGroupDuration: nextGroupDuration)
     }
 
     private func renderCardAssets(
@@ -345,10 +834,13 @@ public final class Renderer: @unchecked Sendable {
         nextBoundary: BoundaryTransition?,
         profile: ExportProfile,
         binaries: FFmpegBinarySet,
+        duration: RenderBlockDuration,
+        videoEncoder: PhaseOneVideoEncoder,
         outputURL: URL,
-        commandLogURL: URL
+        commandLogURL: URL,
+        heartbeat: RenderProcessHeartbeat?
     ) throws {
-        let duration = node.template?.durationSeconds ?? 2.0
+        let durationSeconds = duration.seconds
         let fadeIn = previousBoundary?.resolved.style == "fade_through_black" ? Double(previousBoundary?.resolved.durationFrames ?? 0) / profile.frameRate : 0
         let fadeOut = nextBoundary?.resolved.style == "fade_through_black" ? Double(nextBoundary?.resolved.durationFrames ?? 0) / profile.frameRate : 0
 
@@ -363,59 +855,72 @@ public final class Renderer: @unchecked Sendable {
             videoFilter.append("fade=t=in:st=0:d=\(format(fadeIn)):color=black")
         }
         if fadeOut > 0 {
-            videoFilter.append("fade=t=out:st=\(format(max(duration - fadeOut, 0))):d=\(format(fadeOut)):color=black")
+            videoFilter.append("fade=t=out:st=\(format(max(durationSeconds - fadeOut, 0))):d=\(format(fadeOut)):color=black")
         }
 
         try runner.run(
             executableURL: binaries.ffmpegURL,
             arguments: segmentEncodeArguments(
                 inputs: [
-                    ["-loop", "1", "-framerate", format(profile.frameRate), "-i", imageURL.path],
-                    ["-f", "lavfi", "-t", format(duration), "-i", "anullsrc=r=48000:cl=stereo"]
+                    ["-loop", "1", "-framerate", format(profile.frameRate), "-t", format(durationSeconds), "-i", imageURL.path],
+                    ["-f", "lavfi", "-t", format(durationSeconds), "-i", "anullsrc=r=48000:cl=stereo"]
                 ],
-                filterComplex: "[0:v]\(videoFilter.joined(separator: ","))[v];[1:a]atrim=duration=\(format(duration)),asetpts=PTS-STARTPTS[a]",
+                filterComplex: "[0:v]\(videoFilter.joined(separator: ","))[v];[1:a]atrim=duration=\(format(durationSeconds)),asetpts=PTS-STARTPTS[a]",
                 mapVideo: "[v]",
                 mapAudio: "[a]",
                 outputURL: outputURL,
-                profile: profile
+                videoEncoder: videoEncoder,
+                profile: profile,
+                videoFrameCount: duration.frameCount,
+                audioSampleCount: duration.audioSampleCount
             ),
-            commandLogURL: commandLogURL
+            commandLogURL: commandLogURL,
+            heartbeatInterval: heartbeat == nil ? nil : 5,
+            heartbeat: heartbeat,
+            timeout: segmentProcessTimeout
         )
     }
 
     private func renderAnswerCoreSegment(
         node: RenderSequenceNode,
         inspection: MediaInspectionResult,
+        timingWindow: ValidatedAnswerWindow,
+        duration: RenderBlockDuration,
         overlayAssetURL: URL?,
         previousBoundary: BoundaryTransition?,
         nextBoundary: BoundaryTransition?,
         profile: ExportProfile,
         binaries: FFmpegBinarySet,
+        videoEncoder: PhaseOneVideoEncoder,
         outputURL: URL,
-        commandLogURL: URL
+        commandLogURL: URL,
+        heartbeat: RenderProcessHeartbeat?
     ) throws {
-        guard let clipRef = node.clipRef, let timing = node.timing else {
+        guard let clipRef = node.clipRef else {
             throw RendererError.missingSequenceNode(node.nodeID)
         }
 
-        let duration = max(Double(timing.durationUS) / 1_000_000, 0.05)
-        let start = max(Double(timing.answerStartInOutputUS) / 1_000_000, 0)
+        let durationSeconds = duration.seconds
+        let start = timingWindow.startSeconds
         let audioFilter = baseAudioFilter(
             start: start,
-            duration: duration,
+            duration: timingWindow.durationSeconds,
             loudnessMatch: node.audio?.loudnessMatch ?? true,
             targetLUFS: node.audio?.targetLUFS ?? -16,
             truePeak: node.audio?.truePeakCeilingDBTP ?? -1
         )
 
         var videoChain = [
-            "trim=start=\(format(start)):duration=\(format(duration))",
+            "trim=start=\(format(start)):duration=\(format(timingWindow.durationSeconds))",
             "setpts=PTS-STARTPTS",
             "fps=\(format(profile.frameRate))",
             colorNormalizeFilter(for: inspection.colorInfo, profile: profile),
             scalePadFilter(profile: profile),
             "setsar=1"
         ]
+        if durationSeconds > timingWindow.durationSeconds {
+            videoChain.append("tpad=stop_mode=clone:stop_duration=\(format(durationSeconds - timingWindow.durationSeconds))")
+        }
 
         if let previousBoundary, previousBoundary.resolved.style == "fade_through_black" {
             let fadeIn = Double(previousBoundary.resolved.durationFrames) / profile.frameRate
@@ -423,21 +928,21 @@ public final class Renderer: @unchecked Sendable {
         }
         if let nextBoundary, nextBoundary.resolved.style == "fade_through_black" {
             let fadeOut = Double(nextBoundary.resolved.durationFrames) / profile.frameRate
-            videoChain.append("fade=t=out:st=\(format(max(duration - fadeOut, 0))):d=\(format(fadeOut)):color=black")
+            videoChain.append("fade=t=out:st=\(format(max(durationSeconds - fadeOut, 0))):d=\(format(fadeOut)):color=black")
         }
 
         var inputs: [[String]] = [["-i", clipRef.resolvedPath]]
         var filterComplex = "[0:v]\(videoChain.joined(separator: ","))[v0];"
         if inspection.hasAudio {
-            filterComplex += "[0:a]\(audioFilter)[a0];"
+            filterComplex += "[0:a]\(audioFilter),apad=whole_dur=\(format(durationSeconds)),atrim=duration=\(format(durationSeconds)),asetpts=PTS-STARTPTS[a0];"
         } else {
-            inputs.append(["-f", "lavfi", "-t", format(duration), "-i", "anullsrc=r=48000:cl=stereo"])
-            filterComplex += "[1:a]atrim=duration=\(format(duration)),asetpts=PTS-STARTPTS[a0];"
+            inputs.append(["-f", "lavfi", "-t", format(durationSeconds), "-i", "anullsrc=r=48000:cl=stereo"])
+            filterComplex += "[1:a]atrim=duration=\(format(durationSeconds)),asetpts=PTS-STARTPTS[a0];"
         }
 
         var videoMap = "[v0]"
         if let overlayAssetURL {
-            inputs.append(["-loop", "1", "-framerate", format(profile.frameRate), "-i", overlayAssetURL.path])
+            inputs.append(["-loop", "1", "-framerate", format(profile.frameRate), "-t", format(durationSeconds), "-i", overlayAssetURL.path])
             let overlayIndex = inputs.count - 1
             filterComplex += "[\(overlayIndex):v]format=rgba[ov];[v0][ov]overlay=0:0:format=auto[v1]"
             videoMap = "[v1]"
@@ -453,9 +958,15 @@ public final class Renderer: @unchecked Sendable {
                 mapVideo: videoMap,
                 mapAudio: "[a0]",
                 outputURL: outputURL,
-                profile: profile
+                videoEncoder: videoEncoder,
+                profile: profile,
+                videoFrameCount: duration.frameCount,
+                audioSampleCount: duration.audioSampleCount
             ),
-            commandLogURL: commandLogURL
+            commandLogURL: commandLogURL,
+            heartbeatInterval: heartbeat == nil ? nil : 5,
+            heartbeat: heartbeat,
+            timeout: segmentProcessTimeout
         )
     }
 
@@ -465,30 +976,59 @@ public final class Renderer: @unchecked Sendable {
         toNode: RenderSequenceNode,
         fromInspection: MediaInspectionResult,
         toInspection: MediaInspectionResult,
+        fromWindow: ValidatedAnswerWindow,
+        toWindow: ValidatedAnswerWindow,
+        duration: RenderBlockDuration,
         fromOverlayURL: URL?,
         toOverlayURL: URL?,
         profile: ExportProfile,
         binaries: FFmpegBinarySet,
+        videoEncoder: PhaseOneVideoEncoder,
         outputURL: URL,
-        commandLogURL: URL
+        commandLogURL: URL,
+        heartbeat: RenderProcessHeartbeat?
     ) throws {
         guard let fromClipRef = fromNode.clipRef,
-              let toClipRef = toNode.clipRef,
-              let fromTiming = fromNode.timing,
-              let toTiming = toNode.timing else {
+              let toClipRef = toNode.clipRef else {
             throw RendererError.missingSequenceNode(boundary.boundaryID)
         }
 
-        let duration = Double(boundary.requested.durationUS) / 1_000_000
+        let durationSeconds = duration.seconds
         let outgoingAvailable = max(Double(boundary.availability.outgoingRealHandleAfterUS) / 1_000_000, 0)
         let incomingAvailable = max(Double(boundary.availability.incomingRealHandleBeforeUS) / 1_000_000, 0)
+        let outgoingAnalysisAvailable = max(
+            Double((fromNode.handles?.actualHandleAfterUS ?? boundary.availability.outgoingRealHandleAfterUS) + (fromNode.handles?.syntheticHandleAfterUS ?? 0)) / 1_000_000,
+            0
+        )
+        let incomingAnalysisAvailable = max(
+            Double((toNode.handles?.actualHandleBeforeUS ?? boundary.availability.incomingRealHandleBeforeUS) + (toNode.handles?.syntheticHandleBeforeUS ?? 0)) / 1_000_000,
+            0
+        )
 
-        let outgoingMissing = max(duration - outgoingAvailable, 0)
-        let incomingMissing = max(duration - incomingAvailable, 0)
-        let outgoingTrimDuration = max(min(duration, outgoingAvailable), 0.01)
-        let incomingTrimDuration = max(min(duration, incomingAvailable), 0.01)
-        let outgoingStart = Double(fromTiming.answerEndInOutputUS) / 1_000_000
-        let incomingStart = max(Double(toTiming.answerStartInOutputUS) / 1_000_000 - incomingTrimDuration, 0)
+        let outgoingMissing = max(durationSeconds - outgoingAvailable, 0)
+        let incomingMissing = max(durationSeconds - incomingAvailable, 0)
+        let outgoingTrimDuration = max(min(durationSeconds, outgoingAvailable), 0.01)
+        let incomingTrimDuration = max(min(durationSeconds, incomingAvailable), 0.01)
+        let frameDuration = 1 / max(profile.frameRate, 1)
+        // If no real trailing handle exists, use the final decoded frame as
+        // the source for synthetic padding. Starting at the exact media end
+        // creates an empty trim input, which can leave ffmpeg spinning forever.
+        let lastOutgoingFrameStart = max(fromInspection.durationSeconds - frameDuration, 0)
+        let outgoingStart = min(fromWindow.endSeconds, lastOutgoingFrameStart)
+        let incomingStart = min(
+            max(toWindow.startSeconds - incomingTrimDuration, 0),
+            max(toInspection.durationSeconds - incomingTrimDuration, 0)
+        )
+        let outgoingAnalysisDuration = min(
+            Double(boundary.requested.durationUS) / 1_000_000,
+            outgoingAnalysisAvailable
+        )
+        let incomingAnalysisDuration = min(
+            Double(boundary.requested.durationUS) / 1_000_000,
+            incomingAnalysisAvailable
+        )
+        let outgoingAnalysisStart = fromWindow.endSeconds
+        let incomingAnalysisStart = max(toWindow.startSeconds - incomingAnalysisDuration, 0)
 
         var inputs: [[String]] = [
             ["-i", fromClipRef.resolvedPath],
@@ -511,7 +1051,7 @@ public final class Renderer: @unchecked Sendable {
 
         var fromVideoMap = "fv0"
         if let fromOverlayURL {
-            inputs.append(["-loop", "1", "-framerate", format(profile.frameRate), "-i", fromOverlayURL.path])
+            inputs.append(["-loop", "1", "-framerate", format(profile.frameRate), "-t", format(durationSeconds), "-i", fromOverlayURL.path])
             let index = inputs.count - 1
             filterParts.append("[\(index):v]format=rgba[fov]")
             filterParts.append("[fv0][fov]overlay=0:0:format=auto[fv1]")
@@ -520,74 +1060,94 @@ public final class Renderer: @unchecked Sendable {
 
         var toVideoMap = "tv0"
         if let toOverlayURL {
-            inputs.append(["-loop", "1", "-framerate", format(profile.frameRate), "-i", toOverlayURL.path])
+            inputs.append(["-loop", "1", "-framerate", format(profile.frameRate), "-t", format(durationSeconds), "-i", toOverlayURL.path])
             let index = inputs.count - 1
             filterParts.append("[\(index):v]format=rgba[tov]")
             filterParts.append("[tv0][tov]overlay=0:0:format=auto[tv1]")
             toVideoMap = "tv1"
         }
 
-        filterParts.append("[\(fromVideoMap)][\(toVideoMap)]xfade=transition=fade:duration=\(format(duration)):offset=0[vout]")
+        filterParts.append("[\(fromVideoMap)][\(toVideoMap)]xfade=transition=fade:duration=\(format(durationSeconds)):offset=0[vout]")
 
-        switch boundary.audio.mode {
+        let requestedQuietDuration = Double(boundary.audio.quietWindowUS ?? 0) / 1_000_000
+        let outgoingQuietOffset = Double(boundary.audio.outgoingQuietWindowOffsetUS ?? -1) / 1_000_000
+        let incomingQuietOffset = Double(boundary.audio.incomingQuietWindowOffsetUS ?? -1) / 1_000_000
+        let quietWindowIsValid = requestedQuietDuration > 0
+            && outgoingQuietOffset >= 0
+            && incomingQuietOffset >= 0
+            && outgoingQuietOffset + requestedQuietDuration <= outgoingAnalysisDuration + 0.000001
+            && incomingQuietOffset + requestedQuietDuration <= incomingAnalysisDuration + 0.000001
+            && requestedQuietDuration <= durationSeconds / 2 + 0.000001
+        let requestedAudioMode = ["full_crossfade", "quiet_window_bridge", "silence_gap"].contains(boundary.audio.mode)
+            ? boundary.audio.mode
+            : "silence_gap"
+        let audioMode = requestedAudioMode == "quiet_window_bridge" && !quietWindowIsValid ? "silence_gap" : requestedAudioMode
+        switch audioMode {
         case "quiet_window_bridge":
-            let quietDuration = max(Double(boundary.audio.quietWindowUS ?? 0) / 1_000_000, min(duration / 2, 0.04))
-            let outgoingQuietOffset = Double(boundary.audio.outgoingQuietWindowOffsetUS ?? 0) / 1_000_000
-            let incomingQuietOffset = Double(boundary.audio.incomingQuietWindowOffsetUS ?? 0) / 1_000_000
-            let bridgeDelay = max(duration - quietDuration, 0)
+            let minimumQuietDuration = 1.0 / 48_000.0
+            let quietDuration = min(
+                max(requestedQuietDuration, minimumQuietDuration),
+                max(durationSeconds / 2, minimumQuietDuration)
+            )
+            let bridgeDelay = max(durationSeconds - quietDuration, 0)
 
             if fromInspection.hasAudio {
-                let fromAudio = "[0:a]\(baseAudioFilter(start: outgoingStart + outgoingQuietOffset, duration: quietDuration, loudnessMatch: fromNode.audio?.loudnessMatch ?? true, targetLUFS: fromNode.audio?.targetLUFS ?? -16, truePeak: fromNode.audio?.truePeakCeilingDBTP ?? -1)),afade=t=out:st=0:d=\(format(quietDuration)),apad=whole_dur=\(format(duration)),atrim=duration=\(format(duration))"
+                let fromAudio = "[0:a]\(baseAudioFilter(start: outgoingAnalysisStart + outgoingQuietOffset, duration: quietDuration, loudnessMatch: false, targetLUFS: fromNode.audio?.targetLUFS ?? -16, truePeak: fromNode.audio?.truePeakCeilingDBTP ?? -1)),volume=0.35,afade=t=out:st=0:d=\(format(quietDuration)),apad=whole_dur=\(format(durationSeconds)),atrim=duration=\(format(durationSeconds))"
                 filterParts.append("\(fromAudio)[fa0]")
             } else {
-                inputs.append(["-f", "lavfi", "-t", format(duration), "-i", "anullsrc=r=48000:cl=stereo"])
+                inputs.append(["-f", "lavfi", "-t", format(durationSeconds), "-i", "anullsrc=r=48000:cl=stereo"])
                 let index = inputs.count - 1
-                filterParts.append("[\(index):a]atrim=duration=\(format(duration)),asetpts=PTS-STARTPTS[fa0]")
+                filterParts.append("[\(index):a]atrim=duration=\(format(durationSeconds)),asetpts=PTS-STARTPTS[fa0]")
             }
 
             if toInspection.hasAudio {
-                let toAudio = "[1:a]\(baseAudioFilter(start: incomingStart + incomingQuietOffset, duration: quietDuration, loudnessMatch: toNode.audio?.loudnessMatch ?? true, targetLUFS: toNode.audio?.targetLUFS ?? -16, truePeak: toNode.audio?.truePeakCeilingDBTP ?? -1)),afade=t=in:st=0:d=\(format(quietDuration)),adelay=\(Int((bridgeDelay * 1000).rounded()))|\(Int((bridgeDelay * 1000).rounded())),apad=whole_dur=\(format(duration)),atrim=duration=\(format(duration))"
+                let toAudio = "[1:a]\(baseAudioFilter(start: incomingAnalysisStart + incomingQuietOffset, duration: quietDuration, loudnessMatch: false, targetLUFS: toNode.audio?.targetLUFS ?? -16, truePeak: toNode.audio?.truePeakCeilingDBTP ?? -1)),volume=0.35,afade=t=in:st=0:d=\(format(quietDuration)),adelay=\(Int((bridgeDelay * 1000).rounded()))|\(Int((bridgeDelay * 1000).rounded())),apad=whole_dur=\(format(durationSeconds)),atrim=duration=\(format(durationSeconds))"
                 filterParts.append("\(toAudio)[ta0]")
             } else {
-                inputs.append(["-f", "lavfi", "-t", format(duration), "-i", "anullsrc=r=48000:cl=stereo"])
+                inputs.append(["-f", "lavfi", "-t", format(durationSeconds), "-i", "anullsrc=r=48000:cl=stereo"])
                 let index = inputs.count - 1
-                filterParts.append("[\(index):a]atrim=duration=\(format(duration)),asetpts=PTS-STARTPTS[ta0]")
+                filterParts.append("[\(index):a]atrim=duration=\(format(durationSeconds)),asetpts=PTS-STARTPTS[ta0]")
             }
 
-            filterParts.append("[fa0][ta0]amix=inputs=2:normalize=0:duration=longest[aout]")
+            filterParts.append("[fa0][ta0]amix=inputs=2:normalize=0:duration=longest[aout_raw]")
         case "silence_gap":
-            inputs.append(["-f", "lavfi", "-t", format(duration), "-i", "anullsrc=r=48000:cl=stereo"])
+            inputs.append(["-f", "lavfi", "-t", format(durationSeconds), "-i", "anullsrc=r=48000:cl=stereo"])
             let silenceIndex = inputs.count - 1
-            filterParts.append("[\(silenceIndex):a]atrim=duration=\(format(duration)),asetpts=PTS-STARTPTS[aout]")
+            filterParts.append("[\(silenceIndex):a]atrim=duration=\(format(durationSeconds)),asetpts=PTS-STARTPTS[aout_raw]")
         default:
             if fromInspection.hasAudio {
-                var fromAudio = "[0:a]\(baseAudioFilter(start: outgoingStart, duration: outgoingTrimDuration, loudnessMatch: fromNode.audio?.loudnessMatch ?? true, targetLUFS: fromNode.audio?.targetLUFS ?? -16, truePeak: fromNode.audio?.truePeakCeilingDBTP ?? -1))"
+                var fromAudio = "[0:a]\(baseAudioFilter(start: outgoingStart, duration: outgoingTrimDuration, loudnessMatch: false, targetLUFS: fromNode.audio?.targetLUFS ?? -16, truePeak: fromNode.audio?.truePeakCeilingDBTP ?? -1))"
                 if outgoingMissing > 0 {
-                    fromAudio += ",apad=whole_dur=\(format(duration)),atrim=duration=\(format(duration))"
+                    fromAudio += ",apad=whole_dur=\(format(durationSeconds)),atrim=duration=\(format(durationSeconds))"
                 }
                 filterParts.append("\(fromAudio)[fa0]")
             } else {
-                inputs.append(["-f", "lavfi", "-t", format(duration), "-i", "anullsrc=r=48000:cl=stereo"])
+                inputs.append(["-f", "lavfi", "-t", format(durationSeconds), "-i", "anullsrc=r=48000:cl=stereo"])
                 let index = inputs.count - 1
-                filterParts.append("[\(index):a]atrim=duration=\(format(duration)),asetpts=PTS-STARTPTS[fa0]")
+                filterParts.append("[\(index):a]atrim=duration=\(format(durationSeconds)),asetpts=PTS-STARTPTS[fa0]")
             }
 
             if toInspection.hasAudio {
-                var toAudio = "[1:a]\(baseAudioFilter(start: incomingStart, duration: incomingTrimDuration, loudnessMatch: toNode.audio?.loudnessMatch ?? true, targetLUFS: toNode.audio?.targetLUFS ?? -16, truePeak: toNode.audio?.truePeakCeilingDBTP ?? -1))"
+                var toAudio = "[1:a]\(baseAudioFilter(start: incomingStart, duration: incomingTrimDuration, loudnessMatch: false, targetLUFS: toNode.audio?.targetLUFS ?? -16, truePeak: toNode.audio?.truePeakCeilingDBTP ?? -1))"
                 if incomingMissing > 0 {
                     let delayMS = Int((incomingMissing * 1000).rounded())
                     toAudio += ",adelay=\(delayMS)|\(delayMS)"
                 }
-                toAudio += ",apad=whole_dur=\(format(duration)),atrim=duration=\(format(duration))"
+                toAudio += ",apad=whole_dur=\(format(durationSeconds)),atrim=duration=\(format(durationSeconds))"
                 filterParts.append("\(toAudio)[ta0]")
             } else {
-                inputs.append(["-f", "lavfi", "-t", format(duration), "-i", "anullsrc=r=48000:cl=stereo"])
+                inputs.append(["-f", "lavfi", "-t", format(durationSeconds), "-i", "anullsrc=r=48000:cl=stereo"])
                 let index = inputs.count - 1
-                filterParts.append("[\(index):a]atrim=duration=\(format(duration)),asetpts=PTS-STARTPTS[ta0]")
+                filterParts.append("[\(index):a]atrim=duration=\(format(durationSeconds)),asetpts=PTS-STARTPTS[ta0]")
             }
 
-            filterParts.append("[fa0][ta0]acrossfade=d=\(format(duration)):c1=tri:c2=tri[aout]")
+            filterParts.append("[fa0][ta0]acrossfade=d=\(format(durationSeconds)):c1=tri:c2=tri[aout_raw]")
         }
+
+        // Normalize every transition output to the same sample clock as the
+        // video block. This also removes any short tail introduced by a
+        // fade/mix implementation before the segment is concatenated.
+        filterParts.append("[aout_raw]aresample=48000:async=0:first_pts=0,apad=whole_dur=\(format(durationSeconds)),atrim=duration=\(format(durationSeconds)),asetpts=PTS-STARTPTS[aout]")
 
         try runner.run(
             executableURL: binaries.ffmpegURL,
@@ -597,9 +1157,15 @@ public final class Renderer: @unchecked Sendable {
                 mapVideo: "[vout]",
                 mapAudio: "[aout]",
                 outputURL: outputURL,
-                profile: profile
+                videoEncoder: videoEncoder,
+                profile: profile,
+                videoFrameCount: duration.frameCount,
+                audioSampleCount: duration.audioSampleCount
             ),
-            commandLogURL: commandLogURL
+            commandLogURL: commandLogURL,
+            heartbeatInterval: heartbeat == nil ? nil : 5,
+            heartbeat: heartbeat,
+            timeout: segmentProcessTimeout
         )
     }
 
@@ -609,24 +1175,90 @@ public final class Renderer: @unchecked Sendable {
         mapVideo: String,
         mapAudio: String,
         outputURL: URL,
-        profile: ExportProfile
+        videoEncoder: PhaseOneVideoEncoder,
+        profile: ExportProfile,
+        videoFrameCount: Int,
+        audioSampleCount: Int
     ) -> [String] {
         var args = ["-hide_banner", "-loglevel", "error", "-nostdin", "-n"]
         for input in inputs {
             args.append(contentsOf: input)
         }
         args.append(contentsOf: [
-            "-filter_complex", filterComplex,
+            "-filter_complex", limitedAudioFilterGraph(filterComplex: filterComplex, mapAudio: mapAudio, sampleCount: audioSampleCount),
             "-map", mapVideo,
-            "-map", mapAudio,
-            "-c:v", "prores_ks",
-            "-profile:v", "3",
-            "-pix_fmt", "yuv422p10le",
-            "-vendor", "apl0",
+            "-map", "[audio_clock]"
+        ])
+        args.append(contentsOf: videoEncodingArguments(for: videoEncoder))
+        args.append(contentsOf: [
             "-c:a", "pcm_s16le",
             "-ar", "48000",
             "-ac", "2",
-            "-shortest",
+            "-fps_mode", "cfr",
+            "-frames:v", String(videoFrameCount),
+            "-colorspace", profile.colorMatrix,
+            "-color_primaries", profile.colorPrimaries,
+            "-color_trc", profile.colorTransfer,
+            outputURL.path
+        ])
+        return args
+    }
+
+    private func videoEncodingArguments(for encoder: PhaseOneVideoEncoder) -> [String] {
+        switch encoder {
+        case .hevcVideoToolbox:
+            // Hardware Main10 keeps the segment/chunk timeline compressed and
+            // avoids both the multi-gigabyte ProRes scratch path and the
+            // software x265 bottleneck. Disallow silent software fallback so
+            // an unavailable hardware encoder fails quickly and diagnostically.
+            return [
+                "-c:v", "hevc_videotoolbox",
+                "-allow_sw", "0",
+                "-profile:v", "main10",
+                "-pix_fmt", "p010le",
+                "-tag:v", "hvc1",
+                "-q:v", "70"
+            ]
+        case .libx265:
+            return [
+                "-c:v", "libx265",
+                "-preset", "faster",
+                "-crf", "18",
+                "-pix_fmt", "yuv420p10le",
+                "-tag:v", "hvc1",
+                "-x265-params", "repeat-headers=1:colorprim=bt2020:transfer=arib-std-b67:colormatrix=bt2020nc"
+            ]
+        }
+    }
+
+    private func chunkAssemblyArguments(
+        concatFileURL: URL,
+        outputURL: URL,
+        videoEncoder: PhaseOneVideoEncoder,
+        expectedFrameCount: Int,
+        expectedAudioSampleCount: Int,
+        profile: ExportProfile
+    ) -> [String] {
+        var args = [
+            "-hide_banner",
+            "-loglevel", "error",
+            "-nostdin",
+            "-n",
+            "-f", "concat",
+            "-safe", "0",
+            "-i", concatFileURL.path
+        ]
+        args.append(contentsOf: videoEncodingArguments(for: videoEncoder))
+        args.append(contentsOf: [
+            "-c:a", "pcm_s16le",
+            "-ar", "48000",
+            "-ac", "2",
+            "-af", audioSampleLimitFilter(sampleCount: expectedAudioSampleCount, resetPTS: true),
+            // Both streams are bounded on their native clocks. Since every
+            // input segment uses the same frame/sample grid, the concat
+            // demuxer cannot choose a different stream duration at a seam.
+            "-fps_mode", "cfr",
+            "-frames:v", String(expectedFrameCount),
             "-colorspace", profile.colorMatrix,
             "-color_primaries", profile.colorPrimaries,
             "-color_trc", profile.colorTransfer,
@@ -638,6 +1270,8 @@ public final class Renderer: @unchecked Sendable {
     private func finalAssemblyArguments(
         concatFileURL: URL,
         outputURL: URL,
+        expectedFrameCount: Int,
+        expectedAudioSampleCount: Int,
         profile: ExportProfile
     ) -> [String] {
         [
@@ -648,16 +1282,16 @@ public final class Renderer: @unchecked Sendable {
             "-f", "concat",
             "-safe", "0",
             "-i", concatFileURL.path,
-            "-c:v", "libx265",
-            "-preset", "faster",
-            "-crf", "18",
-            "-pix_fmt", "yuv420p10le",
+            "-map", "0:v:0",
+            "-map", "0:a:0",
+            "-c:v", "copy",
             "-tag:v", "hvc1",
-            "-x265-params", "repeat-headers=1:colorprim=bt2020:transfer=arib-std-b67:colormatrix=bt2020nc",
             "-c:a", "aac",
             "-b:a", "192k",
             "-ar", "48000",
             "-ac", "2",
+            "-af", audioSampleLimitFilter(sampleCount: expectedAudioSampleCount, resetPTS: true),
+            "-frames:v", String(expectedFrameCount),
             "-movflags", "+faststart",
             "-colorspace", profile.colorMatrix,
             "-color_primaries", profile.colorPrimaries,
@@ -666,16 +1300,32 @@ public final class Renderer: @unchecked Sendable {
         ]
     }
 
+    private func limitedAudioFilterGraph(filterComplex: String, mapAudio: String, sampleCount: Int) -> String {
+        let separator = filterComplex.hasSuffix(";") ? "" : ";"
+        return filterComplex + separator + "\(mapAudio)\(audioSampleLimitFilter(sampleCount: sampleCount, resetPTS: true))[audio_clock]"
+    }
+
+    private func audioSampleLimitFilter(sampleCount: Int, resetPTS: Bool) -> String {
+        let ptsFilter = resetPTS ? ",asetpts=N/SR/TB" : ""
+        return "aresample=48000:async=0:first_pts=0,atrim=end_sample=\(sampleCount)\(ptsFilter)"
+    }
+
     private func baseAudioFilter(start: Double, duration: Double, loudnessMatch: Bool, targetLUFS: Double, truePeak: Double) -> String {
         var parts = [
             "atrim=start=\(format(start)):duration=\(format(duration))",
             "asetpts=PTS-STARTPTS",
-            "aresample=48000",
+            "aresample=48000:async=0:first_pts=0",
             "aformat=sample_fmts=fltp:channel_layouts=stereo"
         ]
         if loudnessMatch {
             parts.append("loudnorm=I=\(format(targetLUFS)):TP=\(format(truePeak)):LRA=11:linear=true")
+            // loudnorm may process at 192 kHz. Return to the render clock
+            // before any sample-count limit is applied downstream.
+            parts.append("aresample=48000:async=0:first_pts=0")
         }
+        parts.append("apad=whole_dur=\(format(duration))")
+        parts.append("atrim=duration=\(format(duration))")
+        parts.append("asetpts=PTS-STARTPTS")
         return parts.joined(separator: ",")
     }
 
@@ -716,22 +1366,67 @@ public final class Renderer: @unchecked Sendable {
         let tempBase = FileManager.default.temporaryDirectory
             .appendingPathComponent("YearlyInterviewStudio-Render-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: tempBase, withIntermediateDirectories: true)
+        let marker = RenderWorkspaceMarker(
+            schemaVersion: 1,
+            application: "InterviewStudio",
+            createdAt: Date(),
+            ownerProcessID: ProcessInfo.processInfo.processIdentifier
+        )
+        let markerData = try JSONEncoder().encode(marker)
+        try markerData.write(to: tempBase.appendingPathComponent(".render-workspace"), options: .atomic)
         let persistentBase = baseURL ?? FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Application Support/Yearly Interview Studio/Diagnostics", isDirectory: true)
         let workURL = tempBase.appendingPathComponent("work", isDirectory: true)
         let assetsURL = workURL.appendingPathComponent("assets", isDirectory: true)
         let segmentsURL = workURL.appendingPathComponent("segments", isDirectory: true)
+        let chunksURL = workURL.appendingPathComponent("chunks", isDirectory: true)
         try FileManager.default.createDirectory(at: assetsURL, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: segmentsURL, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: chunksURL, withIntermediateDirectories: true)
         return RenderWorkspace(
             tempRootURL: tempBase,
             persistentBaseURL: persistentBase,
             workURL: workURL,
             assetsURL: assetsURL,
             segmentsURL: segmentsURL,
+            chunksURL: chunksURL,
             commandLogURL: tempBase.appendingPathComponent("ffmpeg_commands.txt"),
             concatFileURL: tempBase.appendingPathComponent("concat.txt")
         )
+    }
+
+    private func pruneStaleRenderWorkspaces() throws {
+        let root = FileManager.default.temporaryDirectory.standardizedFileURL
+        let entries = try FileManager.default.contentsOfDirectory(
+            at: root,
+            includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
+            options: [.skipsHiddenFiles]
+        )
+        let cutoff = Date().addingTimeInterval(-24 * 60 * 60)
+        for entry in entries {
+            guard entry.deletingLastPathComponent().standardizedFileURL == root,
+                  entry.lastPathComponent.hasPrefix("YearlyInterviewStudio-Render-") else {
+                continue
+            }
+            let values = try entry.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+            guard values.isDirectory == true, values.isSymbolicLink != true else { continue }
+
+            let markerURL = entry.appendingPathComponent(".render-workspace")
+            guard let markerData = try? Data(contentsOf: markerURL),
+                  let marker = try? JSONDecoder().decode(RenderWorkspaceMarker.self, from: markerData),
+                  marker.schemaVersion == 1,
+                  marker.application == "InterviewStudio",
+                  marker.createdAt < cutoff else {
+                continue
+            }
+
+            #if os(macOS)
+            // A live owner is allowed to keep its workspace even if the
+            // machine clock or a long-running operation makes it look old.
+            if kill(marker.ownerProcessID, 0) == 0 { continue }
+            #endif
+            try? FileManager.default.removeItem(at: entry)
+        }
     }
 
     private func diagnosticPlanData(_ plan: RenderPlan) throws -> Data {
@@ -757,11 +1452,26 @@ public final class Renderer: @unchecked Sendable {
         try FileManager.default.moveItem(at: stagedURL, to: outputURL)
     }
 
-    private func persistDiagnostics(from workspace: RenderWorkspace) throws -> URL {
+    private func persistDiagnostics(from workspace: RenderWorkspace, failure: RenderFailureReport?) throws -> URL {
         let destination = try makeDiagnosticsDirectory(baseURL: workspace.persistentBaseURL)
-        let contents = try FileManager.default.contentsOfDirectory(at: workspace.tempRootURL, includingPropertiesForKeys: nil)
-        for item in contents {
-            try FileManager.default.copyItem(at: item, to: destination.appendingPathComponent(item.lastPathComponent, isDirectory: true))
+        // Keep failure evidence small and durable. The workspace can contain
+        // tens of gigabytes of ProRes segments and generated graphics; those
+        // are rebuildable intermediates, not diagnostics.
+        let retainedFiles = [
+            workspace.tempRootURL.appendingPathComponent("render_plan.json"),
+            workspace.commandLogURL
+        ]
+        for sourceURL in retainedFiles where FileManager.default.fileExists(atPath: sourceURL.path) {
+            try FileManager.default.copyItem(at: sourceURL, to: destination.appendingPathComponent(sourceURL.lastPathComponent))
+        }
+        if let failure {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+            encoder.dateEncodingStrategy = .iso8601
+            try encoder.encode(failure).write(
+                to: destination.appendingPathComponent("render_failure.json"),
+                options: .atomic
+            )
         }
         return destination
     }
@@ -802,7 +1512,8 @@ public final class Renderer: @unchecked Sendable {
         masterOutputURL: URL,
         workspace: RenderWorkspace,
         binaries: FFmpegBinarySet,
-        stagedOutputURLs: inout [URL]
+        stagedOutputURLs: inout [URL],
+        heartbeat: RenderProcessHeartbeat?
     ) throws -> URL {
         let chapterURL = workspace.tempRootURL.appendingPathComponent("plex_chapters.ffmeta")
         try Data(ffmetadataText(for: plexMetadata.chapters).utf8).write(to: chapterURL)
@@ -819,7 +1530,10 @@ public final class Renderer: @unchecked Sendable {
                 chapterMetadataURL: chapterURL,
                 outputURL: stagedURL
             ),
-            commandLogURL: workspace.commandLogURL
+            commandLogURL: workspace.commandLogURL,
+            heartbeatInterval: heartbeat == nil ? nil : 5,
+            heartbeat: heartbeat,
+            timeout: plexProcessTimeout
         )
         let inspection = try inspector.inspect(url: stagedURL, using: binaries)
         try outputValidator.validate(inspection, against: plan.exportProfile, expectedDurationSeconds: nil)
@@ -936,8 +1650,93 @@ private struct RenderWorkspace {
     let workURL: URL
     let assetsURL: URL
     let segmentsURL: URL
+    let chunksURL: URL
     let commandLogURL: URL
     let concatFileURL: URL
+}
+
+struct RenderChunkingPolicy: Sendable {
+    let targetDurationSeconds: Double
+
+    init(targetDurationSeconds: Double) {
+        self.targetDurationSeconds = max(targetDurationSeconds, 0.01)
+    }
+
+    func shouldStartNewChunk(currentDuration: Double, nextGroupDuration: Double) -> Bool {
+        currentDuration > 0 && currentDuration + nextGroupDuration > targetDurationSeconds
+    }
+}
+
+private struct RenderChunk {
+    var segmentURLs: [URL] = []
+    let frameRate: Double
+    var frameCount: Int = 0
+    var audioSampleCount: Int = 0
+
+    init(frameRate: Double) {
+        self.frameRate = frameRate
+    }
+
+    var durationSeconds: Double {
+        Double(frameCount) / frameRate
+    }
+
+    mutating func append(segmentURL: URL, duration: RenderBlockDuration) {
+        precondition(duration.frameRate == frameRate)
+        segmentURLs.append(segmentURL)
+        frameCount += duration.frameCount
+        audioSampleCount += duration.audioSampleCount
+    }
+}
+
+struct ChunkStreamSignature: Equatable {
+    let width: Int
+    let height: Int
+    let frameRate: Double
+    let pixFmt: String?
+    let colorSpace: String?
+    let colorTransfer: String?
+    let colorPrimaries: String?
+    let hasAudio: Bool
+    let audioChannels: Int
+    let codecName: String?
+    let formatName: String?
+    let videoProfile: String?
+    let videoLevel: Int?
+    let videoCodecTag: String?
+    let videoTimeBase: String?
+    let sampleAspectRatio: String?
+    let audioCodecName: String?
+    let audioSampleRate: Int?
+    let audioSampleFormat: String?
+    let audioChannelLayout: String?
+    let audioTimeBase: String?
+    let streamCount: Int
+
+    init(inspection: MediaInspectionResult) {
+        width = inspection.width
+        height = inspection.height
+        frameRate = inspection.frameRate
+        pixFmt = inspection.pixFmt
+        colorSpace = inspection.colorSpace
+        colorTransfer = inspection.colorTransfer
+        colorPrimaries = inspection.colorPrimaries
+        hasAudio = inspection.hasAudio
+        audioChannels = inspection.audioChannels
+        codecName = inspection.codecName
+        formatName = inspection.formatName
+        videoProfile = inspection.videoProfile
+        videoLevel = inspection.videoLevel
+        videoCodecTag = inspection.videoCodecTag
+        videoTimeBase = inspection.videoTimeBase
+        sampleAspectRatio = inspection.sampleAspectRatio
+        audioCodecName = inspection.audioCodecName
+        audioSampleRate = inspection.audioSampleRate
+        audioSampleFormat = inspection.audioSampleFormat
+        audioChannelLayout = inspection.audioChannelLayout
+        audioTimeBase = inspection.audioTimeBase
+        streamCount = inspection.streamCount
+    }
 }
 
 private extension JSONEncoder {

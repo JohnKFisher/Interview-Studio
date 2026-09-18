@@ -1,4 +1,5 @@
 import AVFoundation
+import Darwin
 import Foundation
 
 public enum NativePublishingError: LocalizedError, Sendable {
@@ -10,6 +11,8 @@ public enum NativePublishingError: LocalizedError, Sendable {
     case outputAlreadyExists(URL)
     case outputProfileMismatch(String)
     case manifestBlocked(String)
+    case derivedBuildInProgress
+    case derivedBuildLockFailed(String)
 
     public var errorDescription: String? {
         switch self {
@@ -20,7 +23,9 @@ public enum NativePublishingError: LocalizedError, Sendable {
         case .exportFailed(let message): return "Native answer export failed: \(message)"
         case .outputAlreadyExists(let url): return "The answer output already exists and was not overwritten: \(url.path)"
         case .outputProfileMismatch(let message): return "Native answer output did not meet the protected publication profile: \(message)"
-        case .manifestBlocked(let message): return "The generated manifest is blocked: \(message)"
+        case .manifestBlocked(let message): return "Publication is blocked: \(message)"
+        case .derivedBuildInProgress: return "A derived publication is already in progress for this project."
+        case .derivedBuildLockFailed(let message): return "Could not reserve the derived publication workspace: \(message)"
         }
     }
 }
@@ -65,10 +70,13 @@ public struct NativeAnswerPublisher: Sendable {
               let sourceAudio = try await asset.loadTracks(withMediaType: .audio).first else {
             throw NativePublishingError.sourceMissing(sourceURL.path)
         }
+        let naturalSize = try await sourceVideo.load(.naturalSize)
+        let preferredTransform = try await sourceVideo.load(.preferredTransform)
         let start = CMTime(value: boundaries.safeLeadingStart.value, timescale: boundaries.safeLeadingStart.timescale)
         let end = CMTime(value: boundaries.safeTrailingEnd.value, timescale: boundaries.safeTrailingEnd.timescale)
         let duration = CMTimeSubtract(end, start)
         guard duration.isNumeric, duration > .zero else { throw NativePublishingError.exportFailed("The selected range is empty.") }
+        let renderTransform = try compositionTransform(for: naturalSize, preferredTransform: preferredTransform)
 
         let composition = AVMutableComposition()
         guard let videoTrack = composition.addMutableTrack(withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid),
@@ -82,6 +90,17 @@ public struct NativeAnswerPublisher: Sendable {
         } catch {
             throw NativePublishingError.exportFailed(error.localizedDescription)
         }
+        videoTrack.preferredTransform = .identity
+
+        let instruction = AVMutableVideoCompositionInstruction()
+        instruction.timeRange = CMTimeRange(start: .zero, duration: duration)
+        let layer = AVMutableVideoCompositionLayerInstruction(assetTrack: videoTrack)
+        layer.setTransform(renderTransform, at: .zero)
+        instruction.layerInstructions = [layer]
+        let videoComposition = AVMutableVideoComposition()
+        videoComposition.renderSize = CGSize(width: recipe.width, height: recipe.height)
+        videoComposition.frameDuration = CMTime(value: 1, timescale: CMTimeScale(recipe.frameRate))
+        videoComposition.instructions = [instruction]
 
         try FileManager.default.createDirectory(at: outputURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         let preset = AVAssetExportPresetHEVC3840x2160
@@ -96,6 +115,7 @@ public struct NativeAnswerPublisher: Sendable {
             }
         }
         exporter.shouldOptimizeForNetworkUse = false
+        exporter.videoComposition = videoComposition
         do {
             try await exporter.export(to: stagedURL, as: .mov)
         } catch {
@@ -274,7 +294,7 @@ public struct NativeAnswerPublisher: Sendable {
         return inspection
     }
 
-    private func compositionTransform(for naturalSize: CGSize, preferredTransform: CGAffineTransform) throws -> CGAffineTransform {
+    internal func compositionTransform(for naturalSize: CGSize, preferredTransform: CGAffineTransform) throws -> CGAffineTransform {
         let naturalRect = CGRect(origin: .zero, size: naturalSize)
         let orientedRect = naturalRect.applying(preferredTransform)
         let orientedWidth = abs(orientedRect.width)
@@ -285,16 +305,16 @@ public struct NativeAnswerPublisher: Sendable {
         let scale = min(CGFloat(recipe.width) / orientedWidth, CGFloat(recipe.height) / orientedHeight)
         let renderedWidth = orientedWidth * scale
         let renderedHeight = orientedHeight * scale
-        let translation = CGAffineTransform(
-            translationX: (CGFloat(recipe.width) - renderedWidth) / 2 - orientedRect.minX * scale,
-            y: (CGFloat(recipe.height) - renderedHeight) / 2 - orientedRect.minY * scale
+        let centering = CGAffineTransform(
+            translationX: (CGFloat(recipe.width) - renderedWidth) / 2,
+            y: (CGFloat(recipe.height) - renderedHeight) / 2
         )
         let scaling = CGAffineTransform(scaleX: scale, y: scale)
         let normalization = CGAffineTransform(translationX: -orientedRect.minX, y: -orientedRect.minY)
-        return translation
-            .concatenating(scaling)
+        return preferredTransform
             .concatenating(normalization)
-            .concatenating(preferredTransform)
+            .concatenating(scaling)
+            .concatenating(centering)
     }
 
     private func refinedFallback(for markers: RawAnswerMarkers) -> RefinedBoundaries? {
@@ -363,18 +383,199 @@ private struct PublicationFingerprintInput: Codable, Sendable {
     let recipe: PublicationRecipe
 }
 
+/// A cross-process lease for one project's derived publication cache.
+/// The descriptor-backed lock is released by the kernel if the owner exits.
+public final class DerivedBuildLease: @unchecked Sendable {
+    private let stateLock = NSLock()
+    private var fileDescriptor: Int32?
+
+    fileprivate init(fileDescriptor: Int32) {
+        self.fileDescriptor = fileDescriptor
+    }
+
+    public func release() {
+        stateLock.lock()
+        guard let fileDescriptor else {
+            stateLock.unlock()
+            return
+        }
+        self.fileDescriptor = nil
+        stateLock.unlock()
+        _ = flock(fileDescriptor, LOCK_UN)
+        _ = Darwin.close(fileDescriptor)
+    }
+
+    deinit { release() }
+}
+
 public struct ManifestPublicationBuilder: Sendable {
     public let answerPublisher: NativeAnswerPublisher
 
+    /// Timing fields for a published answer are relative to the generated
+    /// output file, not to the source recording. Legacy publication exports a
+    /// source range into a new file whose timeline starts at zero.
+    internal struct PublishedOutputTiming: Equatable, Sendable {
+        let requestedHandleBeforeUS: Int64
+        let requestedHandleAfterUS: Int64
+        let actualHandleBeforeUS: Int64
+        let actualHandleAfterUS: Int64
+        let realMediaStartUS: Int64
+        let realMediaEndUS: Int64
+        let answerStartUS: Int64
+        let answerEndUS: Int64
+    }
+
     public init(answerPublisher: NativeAnswerPublisher = .init()) {
         self.answerPublisher = answerPublisher
+    }
+
+    /// Converts source-relative legacy markers to the zero-based timeline of
+    /// the native answer export. The export contains the complete safe range,
+    /// so all of that output is real media and the visible answer is offset by
+    /// the exported range's source start.
+    internal static func legacyPublishedOutputTiming(
+        boundaries: RefinedBoundaries?,
+        rawMarkers: RawAnswerMarkers,
+        outputDurationUS: Int64
+    ) -> PublishedOutputTiming {
+        let durationUS = max(0, outputDurationUS)
+        let exportedSourceStartUS = boundaries?.safeLeadingStart.microseconds
+            ?? rawMarkers.answerStart?.microseconds
+            ?? 0
+        let sourceVisibleStartUS = boundaries?.visibleStart.microseconds
+            ?? rawMarkers.answerStart?.microseconds
+            ?? exportedSourceStartUS
+        let sourceVisibleEndUS = boundaries?.visibleEnd.microseconds
+            ?? rawMarkers.answerEnd?.microseconds
+            ?? boundaries?.safeTrailingEnd.microseconds
+            ?? (exportedSourceStartUS + durationUS)
+
+        let answerStartUS = min(durationUS, max(0, sourceVisibleStartUS - exportedSourceStartUS))
+        let answerEndUS = min(durationUS, max(answerStartUS, sourceVisibleEndUS - exportedSourceStartUS))
+        return PublishedOutputTiming(
+            requestedHandleBeforeUS: answerStartUS,
+            requestedHandleAfterUS: max(0, durationUS - answerEndUS),
+            actualHandleBeforeUS: answerStartUS,
+            actualHandleAfterUS: max(0, durationUS - answerEndUS),
+            realMediaStartUS: 0,
+            realMediaEndUS: durationUS,
+            answerStartUS: answerStartUS,
+            answerEndUS: answerEndUS
+        )
+    }
+
+    /// Reserves the current project's canonical derived cache until the
+    /// caller finishes consuming its publication build.
+    public static func acquireDerivedBuildLease(at buildRoot: URL, for projectID: UUID) throws -> DerivedBuildLease {
+        guard let normalizedRoot = canonicalDerivedBuildRoot(buildRoot) else {
+            throw NativePublishingError.derivedBuildLockFailed("The derived build root is not a canonical Interview Studio cache root.")
+        }
+        let projectRoot = normalizedRoot.appendingPathComponent(projectID.uuidString, isDirectory: true)
+        if let values = try? projectRoot.resourceValues(forKeys: [.isSymbolicLinkKey]), values.isSymbolicLink == true {
+            throw NativePublishingError.derivedBuildLockFailed("The project cache directory is a symbolic link.")
+        }
+        try FileManager.default.createDirectory(at: projectRoot, withIntermediateDirectories: true)
+        guard canonicalDerivedBuildRoot(buildRoot) != nil else {
+            throw NativePublishingError.derivedBuildLockFailed("The derived build root became a symbolic link.")
+        }
+        guard !pathContainsSymbolicLink(from: projectRoot, through: normalizedRoot) else {
+            throw NativePublishingError.derivedBuildLockFailed("The project cache path contains a symbolic link.")
+        }
+        let lockURL = projectRoot.appendingPathComponent(".publication.lock")
+        let fileDescriptor = Darwin.open(lockURL.path, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR)
+        guard fileDescriptor >= 0 else {
+            throw NativePublishingError.derivedBuildLockFailed(String(cString: strerror(errno)))
+        }
+        guard flock(fileDescriptor, LOCK_EX | LOCK_NB) == 0 else {
+            let lockError = errno
+            _ = Darwin.close(fileDescriptor)
+            if lockError == EACCES || lockError == EAGAIN || lockError == EWOULDBLOCK {
+                throw NativePublishingError.derivedBuildInProgress
+            }
+            throw NativePublishingError.derivedBuildLockFailed(String(cString: strerror(lockError)))
+        }
+        return DerivedBuildLease(fileDescriptor: fileDescriptor)
+    }
+
+    /// Removes a derived publication directory after its consumer no longer
+    /// needs the generated answer clips. The caller must provide the canonical
+    /// cache root and project ID so UUID-shaped paths outside that exact
+    /// ownership boundary are never removed.
+    public static func cleanupDerivedBuild(at buildURL: URL, in buildRoot: URL, for projectID: UUID) throws {
+        guard let normalizedRoot = canonicalDerivedBuildRoot(buildRoot) else { return }
+        try cleanupBuildDirectory(at: buildURL, under: normalizedRoot, for: projectID)
+    }
+
+    /// Removes stale derived publications for one project before a new build.
+    /// Import staging lives elsewhere and is intentionally not touched.
+    public static func pruneDerivedBuilds(at buildRoot: URL, for projectID: UUID) throws {
+        guard let normalizedRoot = canonicalDerivedBuildRoot(buildRoot) else { return }
+        let projectRoot = normalizedRoot.appendingPathComponent(projectID.uuidString, isDirectory: true).standardizedFileURL
+        guard FileManager.default.fileExists(atPath: projectRoot.path) else { return }
+        guard !pathContainsSymbolicLink(from: projectRoot, through: normalizedRoot) else { return }
+        let values = try projectRoot.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+        guard values.isDirectory == true, values.isSymbolicLink != true else { return }
+        let entries = try FileManager.default.contentsOfDirectory(at: projectRoot, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])
+        for entry in entries where UUID(uuidString: entry.lastPathComponent) != nil {
+            try cleanupBuildDirectory(at: entry, under: normalizedRoot, for: projectID)
+        }
+    }
+
+    static func canonicalDerivedBuildRoot(_ buildRoot: URL, cachesDirectory overrideCachesDirectory: URL? = nil) -> URL? {
+        let normalizedRoot = buildRoot.standardizedFileURL
+        guard ["Generated", "FinalRenders"].contains(normalizedRoot.lastPathComponent) else { return nil }
+        guard let cachesRoot = overrideCachesDirectory?.standardizedFileURL
+                ?? FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first?.standardizedFileURL else { return nil }
+        let expectedRoot = cachesRoot
+            .appendingPathComponent("YearlyInterviewStudio", isDirectory: true)
+            .appendingPathComponent(normalizedRoot.lastPathComponent, isDirectory: true)
+            .standardizedFileURL
+        guard normalizedRoot == expectedRoot else { return nil }
+        return pathContainsSymbolicLink(from: normalizedRoot, through: cachesRoot) ? nil : normalizedRoot
+    }
+
+    private static func pathContainsSymbolicLink(from path: URL, through ancestor: URL) -> Bool {
+        let normalizedPath = path.standardizedFileURL
+        let normalizedAncestor = ancestor.standardizedFileURL
+        guard normalizedPath == normalizedAncestor || normalizedPath.path.hasPrefix(normalizedAncestor.path + "/") else {
+            return true
+        }
+
+        var current = normalizedPath
+        while true {
+            if let values = try? current.resourceValues(forKeys: [.isSymbolicLinkKey]), values.isSymbolicLink == true {
+                return true
+            }
+            if current == normalizedAncestor { return false }
+            let parent = current.deletingLastPathComponent()
+            guard parent != current else { return true }
+            current = parent
+        }
+    }
+
+    private static func cleanupBuildDirectory(at buildURL: URL, under buildRoot: URL, for projectID: UUID) throws {
+        let normalizedRoot = buildRoot.standardizedFileURL
+        let expectedProjectRoot = normalizedRoot
+            .appendingPathComponent(projectID.uuidString, isDirectory: true)
+            .standardizedFileURL
+        let normalizedURL = buildURL.standardizedFileURL
+        guard normalizedURL.deletingLastPathComponent() == expectedProjectRoot,
+              UUID(uuidString: normalizedURL.lastPathComponent) != nil else {
+            return
+        }
+        guard !pathContainsSymbolicLink(from: expectedProjectRoot, through: normalizedRoot) else { return }
+        guard FileManager.default.fileExists(atPath: normalizedURL.path) else { return }
+        let values = try normalizedURL.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+        guard values.isDirectory == true, values.isSymbolicLink != true else { return }
+        try FileManager.default.removeItem(at: normalizedURL)
     }
 
     public func build(
         project: InterviewStudioProject,
         session: InterviewSession,
         store: InterviewStudioPackageStore,
-        buildRoot: URL
+        buildRoot: URL,
+        progress: (@Sendable (String) -> Void)? = nil
     ) async throws -> PublicationBuildResult {
         try await build(
             project: project,
@@ -382,7 +583,8 @@ public struct ManifestPublicationBuilder: Sendable {
             store: store,
             buildRoot: buildRoot,
             publicationSessionID: session.id,
-            publicationRevision: session.revision
+            publicationRevision: session.revision,
+            progress: progress
         )
     }
 
@@ -390,7 +592,8 @@ public struct ManifestPublicationBuilder: Sendable {
         project: InterviewStudioProject,
         sessions: [InterviewSession],
         store: InterviewStudioPackageStore,
-        buildRoot: URL
+        buildRoot: URL,
+        progress: (@Sendable (String) -> Void)? = nil
     ) async throws -> PublicationBuildResult {
         let orderedSessions = sessions.filter(\.isActive).sorted {
             let left = ($0.ageSortValue ?? .greatestFiniteMagnitude, $0.id.uuidString)
@@ -406,7 +609,8 @@ public struct ManifestPublicationBuilder: Sendable {
             store: store,
             buildRoot: buildRoot,
             publicationSessionID: firstSession.id,
-            publicationRevision: orderedSessions.map(\.revision).max() ?? firstSession.revision
+            publicationRevision: orderedSessions.map(\.revision).max() ?? firstSession.revision,
+            progress: progress
         )
     }
 
@@ -416,7 +620,8 @@ public struct ManifestPublicationBuilder: Sendable {
         store: InterviewStudioPackageStore,
         buildRoot: URL,
         publicationSessionID: UUID,
-        publicationRevision: Int
+        publicationRevision: Int,
+        progress: (@Sendable (String) -> Void)? = nil
     ) async throws -> PublicationBuildResult {
         guard !sessions.isEmpty else { throw NativePublishingError.manifestBlocked("No interview years are available for publication.") }
         guard sessions.allSatisfy({ $0.isActive && ($0.lifecycle == .open || $0.lifecycle == .locked) && $0.compatibility.isWritable }) else {
@@ -426,16 +631,35 @@ public struct ManifestPublicationBuilder: Sendable {
         let fingerprint = sha256(data: try JSONEncoder.interviewStudio.encode(fingerprintInput))
         let publicationID = UUID()
         let root = buildRoot.appendingPathComponent(project.projectID.uuidString, isDirectory: true).appendingPathComponent(publicationID.uuidString, isDirectory: true)
+        var buildCompleted = false
+        defer {
+            if !buildCompleted {
+                try? Self.cleanupBuildDirectory(at: root, under: buildRoot, for: project.projectID)
+            }
+        }
         let answersRoot = root.appendingPathComponent("Answers", isDirectory: true)
         try FileManager.default.createDirectory(at: answersRoot, withIntermediateDirectories: true)
 
+        let answerCount = sessions.reduce(0) { count, session in
+            count + project.activeQuestions.filter { session.answers[$0.questionKey]?.state == .complete }.count
+        }
+        if answerCount == 0 {
+            progress?("No answer clips need preparation; building the render plan…")
+        } else {
+            progress?("Preparing 0 of \(answerCount) answer clips…")
+        }
+
         var rows: [ManifestRow] = []
         var clipNumber = 1
+        var preparedAnswerCount = 0
         for session in sessions {
+            let displayAgeLabel = RecordingFirstWorkflow.displayAgeLabel(for: session)
             for (questionIndex, question) in project.activeQuestions.enumerated() {
                 guard let answer = session.answers[question.questionKey] else { continue }
                 if answer.state == .skipped { continue }
-                guard answer.state == .complete else { throw NativePublishingError.manifestBlocked("Question \(question.questionKey) for \(session.ageLabel) is \(answer.state.rawValue).") }
+                guard answer.state == .complete else { throw NativePublishingError.manifestBlocked("Question \(question.questionKey) for \(displayAgeLabel) is \(answer.state.rawValue).") }
+                let answerOrdinal = preparedAnswerCount + 1
+                progress?("Preparing \(answerOrdinal) of \(answerCount): \(displayAgeLabel) · \(question.displayText)…")
                 let recording: SourceRecording
                 let boundaries: RefinedBoundaries?
         let rawMarkers: RawAnswerMarkers
@@ -445,7 +669,7 @@ public struct ManifestPublicationBuilder: Sendable {
         if session.workflowKind == .recordingFirstV1 {
                     guard let candidateID = answer.assignedCandidateID,
                           let candidate = session.candidates.first(where: { $0.id == candidateID }) else {
-                        throw NativePublishingError.manifestBlocked("Question \(question.questionKey) for \(session.ageLabel) has no assigned answer candidate.")
+                        throw NativePublishingError.manifestBlocked("Question \(question.questionKey) for \(displayAgeLabel) has no assigned answer candidate.")
                     }
                     guard candidate.reviewState == .approved else {
                         throw NativePublishingError.manifestBlocked("\(candidate.label) must be approved before publication.")
@@ -505,13 +729,28 @@ public struct ManifestPublicationBuilder: Sendable {
                     let timeline = RecordingFirstWorkflow.publicationTimeline(for: $0)
                     return timeline.visibleOutputRange(for: $0)
                 }
-                let outputVisibleStartUS = candidateOutputRange?.start.microseconds
-                let outputVisibleEndUS = candidateOutputRange?.end.microseconds
+                let outputTiming: PublishedOutputTiming
+                if let candidateOutputRange {
+                    let outputVisibleStartUS = candidateOutputRange.start.microseconds
+                    let outputVisibleEndUS = candidateOutputRange.end.microseconds
+                    outputTiming = PublishedOutputTiming(
+                        requestedHandleBeforeUS: max(0, outputVisibleStartUS),
+                        requestedHandleAfterUS: max(0, duration - outputVisibleEndUS),
+                        actualHandleBeforeUS: max(0, outputVisibleStartUS),
+                        actualHandleAfterUS: max(0, duration - outputVisibleEndUS),
+                        realMediaStartUS: 0,
+                        realMediaEndUS: duration,
+                        answerStartUS: outputVisibleStartUS,
+                        answerEndUS: outputVisibleEndUS
+                    )
+                } else {
+                    outputTiming = Self.legacyPublishedOutputTiming(
+                        boundaries: boundaries,
+                        rawMarkers: rawMarkers,
+                        outputDurationUS: duration
+                    )
+                }
                 let sourceDurationUS = recording.mediaSignature.durationMicroseconds ?? sourceSegments.map(\.end.microseconds).max() ?? 0
-                let requestedHandleBeforeUS = outputVisibleStartUS.map { max(0, $0) } ?? boundaries.map { max(0, $0.visibleStart.microseconds - $0.safeLeadingStart.microseconds) } ?? 0
-                let requestedHandleAfterUS = outputVisibleEndUS.map { max(0, duration - $0) } ?? boundaries.map { max(0, $0.safeTrailingEnd.microseconds - $0.visibleEnd.microseconds) } ?? 0
-                let actualHandleBeforeUS = outputVisibleStartUS.map { max(0, $0) } ?? boundaries.map { max(0, $0.visibleStart.microseconds - $0.safeLeadingStart.microseconds) } ?? 0
-                let actualHandleAfterUS = outputVisibleEndUS.map { max(0, duration - $0) } ?? boundaries.map { max(0, $0.safeTrailingEnd.microseconds - $0.visibleEnd.microseconds) } ?? 0
                 let row = ManifestRow(
                     clipNumber: String(clipNumber),
                     sequenceIndex: questionIndex,
@@ -520,7 +759,7 @@ public struct ManifestPublicationBuilder: Sendable {
                     question: question.displayText,
                     questionKey: question.questionKey,
                     questionOriginalIndex: question.order,
-                    age: session.ageLabel,
+                    age: displayAgeLabel,
                     ageRawText: session.ageLabel,
                     ageKey: session.ageKey,
                     ageYears: session.ageSortValue,
@@ -533,16 +772,16 @@ public struct ManifestPublicationBuilder: Sendable {
                     sourceIsDolby: (recording.mediaSignature.colorTransfer ?? "").localizedCaseInsensitiveContains("2084"),
                     hdrDolbyValidation: "pending_owner_validation",
                     outputVideoSignature: outputSignature,
-                    requestedHandleBeforeUS: requestedHandleBeforeUS,
-                    requestedHandleAfterUS: requestedHandleAfterUS,
-                    actualHandleBeforeUS: actualHandleBeforeUS,
-                    actualHandleAfterUS: actualHandleAfterUS,
+                    requestedHandleBeforeUS: outputTiming.requestedHandleBeforeUS,
+                    requestedHandleAfterUS: outputTiming.requestedHandleAfterUS,
+                    actualHandleBeforeUS: outputTiming.actualHandleBeforeUS,
+                    actualHandleAfterUS: outputTiming.actualHandleAfterUS,
                     handleBeforeStatus: "derived_from_validated_export_range",
                     handleAfterStatus: "derived_from_validated_export_range",
-                    realMediaStartInOutputUS: recordingFirstCandidate == nil ? boundaries?.visibleStart.microseconds ?? 0 : 0,
-                    realMediaEndInOutputUS: recordingFirstCandidate == nil ? boundaries?.visibleEnd.microseconds ?? duration : duration,
-                    answerStartInOutputUS: outputVisibleStartUS ?? boundaries?.visibleStart.microseconds ?? 0,
-                    answerEndInOutputUS: outputVisibleEndUS ?? boundaries?.visibleEnd.microseconds ?? duration,
+                    realMediaStartInOutputUS: outputTiming.realMediaStartUS,
+                    realMediaEndInOutputUS: outputTiming.realMediaEndUS,
+                    answerStartInOutputUS: outputTiming.answerStartUS,
+                    answerEndInOutputUS: outputTiming.answerEndUS,
                     sourcePartCount: sourceSegments.count,
                     sourceParts: sourceSegments.enumerated().map { index, segment in
                         SourcePart(partIndex: index, sourceFile: recording.packageRelativePath, sourceUUID: recording.id.uuidString, sourceIsDolby: (recording.mediaSignature.colorTransfer ?? "").localizedCaseInsensitiveContains("2084"), parsedSourceInUS: segment.start.microseconds, parsedSourceOutUS: segment.end.microseconds, sourceDurationUS: sourceDurationUS)
@@ -550,6 +789,8 @@ public struct ManifestPublicationBuilder: Sendable {
                 )
                 rows.append(row)
                 clipNumber += 1
+                preparedAnswerCount += 1
+                progress?("Prepared \(preparedAnswerCount) of \(answerCount) answer clips.")
             }
         }
 
@@ -569,11 +810,25 @@ public struct ManifestPublicationBuilder: Sendable {
         )
         let renderPlan = RenderPlanBuilder().build(project: loaded, document: legacyDocument)
         if renderPlan.summary.blockerCount > 0 {
-            throw NativePublishingError.manifestBlocked("Phase 1 render plan contains \(renderPlan.summary.blockerCount) blocker(s).")
+            throw NativePublishingError.manifestBlocked(Self.blockingMessage(for: renderPlan))
         }
         let publication = PublicationRecord(projectID: project.projectID, sessionID: publicationSessionID, revision: publicationRevision, fingerprint: fingerprint, manifestRelativePath: "final_manifest.json", recipe: answerPublisher.recipe, answerCount: rows.count)
         try JSONEncoder.interviewStudio.encode(publication).write(to: root.appendingPathComponent("publication.json"), options: .atomic)
+        buildCompleted = true
         return PublicationBuildResult(publication: publication, buildRoot: root, manifestURL: manifestURL, rows: rows, renderPlan: renderPlan)
+    }
+
+    internal static func blockingMessage(for renderPlan: RenderPlan) -> String {
+        let blockers = renderPlan.issues.filter { $0.severity == .blocker }
+        let details = blockers.enumerated().map { index, issue in
+            var detail = "\(index + 1). \(issue.humanMessage) [\(issue.code)]"
+            if !issue.suggestedFix.isEmpty {
+                detail += " Suggested fix: \(issue.suggestedFix)"
+            }
+            return detail
+        }.joined(separator: "\n")
+        let summary = "Phase 1 render plan contains \(blockers.count) blocker(s)."
+        return details.isEmpty ? summary : "\(summary)\n\(details)"
     }
 }
 

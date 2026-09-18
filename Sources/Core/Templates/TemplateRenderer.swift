@@ -212,7 +212,7 @@ public struct TemplateRenderer: Sendable {
 
             let footerRect = NSRect(x: 0, y: 110, width: size.width, height: 40)
             drawCenteredText(
-                "Yearly Interview Studio",
+                "Yearly Interview Studio by Sidelark Labs",
                 in: footerRect,
                 font: footerFont,
                 color: NSColor(hex: cardSet.subtitleHex).withAlphaComponent(0.75)

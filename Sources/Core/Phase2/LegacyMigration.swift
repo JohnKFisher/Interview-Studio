@@ -345,7 +345,7 @@ public struct LegacyMigrationService: Sendable {
             try store.writeSession(session)
         }
         let record = MigrationRecord(sourcePathDescription: analysis.sourceFolder.lastPathComponent, importedManifestSHA256: sha256(fileURL: analysis.manifestURL), decisionSummary: ["Legacy source was copied into Legacy Import/Original.", "Legacy published media was copied without modifying the source folder."])
-        try store.writeJSONForMigration(record)
+        try store.writeMigrationRecord(record)
         var updatedProject = try store.readProject()
         updatedProject.migrationHistoryIDs.append(record.id)
         try store.writeProject(updatedProject)
@@ -359,13 +359,6 @@ public struct LegacyMigrationService: Sendable {
         var visibleDestination = destination
         try visibleDestination.setResourceValues(destinationResourceValues)
         return LegacyImportResult(packageURL: destination, analysis: analysis, migrationRecord: record)
-    }
-}
-
-private extension InterviewStudioPackageStore {
-    func writeJSONForMigration(_ record: MigrationRecord) throws {
-        let url = rootURL.appendingPathComponent("Migration History", isDirectory: true).appendingPathComponent("\(record.id.uuidString).json")
-        try JSONEncoder.interviewStudio.encode(record).write(to: url, options: .atomic)
     }
 }
 

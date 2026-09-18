@@ -73,11 +73,20 @@ private extension InterviewStudioWorkspaceModel {
             errorMessage = "This age entry is read-only. Restore it or open a compatible project before editing."
             return false
         }
+        guard document?.isPackageReadOnly != true else {
+            errorMessage = "This project is read-only. Open a writable copy before editing assignments."
+            return false
+        }
         guard session.lifecycle == .open else {
             errorMessage = "Unlock the age entry before editing it."
             return false
         }
         return true
+    }
+
+    var recordingFirstCanEdit: Bool {
+        guard let session = recordingFirstSession else { return false }
+        return session.isActive && session.compatibility.isWritable && session.lifecycle == .open && document?.isPackageReadOnly != true
     }
 
     var recordingFirstRecording: SourceRecording? {
@@ -168,14 +177,28 @@ private extension InterviewStudioWorkspaceModel {
             durationUS: duration,
             visibleStartUS: start,
             visibleEndUS: end,
-            safeLeadingStartUS: safe?.start.microseconds,
-            safeTrailingEndUS: safe?.end.microseconds
+            safeLeadingStartUS: candidate.refinedBoundaries == nil ? nil : safe?.start.microseconds,
+            safeTrailingEndUS: candidate.refinedBoundaries == nil ? nil : safe?.end.microseconds
         )
+    }
+
+    var recordingFirstInternalCutRanges: [ClosedRange<Int64>] {
+        guard let candidate = recordingFirstSelectedCandidate,
+              let outer = candidate.visibleRange else { return [] }
+        return internalCuts(for: candidate, outer: outer).map { $0.start.microseconds ... $0.end.microseconds }
+    }
+
+    var recordingFirstCutSelectionRange: ClosedRange<Int64>? {
+        guard let start = recordingFirstCutStartUS,
+              let end = recordingFirstCutEndUS,
+              end >= start else { return nil }
+        return start ... end
     }
 
     func recordingFirstSelectRecording(_ recordingID: UUID) {
         selectedRecordingID = recordingID
         recordingFirstSelectedCandidateID = nil
+        recordingFirstPreviewSourceRecordingID = nil
         recordingFirstCutStartUS = nil
         recordingFirstCutEndUS = nil
         if let recording = recordingFirstSession?.recordings.first(where: { $0.id == recordingID }),
@@ -195,6 +218,7 @@ private extension InterviewStudioWorkspaceModel {
         selectedSessionID = session.id
         selectedRecordingID = session.recordings.first?.id
         recordingFirstSelectedCandidateID = nil
+        recordingFirstPreviewSourceRecordingID = nil
         recordingFirstCaptureState = .init()
         recordingFirstCutStartUS = nil
         recordingFirstCutEndUS = nil
@@ -206,10 +230,13 @@ private extension InterviewStudioWorkspaceModel {
         guard let candidate = recordingFirstSession?.candidates.first(where: { $0.id == candidateID }) else { return }
         recordingFirstSelectedCandidateID = candidateID
         selectedRecordingID = candidate.sourceRecordingID
+        recordingFirstPreviewSourceRecordingID = nil
+        player?.pause()
         recordingFirstCutStartUS = nil
         recordingFirstCutEndUS = nil
         if let url = document?.recordingURL(for: recordingFirstSession?.recordings.first(where: { $0.id == candidate.sourceRecordingID }) ?? SourceRecording.placeholder(for: candidate)) {
             replacePlayer(with: url)
+            recordingFirstPreviewSourceRecordingID = candidate.sourceRecordingID
         }
         if let start = candidate.visibleRange?.start.microseconds {
             seek(to: start)
@@ -327,25 +354,20 @@ private extension InterviewStudioWorkspaceModel {
             sourceOrder: sessions[sessionIndex].candidates.count
         )
         let durationUS = recording.mediaSignature.durationMicroseconds ?? segment.end.microseconds
-        candidate.refinedBoundaries = RefinedBoundaries(
-            visibleStart: segment.start,
-            visibleEnd: segment.end,
-            safeLeadingStart: .microseconds(max(0, segment.start.microseconds - 2_000_000)),
-            safeTrailingEnd: .microseconds(min(durationUS, segment.end.microseconds + 2_000_000)),
-            confidence: 0.4,
-            reasons: ["Captured from explicit In/Out markers; refine before approval."],
-            algorithmIdentifier: "recording-first-raw-markers",
-            algorithmVersion: "1.0",
-            manualOverride: false
-        )
+        candidate.refinedBoundaries = RecordingFirstWorkflow.reviewBoundaries(visible: segment, sourceDurationUS: durationUS)
         sessions[sessionIndex].candidates.append(candidate)
         sessions[sessionIndex].revision += 1
         recordingFirstSelectedCandidateID = candidate.id
+        recordingFirstPreviewSourceRecordingID = recordingID
         flushToDocument()
     }
 
     func recordingFirstPlaySelectedCandidate(withBuffers: Bool) {
         guard let candidate = recordingFirstSelectedCandidate else { return }
+        guard recordingFirstPreviewSourceRecordingID == candidate.sourceRecordingID, player != nil else {
+            errorMessage = "This clip's source is not available for preview. Select it again or recover the recording."
+            return
+        }
         let segments = RecordingFirstWorkflow.previewSegments(for: candidate, withBuffers: withBuffers)
         guard let first = segments.first, first.isValid else {
             errorMessage = "This clip does not have a valid preview range yet."
@@ -475,27 +497,24 @@ private extension InterviewStudioWorkspaceModel {
               let candidateIndex = sessions[sessionIndex].candidates.firstIndex(where: { $0.id == candidateID }),
               let candidate = sessions[sessionIndex].candidates[safe: candidateIndex],
               let oldVisible = candidate.visibleRange else { return }
-        let start = max(0, startUS ?? oldVisible.start.microseconds)
-        let end = max(start, endUS ?? oldVisible.end.microseconds)
+        let duration = recordingFirstRecording?.mediaSignature.durationMicroseconds ?? max(oldVisible.end.microseconds, endUS ?? oldVisible.end.microseconds)
+        let start = min(duration, max(0, startUS ?? oldVisible.start.microseconds))
+        let end = min(duration, max(start, endUS ?? oldVisible.end.microseconds))
         guard end > start else {
             errorMessage = "The answer end must be later than its start."
             return
         }
         var updated = candidate
-        let duration = recordingFirstRecording?.mediaSignature.durationMicroseconds ?? end
-        let safeStart = max(0, start - 2_000_000)
-        let safeEnd = min(duration, end + 2_000_000)
-        updated.refinedBoundaries = RefinedBoundaries(
-            visibleStart: .microseconds(start),
-            visibleEnd: .microseconds(end),
-            safeLeadingStart: .microseconds(safeStart),
-            safeTrailingEnd: .microseconds(safeEnd),
-            confidence: 1,
-            reasons: ["Manually adjusted in Refine."],
-            algorithmIdentifier: "manual-boundary",
-            algorithmVersion: "1.0",
+        let visible = CandidateSegment(start: .microseconds(start), end: .microseconds(end))
+        let boundaries = RecordingFirstWorkflow.reviewBoundaries(
+            visible: visible,
+            sourceDurationUS: duration,
+            leadingStartUS: startUS == nil ? candidate.refinedBoundaries?.safeLeadingStart.microseconds : nil,
+            trailingEndUS: endUS == nil ? candidate.refinedBoundaries?.safeTrailingEnd.microseconds : nil,
             manualOverride: true
         )
+        guard let boundaries else { return }
+        updated.refinedBoundaries = boundaries
         let existingCuts = internalCuts(for: candidate, outer: oldVisible)
         updated.retainedSegments = (try? RecordingFirstWorkflow.retainedSegments(for: CandidateSegment(start: .microseconds(start), end: .microseconds(end)), removing: existingCuts)) ?? [CandidateSegment(start: .microseconds(start), end: .microseconds(end))]
         if updated.reviewState == .approved { updated.reviewState = .needsReview }
@@ -505,14 +524,112 @@ private extension InterviewStudioWorkspaceModel {
         flushToDocument()
     }
 
+    func recordingFirstSetLeadingHandle(_ valueUS: Int64) {
+        updateRecordingFirstHandle(leadingStartUS: valueUS, trailingEndUS: nil)
+    }
+
+    func recordingFirstSetTrailingHandle(_ valueUS: Int64) {
+        updateRecordingFirstHandle(leadingStartUS: nil, trailingEndUS: valueUS)
+    }
+
+    func recordingFirstResetHandlesToDefaults() {
+        updateRecordingFirstHandle(leadingStartUS: nil, trailingEndUS: nil, resetToDefaults: true)
+    }
+
+    func recordingFirstResetToInitialRefinement() {
+        guard requireRecordingFirstEditingSession(),
+              let candidateID = recordingFirstSelectedCandidateID,
+              let sessionIndex = sessions.firstIndex(where: { $0.id == selectedSessionID }),
+              let candidateIndex = sessions[sessionIndex].candidates.firstIndex(where: { $0.id == candidateID }),
+              let candidate = sessions[sessionIndex].candidates[safe: candidateIndex],
+              let recording = sessions[sessionIndex].recordings.first(where: { $0.id == candidate.sourceRecordingID }) else { return }
+
+        let initialStartUS = candidate.rawMarkers.answerStart?.microseconds ?? candidate.visibleRange?.start.microseconds
+        let initialEndUS = candidate.rawMarkers.answerEnd?.microseconds ?? candidate.visibleRange?.end.microseconds
+        guard let initialStartUS, let initialEndUS, initialEndUS > initialStartUS else {
+            errorMessage = "The original In/Out marks are not available for this clip."
+            return
+        }
+        let duration = recording.mediaSignature.durationMicroseconds ?? initialEndUS
+        let start = min(duration, max(0, initialStartUS))
+        let end = min(duration, max(start, initialEndUS))
+        guard end > start,
+              let boundaries = RecordingFirstWorkflow.reviewBoundaries(
+                visible: CandidateSegment(start: .microseconds(start), end: .microseconds(end)),
+                sourceDurationUS: duration
+              ) else {
+            errorMessage = "The original In/Out marks are outside the recording."
+            return
+        }
+
+        var updated = candidate
+        updated.refinedBoundaries = boundaries
+        updated.retainedSegments = [CandidateSegment(start: .microseconds(start), end: .microseconds(end))]
+        if updated.reviewState == .approved { updated.reviewState = .needsReview }
+        updated.updatedAt = Date()
+        sessions[sessionIndex].candidates[candidateIndex] = updated
+        sessions[sessionIndex].revision += 1
+        progressMessage = "Restored the original In/Out marks and 2-second transition handles."
+        flushToDocument()
+    }
+
+    private func updateRecordingFirstHandle(leadingStartUS: Int64?, trailingEndUS: Int64?, resetToDefaults: Bool = false) {
+        guard requireRecordingFirstEditingSession(),
+              let candidateID = recordingFirstSelectedCandidateID,
+              let sessionIndex = sessions.firstIndex(where: { $0.id == selectedSessionID }),
+              let candidateIndex = sessions[sessionIndex].candidates.firstIndex(where: { $0.id == candidateID }),
+              let candidate = sessions[sessionIndex].candidates[safe: candidateIndex],
+              let visible = candidate.visibleRange,
+              let recording = sessions[sessionIndex].recordings.first(where: { $0.id == candidate.sourceRecordingID }) else { return }
+        let duration = recording.mediaSignature.durationMicroseconds ?? visible.end.microseconds
+        let boundaries = RecordingFirstWorkflow.reviewBoundaries(
+            visible: visible,
+            sourceDurationUS: duration,
+            leadingStartUS: resetToDefaults ? nil : (leadingStartUS ?? candidate.refinedBoundaries?.safeLeadingStart.microseconds),
+            trailingEndUS: resetToDefaults ? nil : (trailingEndUS ?? candidate.refinedBoundaries?.safeTrailingEnd.microseconds),
+            manualOverride: !resetToDefaults
+        )
+        guard let boundaries else { return }
+        var updated = candidate
+        updated.refinedBoundaries = boundaries
+        if updated.reviewState == .approved { updated.reviewState = .needsReview }
+        updated.updatedAt = Date()
+        sessions[sessionIndex].candidates[candidateIndex] = updated
+        sessions[sessionIndex].revision += 1
+        progressMessage = resetToDefaults ? "Transition handles reset to 2 seconds before and after the In/Out marks." : "Transition handle adjusted."
+        flushToDocument()
+    }
+
     func recordingFirstSetCutIn() {
         guard requireRecordingFirstEditingSession() else { return }
-        recordingFirstCutStartUS = recordingFirstPlayerTimestamp()
+        guard let timeUS = recordingFirstRefinementTimestamp() else { return }
+        recordingFirstCutStartUS = timeUS
+        if let endUS = recordingFirstCutEndUS, endUS <= timeUS {
+            recordingFirstCutEndUS = nil
+        }
+        progressMessage = "Cut In set at " + formatMicroseconds(timeUS) + ". Set Cut Out later in the answer."
     }
 
     func recordingFirstSetCutOut() {
         guard requireRecordingFirstEditingSession() else { return }
-        recordingFirstCutEndUS = recordingFirstPlayerTimestamp()
+        guard let timeUS = recordingFirstRefinementTimestamp() else { return }
+        guard let startUS = recordingFirstCutStartUS else {
+            errorMessage = "Set Cut In first, then move the playhead and set Cut Out."
+            return
+        }
+        guard timeUS > startUS else {
+            errorMessage = "Cut Out must be later than Cut In."
+            return
+        }
+        recordingFirstCutEndUS = timeUS
+        progressMessage = "Cut Out set at " + formatMicroseconds(timeUS) + ". Review the highlighted range, then remove it."
+    }
+
+    func recordingFirstClearCutSelection() {
+        guard requireRecordingFirstEditingSession() else { return }
+        recordingFirstCutStartUS = nil
+        recordingFirstCutEndUS = nil
+        progressMessage = "Pending cut selection cleared."
     }
 
     func recordingFirstRemoveSelection() {
@@ -532,6 +649,10 @@ private extension InterviewStudioWorkspaceModel {
             errorMessage = "Internal cuts must remain inside the answer boundaries."
             return
         }
+        guard cut.start > outer.start || cut.end < outer.end else {
+            errorMessage = "An internal cut must leave some answer content."
+            return
+        }
         let currentCuts = internalCuts(for: sessions[sessionIndex].candidates[candidateIndex], outer: outer)
         guard let retained = try? RecordingFirstWorkflow.retainedSegments(for: outer, removing: currentCuts + [cut]) else {
             errorMessage = "That selection overlaps an existing internal cut."
@@ -545,8 +666,19 @@ private extension InterviewStudioWorkspaceModel {
         sessions[sessionIndex].revision += 1
         recordingFirstCutStartUS = nil
         recordingFirstCutEndUS = nil
-        progressMessage = "Selection removed. Preview Answer will skip it."
+        let cutLabel = String(format: "%.3f–%.3fs", Double(start) / 1_000_000, Double(end) / 1_000_000)
+        progressMessage = "Removed " + cutLabel + ". Preview Answer will skip it; red on the waveform marks the removed range."
         flushToDocument()
+    }
+
+    private func recordingFirstRefinementTimestamp() -> Int64? {
+        guard recordingFirstRecording != nil else {
+            errorMessage = "Choose a recording before marking an internal cut."
+            return nil
+        }
+        let durationUS = recordingFirstRecording?.mediaSignature.durationMicroseconds
+        let timeUS = max(0, currentTimeUS)
+        return durationUS.map { min(timeUS, $0) } ?? timeUS
     }
 
     private func internalCuts(for candidate: AnswerCandidate, outer: CandidateSegment) -> [CandidateSegment] {
@@ -577,7 +709,7 @@ private extension InterviewStudioWorkspaceModel {
             }
             try RecordingFirstWorkflow.assign(candidateID: candidateID, to: questionKey, in: &session)
             sessions[sessionIndex] = session
-            recordingFirstSelectedCandidateID = candidateID
+            recordingFirstSelectCandidate(candidateID)
             let candidateLabel = session.candidates.first(where: { $0.id == candidateID })?.label ?? "clip"
             let questionLabel = project.activeQuestions.first(where: { $0.questionKey == questionKey })?.displayText ?? questionKey
             progressMessage = "Assigned \(candidateLabel) to \(questionLabel)."
@@ -598,7 +730,7 @@ private extension InterviewStudioWorkspaceModel {
             sessions[sessionIndex] = session
             recordingFirstComparison = nil
             recordingFirstComparisonQuestionKey = nil
-            recordingFirstSelectedCandidateID = comparison.proposed.id
+            recordingFirstSelectCandidate(comparison.proposed.id)
             progressMessage = "The new clip replaced the current answer."
             flushToDocument()
         } catch {
@@ -1239,6 +1371,30 @@ private struct RecordingFirstCandidateStrip: View {
     }
 }
 
+private struct PreciseSecondsControl: View {
+    let label: String
+    @Binding var seconds: Double
+    let range: ClosedRange<Double>
+
+    var body: some View {
+        HStack(spacing: 3) {
+            TextField("0.000", value: $seconds, format: .number.precision(.fractionLength(3)))
+                .textFieldStyle(.roundedBorder)
+                .multilineTextAlignment(.trailing)
+                .frame(width: 74)
+                .accessibilityLabel("\(label) seconds")
+                .accessibilityHint("Type a value to the millisecond.")
+            Text("s")
+                .foregroundStyle(.secondary)
+            Stepper("Adjust \(label)", value: $seconds, in: range, step: 0.01)
+                .labelsHidden()
+                .controlSize(.small)
+                .accessibilityLabel("Adjust \(label) in ten-millisecond steps")
+        }
+        .fixedSize()
+    }
+}
+
 private struct RecordingFirstRefineView: View {
     @ObservedObject var model: InterviewStudioWorkspaceModel
     @State private var showDiscarded = false
@@ -1258,7 +1414,7 @@ private struct RecordingFirstRefineView: View {
                             Label("Assigned to \(question.displayText)", systemImage: "arrow.right.circle.fill")
                                 .foregroundStyle(.tint)
                         }
-                        Text("Adjust the answer range, optionally remove an internal pause, then approve it.")
+                        Text("Adjust the In/Out answer range and transition handles, optionally remove an internal pause, then approve it.")
                             .foregroundStyle(.secondary)
                         candidatePlayer
                         boundaryControls(candidate: candidate)
@@ -1276,12 +1432,14 @@ private struct RecordingFirstRefineView: View {
                                 model.recordingFirstApproveSelectedCandidate()
                                 selectNextCandidate()
                             }
-                            .disabled(model.recordingFirstSelectedCandidate?.reviewState == .discarded)
+                            .disabled(!model.recordingFirstCanEdit || model.recordingFirstSelectedCandidate?.reviewState == .discarded)
                             Button("Skip for Now") {
                                 model.recordingFirstSkipSelectedCandidate()
                                 selectNextCandidate()
                             }
+                            .disabled(!model.recordingFirstCanEdit)
                             Button("Discard", role: .destructive) { model.recordingFirstDiscardSelectedCandidate() }
+                                .disabled(!model.recordingFirstCanEdit)
                         }
                         if let message = model.boundaryRefinementMessage {
                             Label(message, systemImage: "exclamationmark.triangle")
@@ -1306,6 +1464,9 @@ private struct RecordingFirstRefineView: View {
                 Button("Assign Answers", systemImage: "arrow.right.circle") { model.recordingFirstStage = .assign }
                     .disabled(model.recordingFirstActiveCandidates.isEmpty)
             }
+        }
+        .task(id: model.recordingFirstRecording?.id) {
+            await model.prepareMediaAnalysis()
         }
     }
 
@@ -1356,11 +1517,53 @@ private struct RecordingFirstRefineView: View {
                 .frame(minHeight: 300)
                 .onAppear { model.replacePlayer(with: url) }
                 .onChange(of: url) { _, newURL in model.replacePlayer(with: newURL) }
-            if let waveform = model.waveform {
-                WaveformView(waveform: waveform, timeline: model.recordingFirstTimelineRange, currentTimeUS: model.currentTimeUS) { timeUS in
-                    model.seek(to: timeUS)
+            if model.isLoadingWaveform {
+                ProgressView("Building waveform…")
+                    .controlSize(.small)
+                    .frame(maxWidth: .infinity, minHeight: 126)
+            } else if let waveform = model.waveform {
+                let timeline = model.recordingFirstTimelineRange
+                WaveformView(
+                    waveform: waveform,
+                    timeline: timeline,
+                    currentTimeUS: model.currentTimeUS,
+                    displayRangeUS: timeline?.reviewViewportUS,
+                    selectionRangeUS: model.recordingFirstCutSelectionRange,
+                    cutRangesUS: model.recordingFirstInternalCutRanges,
+                    onHandleChange: { handle, timeUS in
+                        switch handle {
+                        case .visibleLeading: model.recordingFirstSetBoundary(startUS: timeUS)
+                        case .visibleTrailing: model.recordingFirstSetBoundary(endUS: timeUS)
+                        case .leading: model.recordingFirstSetLeadingHandle(timeUS)
+                        case .trailing: model.recordingFirstSetTrailingHandle(timeUS)
+                        }
+                    },
+                    onSeek: { timeUS in model.seek(to: timeUS) }
+                )
+                .disabled(!model.recordingFirstCanEdit || model.recordingFirstPreviewIsComposed)
+                .frame(height: 126)
+                if let timeline {
+                    HStack {
+                        Text(formatSeconds(timeline.reviewViewportUS.lowerBound))
+                        Spacer()
+                        Text("Review window · up to 3s context")
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        Text(formatSeconds(timeline.reviewViewportUS.upperBound))
+                    }
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
                 }
-                .frame(height: 92)
+            } else if let waveformMessage = model.waveformMessage {
+                Label(waveformMessage, systemImage: "waveform.slash")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, minHeight: 126)
+            } else {
+                Label("Waveform unavailable", systemImage: "waveform")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, minHeight: 126)
             }
         } else {
             ContentUnavailableView("Source unavailable", systemImage: "exclamationmark.triangle", description: Text("The recording needed by this candidate is missing from the package."))
@@ -1369,17 +1572,82 @@ private struct RecordingFirstRefineView: View {
 
     private func boundaryControls(candidate: AnswerCandidate) -> some View {
         let visible = candidate.visibleRange
-        let duration = max(1, model.recordingFirstRecording?.mediaSignature.durationMicroseconds ?? visible?.end.microseconds ?? 1)
-        return GroupBox("Answer boundaries") {
+        let durationUS = max(1, model.recordingFirstRecording?.mediaSignature.durationMicroseconds ?? visible?.end.microseconds ?? 1)
+        let durationSeconds = max(0.001, Double(durationUS) / 1_000_000)
+        let safe = candidate.refinedBoundaries
+        let visibleStartUS = visible?.start.microseconds ?? 0
+        let visibleEndUS = visible?.end.microseconds ?? durationUS
+        let defaultLeadingUS = max(0, visibleStartUS - RecordingFirstWorkflow.defaultHandleDurationUS)
+        let defaultTrailingUS = min(durationUS, visibleEndUS + RecordingFirstWorkflow.defaultHandleDurationUS)
+        let leadingStartUS = safe?.safeLeadingStart.microseconds ?? defaultLeadingUS
+        let trailingEndUS = safe?.safeTrailingEnd.microseconds ?? defaultTrailingUS
+        let leadingMaximumSeconds = max(0.001, min(Double(RecordingFirstWorkflow.maximumReviewHandleDurationUS) / 1_000_000, Double(visibleStartUS) / 1_000_000))
+        let trailingMaximumSeconds = max(0.001, min(Double(RecordingFirstWorkflow.maximumReviewHandleDurationUS) / 1_000_000, Double(max(0, durationUS - visibleEndUS)) / 1_000_000))
+        let startSeconds = Binding<Double>(
+            get: { Double(visibleStartUS) / 1_000_000 },
+            set: { model.recordingFirstSetBoundary(startUS: microseconds(from: $0)) }
+        )
+        let endSeconds = Binding<Double>(
+            get: { Double(visibleEndUS) / 1_000_000 },
+            set: { model.recordingFirstSetBoundary(endUS: microseconds(from: $0)) }
+        )
+        let leadingSeconds = Binding<Double>(
+            get: { Double(max(0, visibleStartUS - leadingStartUS)) / 1_000_000 },
+            set: { model.recordingFirstSetLeadingHandle(visibleStartUS - microseconds(from: $0)) }
+        )
+        let trailingSeconds = Binding<Double>(
+            get: { Double(max(0, trailingEndUS - visibleEndUS)) / 1_000_000 },
+            set: { model.recordingFirstSetTrailingHandle(visibleEndUS + microseconds(from: $0)) }
+        )
+        let controlsDisabled = !model.recordingFirstCanEdit || model.recordingFirstPreviewIsComposed
+        return GroupBox("Answer boundaries and transition handles") {
             VStack(alignment: .leading, spacing: 8) {
-                Slider(value: Binding(get: { Double(candidate.visibleRange?.start.microseconds ?? 0) }, set: { model.recordingFirstSetBoundary(startUS: Int64($0.rounded())) }), in: 0...Double(duration)) {
-                    Text("Start")
+                HStack(spacing: 8) {
+                    Slider(value: startSeconds, in: 0 ... durationSeconds) {
+                        Text("Start")
+                    }
+                    PreciseSecondsControl(label: "Start", seconds: startSeconds, range: 0 ... durationSeconds)
                 }
-                .disabled(model.recordingFirstPreviewIsComposed)
-                Slider(value: Binding(get: { Double(candidate.visibleRange?.end.microseconds ?? duration) }, set: { model.recordingFirstSetBoundary(endUS: Int64($0.rounded())) }), in: 0...Double(duration)) {
-                    Text("End")
+                .disabled(controlsDisabled)
+                HStack(spacing: 8) {
+                    Slider(value: endSeconds, in: 0 ... durationSeconds) {
+                        Text("End")
+                    }
+                    PreciseSecondsControl(label: "End", seconds: endSeconds, range: 0 ... durationSeconds)
                 }
-                .disabled(model.recordingFirstPreviewIsComposed)
+                .disabled(controlsDisabled)
+                Divider()
+                Text("Transition handles")
+                    .font(.subheadline.weight(.semibold))
+                HStack(spacing: 8) {
+                    Slider(value: leadingSeconds, in: 0 ... leadingMaximumSeconds) {
+                        Text("Before I/O")
+                    }
+                    PreciseSecondsControl(label: "Before I/O", seconds: leadingSeconds, range: 0 ... leadingMaximumSeconds)
+                }
+                .disabled(controlsDisabled)
+                HStack(spacing: 8) {
+                    Slider(value: trailingSeconds, in: 0 ... trailingMaximumSeconds) {
+                        Text("After I/O")
+                    }
+                    PreciseSecondsControl(label: "After I/O", seconds: trailingSeconds, range: 0 ... trailingMaximumSeconds)
+                }
+                .disabled(controlsDisabled)
+                HStack {
+                    Text("Type to the millisecond; steppers change by 0.010s. Defaults are 2.000s, capped at 3.000s.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Reset Handles") { model.recordingFirstResetHandlesToDefaults() }
+                        .controlSize(.small)
+                        .disabled(controlsDisabled)
+                    Button("Reset to Initial", systemImage: "arrow.counterclockwise") {
+                        model.recordingFirstResetToInitialRefinement()
+                    }
+                    .controlSize(.small)
+                    .help("Restore the original In/Out marks, remove internal cuts, and reset handles to 2 seconds.")
+                    .disabled(controlsDisabled)
+                }
                 Text(boundarySummary(candidate))
                     .font(.caption.monospaced())
                     .foregroundStyle(.secondary)
@@ -1387,35 +1655,133 @@ private struct RecordingFirstRefineView: View {
         }
     }
 
+    private func microseconds(from seconds: Double) -> Int64 {
+        guard seconds.isFinite else { return 0 }
+        return Int64((seconds * 1_000_000).rounded())
+    }
+
     private var internalCutControls: some View {
-        GroupBox("Optional internal cut") {
-            HStack {
-                Button("Set Cut In") { model.recordingFirstSetCutIn() }
-                    .disabled(model.recordingFirstPreviewIsComposed)
-                Button("Set Cut Out") { model.recordingFirstSetCutOut() }
-                    .disabled(model.recordingFirstPreviewIsComposed)
-                Button("Remove Selection", systemImage: "scissors") { model.recordingFirstRemoveSelection() }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(model.recordingFirstPreviewIsComposed)
-                Text(cutSummary)
-                    .font(.caption.monospaced())
+        let durationUS = max(1, model.recordingFirstRecording?.mediaSignature.durationMicroseconds ?? model.recordingFirstSelectedCandidate?.visibleRange?.end.microseconds ?? 1)
+        let durationSeconds = Double(durationUS) / 1_000_000
+        let controlsDisabled = !model.recordingFirstCanEdit || model.recordingFirstPreviewIsComposed
+        let hasPendingMarks = model.recordingFirstCutStartUS != nil || model.recordingFirstCutEndUS != nil
+        let canRemoveSelection = model.recordingFirstCutStartUS.map { start in
+            model.recordingFirstCutEndUS.map { $0 > start } ?? false
+        } ?? false
+        let playheadSeconds = Binding<Double>(
+            get: { Double(min(max(model.currentTimeUS, 0), durationUS)) / 1_000_000 },
+            set: { model.seek(to: min(max(microseconds(from: $0), 0), durationUS)) }
+        )
+
+        return GroupBox("Remove an internal section") {
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Remove a pause or unwanted moment inside this answer. Move the playhead, set both marks, review the purple selection, then remove it.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                HStack(spacing: 8) {
+                    Label("Playhead", systemImage: "location.fill")
+                    PreciseSecondsControl(label: "Playhead", seconds: playheadSeconds, range: 0 ... durationSeconds)
+                    Spacer()
+                    Button("Set Cut In Here", systemImage: "arrow.down.to.line") { model.recordingFirstSetCutIn() }
+                    Button("Set Cut Out Here", systemImage: "arrow.up.to.line") { model.recordingFirstSetCutOut() }
+                }
+                .disabled(controlsDisabled)
+
+                HStack(spacing: 14) {
+                    if model.recordingFirstCutStartUS != nil {
+                        Text("Cut In")
+                            .font(.caption.weight(.semibold))
+                        PreciseSecondsControl(
+                            label: "Cut In",
+                            seconds: cutPointBinding(isStart: true, durationUS: durationUS),
+                            range: 0 ... durationSeconds
+                        )
+                    } else {
+                        Text("Cut In —")
+                            .foregroundStyle(.secondary)
+                    }
+                    if model.recordingFirstCutEndUS != nil {
+                        Text("Cut Out")
+                            .font(.caption.weight(.semibold))
+                        PreciseSecondsControl(
+                            label: "Cut Out",
+                            seconds: cutPointBinding(isStart: false, durationUS: durationUS),
+                            range: 0 ... durationSeconds
+                        )
+                    } else {
+                        Text("Cut Out —")
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                }
+                .disabled(controlsDisabled)
+
+                HStack(spacing: 8) {
+                    if let selection = model.recordingFirstCutSelectionRange {
+                        Label(
+                            "Pending removal " + formatSeconds(selection.lowerBound) + "–" + formatSeconds(selection.upperBound),
+                            systemImage: "scissors"
+                        )
+                        .foregroundStyle(.purple)
+                    } else {
+                        Label("Set Cut In, then Set Cut Out to create a removable range.", systemImage: "scissors")
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    if hasPendingMarks {
+                        Button("Clear Selection") { model.recordingFirstClearCutSelection() }
+                            .controlSize(.small)
+                    }
+                    Button("Remove Selected Range", systemImage: "scissors") { model.recordingFirstRemoveSelection() }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(controlsDisabled || !canRemoveSelection)
+                }
+
+                Divider()
+
+                if model.recordingFirstInternalCutRanges.isEmpty {
+                    Label("No internal cuts saved for this answer.", systemImage: "checkmark.circle")
+                        .foregroundStyle(.secondary)
+                } else {
+                    let cutCount = model.recordingFirstInternalCutRanges.count
+                    Label(
+                        String(cutCount) + " internal cut" + (cutCount == 1 ? "" : "s") + " saved; red ranges on the waveform are excluded.",
+                        systemImage: "minus.circle.fill"
+                    )
+                    .foregroundStyle(.red)
+                }
+                Text("Preview Answer skips red ranges. Preview With Buffers adds only the outer transition handles; internal cuts receive no extra buffer. Reset to Initial clears all internal cuts.")
+                    .font(.caption)
                     .foregroundStyle(.secondary)
             }
-            Text("Internal cuts use the exact selected points and a tiny automatic join; no safe buffers are added.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
         }
     }
 
-    private var cutSummary: String {
-        let start = model.recordingFirstCutStartUS.map { String(format: "%.2f", Double($0) / 1_000_000) } ?? "—"
-        let end = model.recordingFirstCutEndUS.map { String(format: "%.2f", Double($0) / 1_000_000) } ?? "—"
-        return "Cut \(start)–\(end)s"
+    private func cutPointBinding(isStart: Bool, durationUS: Int64) -> Binding<Double> {
+        Binding(
+            get: {
+                let value = isStart ? model.recordingFirstCutStartUS : model.recordingFirstCutEndUS
+                return Double(value ?? model.currentTimeUS) / 1_000_000
+            },
+            set: { seconds in
+                let value = min(max(microseconds(from: seconds), 0), durationUS)
+                if isStart {
+                    model.recordingFirstCutStartUS = value
+                } else {
+                    model.recordingFirstCutEndUS = value
+                }
+            }
+        )
     }
 
     private func boundarySummary(_ candidate: AnswerCandidate) -> String {
         guard let visible = candidate.visibleRange, let safe = candidate.safeRange else { return "Boundaries unavailable" }
-        return String(format: "Visible %.2f–%.2fs · safe %.2f–%.2fs · %@", Double(visible.start.microseconds) / 1_000_000, Double(visible.end.microseconds) / 1_000_000, Double(safe.start.microseconds) / 1_000_000, Double(safe.end.microseconds) / 1_000_000, candidate.reviewState.rawValue.replacingOccurrences(of: "_", with: " ").capitalized)
+        return String(format: "I/O %.3f–%.3fs · handles −%.3f/+%.3fs · %@", Double(visible.start.microseconds) / 1_000_000, Double(visible.end.microseconds) / 1_000_000, Double(visible.start.microseconds - safe.start.microseconds) / 1_000_000, Double(safe.end.microseconds - visible.end.microseconds) / 1_000_000, candidate.reviewState.rawValue.replacingOccurrences(of: "_", with: " ").capitalized)
+    }
+
+    private func formatSeconds(_ microseconds: Int64) -> String {
+        String(format: "%.3fs", Double(microseconds) / 1_000_000)
     }
 
     private func selectNextCandidate() {
@@ -1445,14 +1811,23 @@ private struct RecordingFirstAssignView: View {
                 Text("Drag a clip onto a question. A question can have one answer at a time.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                List {
+                List(selection: $model.recordingFirstSelectedCandidateID) {
                     ForEach(model.recordingFirstActiveCandidates.filter { $0.reviewState == .approved }) { candidate in
-                        CandidateAssignRow(candidate: candidate, isAssigned: model.recordingFirstSession?.answers.values.contains(where: { $0.assignedCandidateID == candidate.id }) == true)
-                            .onTapGesture { model.recordingFirstSelectCandidate(candidate.id) }
-                            .draggable(candidate.id.uuidString)
+                        if model.recordingFirstCanEdit {
+                            CandidateAssignRow(candidate: candidate, isAssigned: model.recordingFirstSession?.answers.values.contains(where: { $0.assignedCandidateID == candidate.id }) == true)
+                                .tag(candidate.id)
+                                .draggable(candidate.id.uuidString)
+                        } else {
+                            CandidateAssignRow(candidate: candidate, isAssigned: model.recordingFirstSession?.answers.values.contains(where: { $0.assignedCandidateID == candidate.id }) == true)
+                                .tag(candidate.id)
+                        }
                     }
                 }
                 .listStyle(.sidebar)
+                .onChange(of: model.recordingFirstSelectedCandidateID) { _, candidateID in
+                    guard let candidateID else { return }
+                    model.recordingFirstSelectCandidate(candidateID)
+                }
             }
             .frame(minWidth: 285, idealWidth: 335, maxWidth: 390)
             Divider()
@@ -1469,6 +1844,10 @@ private struct RecordingFirstAssignView: View {
                 }
             }
             .padding(18)
+            Divider()
+            RecordingFirstAssignPreview(model: model)
+                .frame(minWidth: 320, idealWidth: 380, maxWidth: 460)
+                .padding(18)
         }
         .toolbar {
             ToolbarItem {
@@ -1482,6 +1861,65 @@ private struct RecordingFirstAssignView: View {
             ToolbarItem {
                 Button("Finish", systemImage: "checkmark.seal") { model.recordingFirstStage = .finish }
             }
+        }
+    }
+}
+
+private struct RecordingFirstAssignPreview: View {
+    @ObservedObject var model: InterviewStudioWorkspaceModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Clip preview")
+                .font(.headline)
+
+            if let candidate = model.recordingFirstSelectedCandidate {
+                Text(candidate.label)
+                    .font(.title3.weight(.semibold))
+                Text("Play the selected answer to hear its audio before assigning it.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                if let player = model.player,
+                   model.recordingFirstPreviewSourceRecordingID == candidate.sourceRecordingID {
+                    RecordingFirstPlayerContainer(player: player)
+                        .frame(minHeight: 180, idealHeight: 220, maxHeight: 300)
+                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                } else {
+                    ContentUnavailableView(
+                        "Clip is loading",
+                        systemImage: "waveform",
+                        description: Text("Select the clip again when its source is ready.")
+                    )
+                    .frame(minHeight: 180)
+                }
+
+                HStack {
+                    Button("Play Selected Clip", systemImage: "play.fill") {
+                        model.recordingFirstPlaySelectedCandidate(withBuffers: false)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(model.player == nil || model.recordingFirstPreviewSourceRecordingID != candidate.sourceRecordingID)
+
+                    Button("Pause", systemImage: "pause.fill") {
+                        model.player?.pause()
+                    }
+                    .disabled(model.player == nil || model.recordingFirstPreviewSourceRecordingID != candidate.sourceRecordingID)
+                }
+
+                Text("Playback uses the reviewed clip range and skips any saved internal cuts. It does not change the package or source recording.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else {
+                ContentUnavailableView(
+                    "Select an approved clip",
+                    systemImage: "play.rectangle",
+                    description: Text("Choose a clip on the left to inspect and hear it before assigning it to a question.")
+                )
+                .frame(maxWidth: .infinity, minHeight: 260)
+            }
+
+            Spacer(minLength: 0)
         }
     }
 }
@@ -1533,13 +1971,16 @@ private struct QuestionAssignmentRow: View {
                 Button("Edit") { model.recordingFirstEditAssignedCandidate(assigned.id) }
                     .buttonStyle(.bordered)
                     .controlSize(.small)
+                    .disabled(!model.recordingFirstCanEdit)
                 Button("Unassign") { model.recordingFirstUnassign(questionKey: question.questionKey) }
                     .buttonStyle(.bordered)
                     .controlSize(.small)
+                    .disabled(!model.recordingFirstCanEdit)
             }
         }
         .padding(.vertical, 5)
         .dropDestination(for: String.self) { ids, _ in
+            guard model.recordingFirstCanEdit else { return false }
             guard let idString = ids.first, let id = UUID(uuidString: idString) else { return false }
             model.recordingFirstAssignCandidate(id, to: question.questionKey)
             return true

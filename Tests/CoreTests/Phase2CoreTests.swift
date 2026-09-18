@@ -1,8 +1,84 @@
-import Core
+@testable import Core
+import CoreGraphics
 import Foundation
 import XCTest
 
 final class Phase2CoreTests: XCTestCase {
+    func testPackageBackedAssemblyDefaultsOptionalPlexCompanionOff() {
+        XCTAssertFalse(AssemblySettings().plexMetadata.isEnabled)
+        XCTAssertTrue(PlexMetadataInput().isEnabled)
+    }
+
+    func testAccidentalEmptyPlexCompanionMigrationIsExactAndIdempotent() {
+        let original = InterviewStudioProject(
+            person: InterviewPerson(readableKey: "ellie", displayName: "Ellie"),
+            assemblySettings: AssemblySettings(plexMetadata: PlexMetadataInput()),
+            createdAt: Date(timeIntervalSince1970: 100),
+            updatedAt: Date(timeIntervalSince1970: 100)
+        )
+        let migrationDate = Date(timeIntervalSince1970: 200)
+
+        let result = InterviewStudioPackageMigration.repairAccidentalEmptyPlexCompanion(
+            in: original,
+            sourcePathDescription: "Ellie Interview.interviewstudio",
+            date: migrationDate
+        )
+
+        XCTAssertFalse(result.project.assemblySettings.plexMetadata.isEnabled)
+        XCTAssertEqual(result.project.createdAt, original.createdAt)
+        XCTAssertEqual(result.project.updatedAt, migrationDate)
+        XCTAssertEqual(result.project.migrationHistoryIDs, [InterviewStudioPackageMigration.accidentalEmptyPlexCompanionDefaultID])
+        XCTAssertEqual(result.migrationRecord?.id, InterviewStudioPackageMigration.accidentalEmptyPlexCompanionDefaultID)
+
+        let secondPass = InterviewStudioPackageMigration.repairAccidentalEmptyPlexCompanion(
+            in: result.project,
+            sourcePathDescription: "Ellie Interview.interviewstudio",
+            date: Date(timeIntervalSince1970: 300)
+        )
+        XCTAssertNil(secondPass.migrationRecord)
+        XCTAssertEqual(secondPass.project, result.project)
+    }
+
+    func testAccidentalEmptyPlexCompanionMigrationDoesNotChangeExplicitSettings() {
+        var configured = InterviewStudioProject(person: InterviewPerson(readableKey: "ellie", displayName: "Ellie"))
+        configured.assemblySettings.plexMetadata.isEnabled = true
+        configured.assemblySettings.plexMetadata.show = "Family Interviews"
+        let configuredResult = InterviewStudioPackageMigration.repairAccidentalEmptyPlexCompanion(
+            in: configured,
+            sourcePathDescription: "configured"
+        )
+        XCTAssertNil(configuredResult.migrationRecord)
+        XCTAssertTrue(configuredResult.project.assemblySettings.plexMetadata.isEnabled)
+
+        var disabled = InterviewStudioProject(person: InterviewPerson(readableKey: "ellie", displayName: "Ellie"))
+        disabled.assemblySettings.plexMetadata.isEnabled = false
+        let disabledResult = InterviewStudioPackageMigration.repairAccidentalEmptyPlexCompanion(
+            in: disabled,
+            sourcePathDescription: "disabled"
+        )
+        XCTAssertNil(disabledResult.migrationRecord)
+        XCTAssertFalse(disabledResult.project.assemblySettings.plexMetadata.isEnabled)
+    }
+
+    func testMigrationRecordIsIncludedInPackageInventory() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("migration-\(UUID().uuidString).interviewstudio", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try InterviewStudioPackageStore.create(
+            project: InterviewStudioProject(person: InterviewPerson(readableKey: "ellie", displayName: "Ellie")),
+            at: root
+        )
+        let record = MigrationRecord(
+            id: UUID(),
+            sourcePathDescription: "test",
+            decisionSummary: ["test migration"]
+        )
+
+        try store.writeMigrationRecord(record)
+        try store.rebuildInventory()
+        try store.verifyInventory()
+        XCTAssertTrue(FileManager.default.fileExists(atPath: store.migrationHistoryURL(for: record.id).path))
+    }
+
     func testPackageRoundTripAndInventoryVerification() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("\(UUID().uuidString).interviewstudio", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -262,6 +338,44 @@ final class Phase2CoreTests: XCTestCase {
         }
     }
 
+    func testLegacyNativePublisherUsesProtected4KCanvas() async throws {
+        let rootURL = FileManager.default.temporaryDirectory.appendingPathComponent("legacy-publisher-(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: rootURL) }
+        try FileManager.default.createDirectory(at: rootURL, withIntermediateDirectories: true)
+        let sourceURL = rootURL.appendingPathComponent("source-1920x1080.mov")
+        let outputURL = rootURL.appendingPathComponent("legacy-answer.mov")
+        try makeMediaFixture(width: 1_920, height: 1_080, duration: 2, at: sourceURL)
+        let part = AnswerPart(
+            sourceRecordingID: UUID(),
+            rawMarkers: .init(
+                answerStart: .microseconds(500_000),
+                answerEnd: .microseconds(1_500_000)
+            )
+        )
+
+        let inspection = try await NativeAnswerPublisher().generate(part: part, sourceURL: sourceURL, outputURL: outputURL)
+
+        XCTAssertEqual(inspection.width, 3_840)
+        XCTAssertEqual(inspection.height, 2_160)
+        XCTAssertTrue(inspection.hasVideo)
+        XCTAssertTrue(inspection.hasAudio)
+    }
+
+    func testNativePublisherCentersRotatedSourceOnProtectedCanvas() throws {
+        let naturalSize = CGSize(width: 1_440, height: 1_080)
+        let preferredTransform = CGAffineTransform(rotationAngle: -.pi / 2)
+        let transform = try NativeAnswerPublisher().compositionTransform(
+            for: naturalSize,
+            preferredTransform: preferredTransform
+        )
+        let renderedRect = CGRect(origin: .zero, size: naturalSize).applying(transform)
+
+        XCTAssertEqual(renderedRect.width, 1_620, accuracy: 0.001)
+        XCTAssertEqual(renderedRect.height, 2_160, accuracy: 0.001)
+        XCTAssertEqual(renderedRect.minX, 1_110, accuracy: 0.001)
+        XCTAssertEqual(renderedRect.minY, 0, accuracy: 0.001)
+    }
+
     func testInventoryRejectsAnUnlistedPackageEntry() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("\(UUID().uuidString).interviewstudio", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -437,6 +551,40 @@ final class Phase2CoreTests: XCTestCase {
         XCTAssertEqual(timeline.visibleOutputRange(for: candidate)?.end.microseconds, 4_880_000)
     }
 
+    func testRecordingFirstReviewDefaultsUseTwoSecondHandlesAndThreeSecondViewport() throws {
+        let visible = CandidateSegment(start: .microseconds(5_000_000), end: .microseconds(10_000_000))
+        let boundaries = try XCTUnwrap(RecordingFirstWorkflow.reviewBoundaries(visible: visible, sourceDurationUS: 20_000_000))
+        XCTAssertEqual(boundaries.safeLeadingStart.microseconds, 3_000_000)
+        XCTAssertEqual(boundaries.safeTrailingEnd.microseconds, 12_000_000)
+
+        let viewport = try XCTUnwrap(RecordingFirstWorkflow.reviewViewport(for: visible, sourceDurationUS: 20_000_000))
+        XCTAssertEqual(viewport.start.microseconds, 2_000_000)
+        XCTAssertEqual(viewport.end.microseconds, 13_000_000)
+    }
+
+    func testRecordingFirstReviewHandleEditsAreBoundedAndPreserveVisibleRange() throws {
+        let visible = CandidateSegment(start: .microseconds(5_000_000), end: .microseconds(10_000_000))
+        let boundaries = try XCTUnwrap(RecordingFirstWorkflow.reviewBoundaries(
+            visible: visible,
+            sourceDurationUS: 20_000_000,
+            leadingStartUS: 0,
+            trailingEndUS: 20_000_000,
+            manualOverride: true
+        ))
+        XCTAssertEqual(boundaries.safeLeadingStart.microseconds, 2_000_000)
+        XCTAssertEqual(boundaries.safeTrailingEnd.microseconds, 13_000_000)
+        XCTAssertEqual(boundaries.visibleStart, visible.start)
+        XCTAssertEqual(boundaries.visibleEnd, visible.end)
+        XCTAssertTrue(boundaries.manualOverride)
+    }
+
+    func testRecordingFirstReviewDefaultsClampAtSourceEdges() throws {
+        let visible = CandidateSegment(start: .microseconds(500_000), end: .microseconds(19_500_000))
+        let boundaries = try XCTUnwrap(RecordingFirstWorkflow.reviewBoundaries(visible: visible, sourceDurationUS: 20_000_000))
+        XCTAssertEqual(boundaries.safeLeadingStart.microseconds, 0)
+        XCTAssertEqual(boundaries.safeTrailingEnd.microseconds, 20_000_000)
+    }
+
     func testRecordingFirstPublisherExportsAndReinspectsInternalCuts() async throws {
         let workspace = try TestWorkspace.make()
         defer { try? FileManager.default.removeItem(at: workspace.rootURL) }
@@ -545,7 +693,7 @@ final class Phase2CoreTests: XCTestCase {
     func testRecordingFirstAgeIdentityAndArchiveRestoreAreStable() throws {
         let normalized = try XCTUnwrap(RecordingFirstWorkflow.normalizedAge(value: 5))
         XCTAssertEqual(normalized.key, "age_5")
-        XCTAssertEqual(normalized.label, "Age 5")
+        XCTAssertEqual(normalized.label, "5 Years Old")
         var session = InterviewSession(workflowKind: .recordingFirstV1, ageKey: normalized.key, ageLabel: normalized.label, ageSortValue: normalized.sortValue)
         XCTAssertTrue(RecordingFirstWorkflow.sameAge(session, normalized: normalized))
         try session.archive()
@@ -553,6 +701,17 @@ final class Phase2CoreTests: XCTestCase {
         try session.restore()
         XCTAssertTrue(session.isActive)
         XCTAssertEqual(session.ageKey, "age_5")
+    }
+
+    func testRecordingFirstDisplayAgeLabelRepairsLegacyPresentationText() {
+        let session = InterviewSession(
+            workflowKind: .recordingFirstV1,
+            ageKey: "age_10",
+            ageLabel: "Age 10",
+            ageSortValue: 10
+        )
+
+        XCTAssertEqual(RecordingFirstWorkflow.displayAgeLabel(for: session), "10 Years Old")
     }
 
     func testRecordingFirstSchemaAddsDefaultsAndUnknownWorkflowIsReadOnly() throws {
@@ -579,5 +738,30 @@ final class Phase2CoreTests: XCTestCase {
         let futureData = try JSONSerialization.data(withJSONObject: object)
         let future = try JSONDecoder.interviewStudio.decode(InterviewSession.self, from: futureData)
         XCTAssertFalse(future.compatibility.isWritable)
+    }
+
+    private func makeMediaFixture(width: Int, height: Int, duration: Int, at outputURL: URL) throws {
+        let ffmpegPath = ProcessInfo.processInfo.environment["YEARLY_INTERVIEW_STUDIO_FFMPEG"] ?? "/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg"
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: ffmpegPath)
+        process.arguments = [
+            "-y",
+            "-f", "lavfi",
+            "-i", "color=c=red:s=\(width)x\(height):d=\(duration):r=30",
+            "-f", "lavfi",
+            "-i", "sine=frequency=440:duration=\(duration)",
+            "-map", "0:v",
+            "-map", "1:a",
+            "-c:v", "libx264",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac",
+            "-shortest",
+            outputURL.path
+        ]
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+        process.waitUntilExit()
+        XCTAssertEqual(process.terminationStatus, 0)
     }
 }

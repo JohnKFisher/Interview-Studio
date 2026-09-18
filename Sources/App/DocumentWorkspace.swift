@@ -21,6 +21,12 @@ private final class PlayerObservationLifetime {
     deinit { invalidate() }
 }
 
+private func cleanupDerivedBuildOffMain(at buildURL: URL, in buildRoot: URL, for projectID: UUID) async {
+    await Task.detached(priority: .utility) {
+        try? ManifestPublicationBuilder.cleanupDerivedBuild(at: buildURL, in: buildRoot, for: projectID)
+    }.value
+}
+
 @MainActor
 final class InterviewStudioWorkspaceModel: ObservableObject {
     @Published var project: InterviewStudioProject
@@ -47,6 +53,7 @@ final class InterviewStudioWorkspaceModel: ObservableObject {
     @Published var isAddingYear = false
     @Published var recordingFirstStage: RecordingFirstStage = .capture
     @Published var recordingFirstSelectedCandidateID: UUID?
+    @Published var recordingFirstPreviewSourceRecordingID: UUID?
     @Published var recordingFirstCutStartUS: Int64?
     @Published var recordingFirstCutEndUS: Int64?
     @Published var playbackRate: Float = 1.0
@@ -692,42 +699,66 @@ final class InterviewStudioWorkspaceModel: ObservableObject {
             return
         }
 
-        isRenderingFinalMovie = true
-        errorMessage = nil
-        progressMessage = "Preparing all locked interview years…"
-        flushToDocument()
         let project = self.project
         let sessions = self.sessions
         let buildRoot = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
             .appendingPathComponent("YearlyInterviewStudio/FinalRenders", isDirectory: true)
-        let renderer = Renderer()
-        Task { @MainActor [weak self, renderer, project, sessions, store, buildRoot, destinationURL] in
-            guard let self else { return }
-            do {
-                let publication = try await ManifestPublicationBuilder().buildAggregate(
-                    project: project,
-                    sessions: sessions,
-                    store: store,
-                    buildRoot: buildRoot
-                )
-                self.renderPlan = publication.renderPlan
-                let result = try await renderer.render(plan: publication.renderPlan, outputURL: destinationURL) { [weak self] state in
-                    Task { @MainActor in
-                        self?.progressMessage = "\(state.phase.capitalized): \(state.detail)"
-                    }
-                }
-                self.lastFinalMovieURL = result.outputURL
-                self.document?.stage(publication: publication.publication)
-                self.progressMessage = "Finished: \(result.outputURL.path)"
-                self.isRenderingFinalMovie = false
-            } catch is CancellationError {
-                self.progressMessage = "Final render cancelled."
-                self.isRenderingFinalMovie = false
-            } catch {
-                self.errorMessage = error.localizedDescription
-                self.progressMessage = "Final render failed."
-                self.isRenderingFinalMovie = false
+        do {
+            let lease = try ManifestPublicationBuilder.acquireDerivedBuildLease(at: buildRoot, for: project.projectID)
+            isRenderingFinalMovie = true
+            errorMessage = nil
+            progressMessage = "Preparing all locked interview years…"
+            flushToDocument()
+            let renderer = Renderer()
+            let pruneTask = Task.detached(priority: .utility) {
+                try ManifestPublicationBuilder.pruneDerivedBuilds(at: buildRoot, for: project.projectID)
             }
+            Task { @MainActor [weak self, renderer, project, sessions, store, buildRoot, destinationURL, lease, pruneTask] in
+                defer { lease.release() }
+                do {
+                    try await pruneTask.value
+                    guard let self else { return }
+                    let publication = try await ManifestPublicationBuilder().buildAggregate(
+                        project: project,
+                        sessions: sessions,
+                        store: store,
+                        buildRoot: buildRoot,
+                        progress: { [weak self] message in
+                            Task { @MainActor in
+                                self?.progressMessage = message
+                            }
+                        }
+                    )
+                    self.renderPlan = publication.renderPlan
+                    do {
+                        let result = try await renderer.render(plan: publication.renderPlan, outputURL: destinationURL) { [weak self] state in
+                            Task { @MainActor in
+                                self?.progressMessage = "\(state.phase.capitalized): \(state.detail)"
+                            }
+                        }
+                        await cleanupDerivedBuildOffMain(at: publication.buildRoot, in: buildRoot, for: project.projectID)
+                        self.lastFinalMovieURL = result.outputURL
+                        self.document?.stage(publication: publication.publication)
+                        self.progressMessage = "Finished: \(result.outputURL.path)"
+                        self.isRenderingFinalMovie = false
+                    } catch {
+                        await cleanupDerivedBuildOffMain(at: publication.buildRoot, in: buildRoot, for: project.projectID)
+                        throw error
+                    }
+                } catch is CancellationError {
+                    guard let self else { return }
+                    self.progressMessage = "Final render cancelled."
+                    self.isRenderingFinalMovie = false
+                } catch {
+                    guard let self else { return }
+                    self.errorMessage = error.localizedDescription
+                    self.progressMessage = "Final render failed."
+                    self.isRenderingFinalMovie = false
+                }
+            }
+        } catch {
+            errorMessage = error.localizedDescription
+            return
         }
     }
 
@@ -899,37 +930,57 @@ final class InterviewStudioWorkspaceModel: ObservableObject {
     }
 
     func finishAndLock() {
+        guard !isBusy else { return }
         guard let store = document?.packageStore, let selectedSession else {
             errorMessage = "Save the project and select an interview year before locking."
             return
         }
-        isBusy = true
-        progressMessage = "Generating validated answer clips and manifest…"
         let project = self.project
         let buildRoot = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!.appendingPathComponent("YearlyInterviewStudio/Generated", isDirectory: true)
-        let finishTask = Task.detached(priority: .userInitiated) {
-            try await FinishAndLockService().finishAndLock(project: project, session: selectedSession, store: store, buildRoot: buildRoot)
-        }
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            do {
-                let result = try await finishTask.value
-                guard let lockedSession = result.stagedSession,
-                      let currentIndex = self.sessions.firstIndex(where: { $0.id == lockedSession.id }) else {
-                    throw InterviewStudioPackageError.invalidPackage("The lock operation did not return updated session state.")
-                }
-                self.sessions[currentIndex] = lockedSession
-                self.renderPlan = result.renderPlan
-                self.selectedSessionID = selectedSession.id
-                self.isBusy = false
-                self.progressMessage = "Year locked. Assembly is ready for inspection; rendering was not started."
-                self.flushToDocument()
-                self.document?.stage(publication: result.publication)
-            } catch {
-                self.errorMessage = error.localizedDescription
-                self.progressMessage = "The year remains open; no lock was committed."
-                self.isBusy = false
+        do {
+            let lease = try ManifestPublicationBuilder.acquireDerivedBuildLease(at: buildRoot, for: project.projectID)
+            isBusy = true
+            progressMessage = "Generating validated answer clips and manifest…"
+            let finishTask = Task.detached(priority: .userInitiated) {
+                try ManifestPublicationBuilder.pruneDerivedBuilds(at: buildRoot, for: project.projectID)
+                return try await FinishAndLockService().finishAndLock(project: project, session: selectedSession, store: store, buildRoot: buildRoot)
             }
+            Task { @MainActor [weak self, lease, finishTask] in
+                defer { lease.release() }
+                var completedBuildRoot: URL?
+                do {
+                    let result = try await finishTask.value
+                    completedBuildRoot = result.buildRoot
+                    guard let self else {
+                        await cleanupDerivedBuildOffMain(at: result.buildRoot, in: buildRoot, for: project.projectID)
+                        return
+                    }
+                    guard let lockedSession = result.stagedSession,
+                          let currentIndex = self.sessions.firstIndex(where: { $0.id == lockedSession.id }) else {
+                        throw InterviewStudioPackageError.invalidPackage("The lock operation did not return updated session state.")
+                    }
+                    self.sessions[currentIndex] = lockedSession
+                    self.renderPlan = result.renderPlan
+                    self.selectedSessionID = selectedSession.id
+                    self.isBusy = false
+                    self.progressMessage = "Year locked. Assembly is ready for inspection; rendering was not started."
+                    self.flushToDocument()
+                    self.document?.stage(publication: result.publication)
+                    await cleanupDerivedBuildOffMain(at: result.buildRoot, in: buildRoot, for: project.projectID)
+                    completedBuildRoot = nil
+                } catch {
+                    if let completedBuildRoot {
+                        await cleanupDerivedBuildOffMain(at: completedBuildRoot, in: buildRoot, for: project.projectID)
+                    }
+                    guard let self else { return }
+                    self.errorMessage = error.localizedDescription
+                    self.progressMessage = "The year remains open; no lock was committed."
+                    self.isBusy = false
+                }
+            }
+        } catch {
+            errorMessage = error.localizedDescription
+            return
         }
     }
 
@@ -1226,8 +1277,21 @@ struct DocumentWorkspaceView: View {
                             .foregroundStyle(.secondary)
                     }
                     if let progressMessage = model.progressMessage {
-                        Label(progressMessage, systemImage: model.isBusy ? "arrow.triangle.2.circlepath" : "checkmark.circle")
-                            .foregroundStyle(.secondary)
+                        HStack(spacing: 8) {
+                            if model.isBusy || model.isRenderingFinalMovie {
+                                ProgressView()
+                                    .controlSize(.small)
+                            } else {
+                                Image(systemName: "checkmark.circle")
+                            }
+                            Text(progressMessage)
+                                .lineLimit(3)
+                                .fixedSize(horizontal: false, vertical: true)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        .foregroundStyle(.secondary)
+                        .accessibilityElement(children: .combine)
+                        .accessibilityLabel(progressMessage)
                     }
                     if let renderPlan = model.renderPlan {
                         AssemblySummaryView(renderPlan: renderPlan)

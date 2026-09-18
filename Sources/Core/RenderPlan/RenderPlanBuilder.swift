@@ -9,6 +9,7 @@ public struct RenderPlanBuilder {
     public func build(project: LoadedManifestProject, document: ProjectDocument, exportProfile: ExportProfile = .appleHLG4K60) -> RenderPlan {
         let orderedQuestions = orderedQuestions(from: project, using: document)
         let settings = document.renderSettings
+        let timeline = RenderTimeline(frameRate: exportProfile.frameRate)
         var sequence: [RenderSequenceNode] = []
         var issues = project.issues
 
@@ -115,12 +116,15 @@ public struct RenderPlanBuilder {
 
         let boundaries = buildBoundaries(sequence: sequence, project: project, questionClipLookup: questionClipLookup, settings: settings, frameRate: exportProfile.frameRate)
         issues.append(contentsOf: boundaries.flatMap(\.issues))
-        let plexMetadata = buildPlexMetadataPlan(document: document, sequence: sequence, boundaries: boundaries, issues: &issues)
+        issues.append(contentsOf: subframeAnswerIssues(sequence: sequence, frameRate: exportProfile.frameRate))
+        let timelineSchedule = timeline.schedule(sequence: sequence, boundaries: boundaries)
+        let plexMetadata = buildPlexMetadataPlan(document: document, sequence: sequence, boundaries: boundaries, timeline: timelineSchedule, issues: &issues)
 
         let normalizedIssues = deduplicatedIssues(issues)
         let summary = makeSummary(
             sequence: sequence,
             boundaries: boundaries,
+            timeline: timelineSchedule,
             issues: normalizedIssues,
             questionCount: questionCount,
             answerCount: answerCount
@@ -367,6 +371,7 @@ public struct RenderPlanBuilder {
         document: ProjectDocument,
         sequence: [RenderSequenceNode],
         boundaries: [BoundaryTransition],
+        timeline: RenderTimelineSchedule,
         issues: inout [AssemblyIssue]
     ) -> PlexMetadataPlan? {
         let input = document.plexMetadata
@@ -396,7 +401,7 @@ public struct RenderPlanBuilder {
             episodeNumber: episodeNumber,
             episodeTitle: input.episodeTitle.trimmingCharacters(in: .whitespacesAndNewlines),
             summary: input.summary.trimmingCharacters(in: .whitespacesAndNewlines),
-            chapters: chapterPlan(sequence: sequence, boundaries: boundaries)
+            chapters: chapterPlan(sequence: sequence, boundaries: boundaries, timeline: timeline)
         )
     }
 
@@ -420,7 +425,11 @@ public struct RenderPlanBuilder {
         return missing
     }
 
-    private func chapterPlan(sequence: [RenderSequenceNode], boundaries: [BoundaryTransition]) -> [RenderChapter] {
+    private func chapterPlan(
+        sequence: [RenderSequenceNode],
+        boundaries: [BoundaryTransition],
+        timeline: RenderTimelineSchedule
+    ) -> [RenderChapter] {
         let boundaryLookup = Dictionary(uniqueKeysWithValues: boundaries.map { ("\($0.fromNodeID)->\($0.toNodeID)", $0) })
         var markers: [(title: String, startUS: Int64)] = []
         var cursorUS: Int64 = 0
@@ -431,14 +440,14 @@ public struct RenderPlanBuilder {
                 markers.append((chapterTitle, cursorUS))
             }
 
-            cursorUS += durationUS(for: node)
+            cursorUS += Int64((timeline.duration(for: node).seconds * 1_000_000).rounded())
             guard index < sequence.count - 1 else { continue }
 
             let next = sequence[index + 1]
             if let boundary = boundaryLookup["\(node.nodeID)->\(next.nodeID)"],
                boundary.boundaryType == "answer_to_answer",
                boundary.resolved.style == "soft_crossfade" {
-                cursorUS += boundary.requested.durationUS
+                cursorUS += Int64((timeline.duration(for: boundary).seconds * 1_000_000).rounded())
             }
         }
 
@@ -461,13 +470,6 @@ public struct RenderPlanBuilder {
         case .answerClip:
             return nil
         }
-    }
-
-    private func durationUS(for node: RenderSequenceNode) -> Int64 {
-        if let template = node.template {
-            return Int64((template.durationSeconds * 1_000_000).rounded())
-        }
-        return node.timing?.durationUS ?? 0
     }
 
     private func evaluateConfidence(for row: ManifestRow, issues: [AssemblyIssue]) -> Confidence {
@@ -508,6 +510,7 @@ public struct RenderPlanBuilder {
     private func makeSummary(
         sequence: [RenderSequenceNode],
         boundaries: [BoundaryTransition],
+        timeline: RenderTimelineSchedule,
         issues: [AssemblyIssue],
         questionCount: Int,
         answerCount: Int
@@ -516,11 +519,7 @@ public struct RenderPlanBuilder {
         let warningCount = issues.filter { $0.severity == .warning }.count
         let infoCount = issues.filter { $0.severity == .info }.count
         let confidences = sequence.compactMap(\.confidence?.level)
-        let runtime = sequence.reduce(0.0) { partial, node in
-            partial + (node.template?.durationSeconds ?? 0) + (node.timing.map { Double($0.durationUS) / 1_000_000 } ?? 0)
-        } + boundaries
-            .filter { $0.boundaryType == "answer_to_answer" && $0.resolved.style == "soft_crossfade" }
-            .reduce(0.0) { $0 + (Double($1.requested.durationUS) / 1_000_000) }
+        let runtime = timeline.total.seconds
 
         return RenderPlanSummary(
             questionCount: questionCount,
@@ -548,6 +547,29 @@ public struct RenderPlanBuilder {
         return issues.filter { issue in
             let key = "\(issue.severity.rawValue)|\(issue.code)|\(issue.humanMessage)"
             return seen.insert(key).inserted
+        }
+    }
+
+    private func subframeAnswerIssues(sequence: [RenderSequenceNode], frameRate: Double) -> [AssemblyIssue] {
+        let minimumDurationUS = Int64(ceil(1_000_000 / max(frameRate, 1)))
+        return sequence.compactMap { node in
+            guard node.type == .answerClip,
+                  let timing = node.timing,
+                  timing.durationUS > 0,
+                  timing.durationUS < minimumDurationUS else {
+                return nil
+            }
+            return AssemblyIssue(
+                severity: .blocker,
+                code: "ANSWER_DURATION_SUBFRAME",
+                humanMessage: "Answer \(node.nodeID) is shorter than one output frame at the selected frame rate, so export is blocked to preserve deterministic audio/video timing.",
+                aiContext: [
+                    "node_id": .string(node.nodeID),
+                    "duration_us": .number(Double(timing.durationUS)),
+                    "minimum_duration_us": .number(Double(minimumDurationUS))
+                ],
+                suggestedFix: "Regenerate the answer clip or repair its answer start/end timestamps so the answer spans at least one output frame."
+            )
         }
     }
 }

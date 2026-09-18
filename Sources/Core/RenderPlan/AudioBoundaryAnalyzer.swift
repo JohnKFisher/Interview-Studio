@@ -4,6 +4,7 @@ import Foundation
 public struct AudioBoundaryAnalyzer {
     private let fullCrossfadeThresholdDBFS = -30.0
     private let quietWindowThresholdDBFS = -36.0
+    private let quietPeakThresholdDBFS = -30.0
     private let quietWindowUS: Int64 = 80_000
     private let silenceGapUS: Int64 = 80_000
 
@@ -56,7 +57,9 @@ public struct AudioBoundaryAnalyzer {
 
             if !handleRisk,
                outgoingMetrics.averageDBFS <= fullCrossfadeThresholdDBFS,
-               incomingMetrics.averageDBFS <= fullCrossfadeThresholdDBFS {
+               incomingMetrics.averageDBFS <= fullCrossfadeThresholdDBFS,
+               outgoingMetrics.peakDBFS <= quietPeakThresholdDBFS,
+               incomingMetrics.peakDBFS <= quietPeakThresholdDBFS {
                 return .init(
                     riskLevel: "safe",
                     mode: "full_crossfade",
@@ -74,6 +77,8 @@ public struct AudioBoundaryAnalyzer {
                let incomingWindow = incomingMetrics.quietestWindowDBFS,
                outgoingWindow <= quietWindowThresholdDBFS,
                incomingWindow <= quietWindowThresholdDBFS,
+               (outgoingMetrics.quietestWindowPeakDBFS ?? 0) <= quietPeakThresholdDBFS,
+               (incomingMetrics.quietestWindowPeakDBFS ?? 0) <= quietPeakThresholdDBFS,
                let outgoingOffset = outgoingMetrics.quietestWindowOffsetUS,
                let incomingOffset = incomingMetrics.quietestWindowOffsetUS {
                 return .init(
@@ -152,36 +157,36 @@ public struct AudioBoundaryAnalyzer {
         }
 
         let channelCount = Int(file.processingFormat.channelCount)
-        var mono: [Float] = Array(repeating: 0, count: availableFrames)
-        for frameIndex in 0 ..< availableFrames {
-            var sum: Float = 0
-            for channelIndex in 0 ..< channelCount {
-                sum += channels[channelIndex][frameIndex]
-            }
-            mono[frameIndex] = sum / Float(channelCount)
+        guard channelCount > 0 else { return .noAudio }
+        let samplesByChannel = (0 ..< channelCount).map { channelIndex in
+            Array(UnsafeBufferPointer(start: channels[channelIndex], count: availableFrames))
         }
 
-        let averageDBFS = dbfs(for: mono)
+        let averageDBFS = dbfs(for: samplesByChannel, start: 0, count: availableFrames)
+        let overallPeakDBFS = peakDBFS(for: samplesByChannel, start: 0, count: availableFrames)
         let quietWindowFrames = max(Int(requestedQuietWindowSeconds * sampleRate), 1)
         guard availableFrames >= quietWindowFrames else {
             return .init(
                 hasAudio: true,
                 averageDBFS: averageDBFS,
+                peakDBFS: overallPeakDBFS,
                 quietestWindowDBFS: averageDBFS,
+                quietestWindowPeakDBFS: overallPeakDBFS,
                 quietestWindowOffsetUS: 0
             )
         }
 
         let stepFrames = max(Int(0.02 * sampleRate), 1)
         var quietestDB = Double.greatestFiniteMagnitude
+        var quietestPeakDB = Double.greatestFiniteMagnitude
         var quietestOffsetUS: Int64 = 0
 
         var start = 0
         while start + quietWindowFrames <= availableFrames {
-            let window = Array(mono[start ..< start + quietWindowFrames])
-            let db = dbfs(for: window)
+            let db = dbfs(for: samplesByChannel, start: start, count: quietWindowFrames)
             if db < quietestDB {
                 quietestDB = db
+                quietestPeakDB = peakDBFS(for: samplesByChannel, start: start, count: quietWindowFrames)
                 quietestOffsetUS = Int64((Double(start) / sampleRate * 1_000_000).rounded())
             }
             start += stepFrames
@@ -190,29 +195,51 @@ public struct AudioBoundaryAnalyzer {
         return .init(
             hasAudio: true,
             averageDBFS: averageDBFS,
+            peakDBFS: overallPeakDBFS,
             quietestWindowDBFS: quietestDB,
+            quietestWindowPeakDBFS: quietestPeakDB,
             quietestWindowOffsetUS: quietestOffsetUS
         )
     }
 
-    private func dbfs(for samples: [Float]) -> Double {
-        guard !samples.isEmpty else { return -120 }
+    private func dbfs(for samplesByChannel: [[Float]], start: Int, count: Int) -> Double {
+        guard !samplesByChannel.isEmpty, count > 0 else { return -120 }
         var sum: Double = 0
-        for sample in samples {
-            let value = Double(sample)
-            sum += value * value
+        for channel in samplesByChannel {
+            for sample in channel[start ..< start + count] {
+                let value = Double(sample)
+                sum += value * value
+            }
         }
-        let rms = sqrt(sum / Double(samples.count))
+        let rms = sqrt(sum / Double(count * samplesByChannel.count))
         guard rms > 0 else { return -120 }
         return 20 * log10(rms)
+    }
+
+    private func peakDBFS(for samplesByChannel: [[Float]], start: Int, count: Int) -> Double {
+        guard !samplesByChannel.isEmpty, count > 0 else { return -120 }
+        let peak = samplesByChannel.reduce(Float.zero) { currentPeak, channel in
+            max(currentPeak, channel[start ..< start + count].reduce(Float.zero) { max($0, abs($1)) })
+        }
+        guard peak > 0 else { return -120 }
+        return 20 * log10(Double(peak))
     }
 }
 
 private struct RegionMetrics {
     var hasAudio: Bool
     var averageDBFS: Double
+    var peakDBFS: Double
     var quietestWindowDBFS: Double?
+    var quietestWindowPeakDBFS: Double?
     var quietestWindowOffsetUS: Int64?
 
-    static let noAudio = RegionMetrics(hasAudio: false, averageDBFS: 0, quietestWindowDBFS: nil, quietestWindowOffsetUS: nil)
+    static let noAudio = RegionMetrics(
+        hasAudio: false,
+        averageDBFS: 0,
+        peakDBFS: 0,
+        quietestWindowDBFS: nil,
+        quietestWindowPeakDBFS: nil,
+        quietestWindowOffsetUS: nil
+    )
 }

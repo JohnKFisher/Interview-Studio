@@ -9,8 +9,20 @@ The first implementation pass uses a SwiftPM core library plus a native macOS ap
 ## 2026-05-03 - Lock Phase 1 exports to one HDR profile
 Phase 1 exports are fixed to `3840x2160`, `60 fps`, `HLG`, `BT.2020`, `bt2020nc`, `HEVC Main10`, and `MOV`, with export blocked when required FFmpeg capabilities or HDR safety checks fail. This keeps Phase 1 deterministic and avoids shipping multiple partially-supported output modes. Status: approved.
 
-## 2026-05-03 - Use ProRes intermediates and a final HEVC assembly encode
-The renderer now writes 10-bit ProRes intermediate segments and performs the HEVC Main10 encode only once at final assembly time. This was chosen after repeated per-segment x265 renders proved too slow and harder to debug, while preserving the locked final export contract. Status: approved.
+## 2026-05-03 - Use ProRes intermediates and a final HEVC assembly encode (superseded)
+The renderer originally wrote 10-bit ProRes intermediate segments and performed the HEVC Main10 encode at final assembly time. This was chosen after repeated per-segment x265 renders proved too slow and harder to debug. The approach was later superseded by the hardware-HEVC path below after real runs showed that ProRes scratch volume and software HEVC assembly were still unacceptable.
+
+## 2026-09-16 - Use standard ProRes 422 for Phase 1 intermediates (superseded)
+The short-lived ProRes 422 reduction preserved 10-bit 4:2:2 pixels but did not solve the observed peak-space and runtime problem. It remains historical context for the renderer experiments, not the preferred production path.
+
+## 2026-09-16 - Assemble Phase 1 in bounded HEVC chunks
+Phase 1 groups the ordered segments into deterministic approximately 60-second chunks, deletes only validated source segments for each completed chunk, and stream-copies the chunks into the final master while rebuilding final audio timestamps before the one AAC encode. This topology remains active, but its segment/chunk video encoder is now selected by preflight as described below.
+
+## 2026-09-17 - Prefer hardware HEVC for Phase 1 segment and chunk encoding
+When FFmpeg exposes `hevc_videotoolbox`, Phase 1 uses hardware HEVC Main10 with `p010le` for both compressed segment intermediates and chunk assembly. This removes the multi-gigabyte ProRes scratch path and the software `libx265` bottleneck. A `libx265` path remains available when hardware HEVC is not exposed. All outputs still pass the existing 4K/60 HLG BT.2020/Main10/audio/timing validators; real-media quality, playback, HDR appearance, and peak-space comparison remain owner validation gates. Status: implemented in source; build and owner render validation pending.
+
+## 2026-09-17 - Preserve render-plan duration at segment and chunk boundaries
+Phase 1 derives every rendered node, transition, chunk, chapter, and final assembly from the export frame clock. Each block gets an explicit video frame count and matching 48 kHz audio sample count, and completed chunks are reopened and stream-duration validated before their source segments are deleted. This prevents fractional per-segment durations from accumulating into progressive A/V drift and makes a repeated mismatch identify the specific chunk. Status: implemented and covered by focused plus smoke validation.
 
 ## 2026-05-03 - Detach renderer subprocesses from terminal stdin
 FFmpeg subprocesses are launched with `stdin` detached and `-nostdin` enabled so Assembly Studio renders do not get suspended by terminal job control during CLI or debug runs. This fixes a real observed hang mode during smoke export verification. Status: approved.
@@ -19,7 +31,7 @@ FFmpeg subprocesses are launched with `stdin` detached and `-nostdin` enabled so
 The main Assembly Studio window now stays focused on controls, compact status, and live previews, while full Sequence and Issues detail lives in dedicated windows reachable from both buttons and the Window menu. This keeps the core workflow compact without hiding important diagnostics. Status: approved.
 
 ## 2026-05-06 - Prefer conservative transition audio over leaked handle speech
-Answer-to-answer transitions now analyze nearby audio and handle quality, keep normal crossfades only when the seam looks safe, and otherwise switch to quiet-window bridging or a muted fallback. This was chosen because avoiding stray interviewer/next-question speech is more important than preserving every soft handle crossfade. Status: approved.
+Answer-to-answer transitions now analyze nearby audio, handle quality, and peak transients; they keep normal crossfades only when the seam looks safe, avoid loudness normalization on short transition slices, reduce gain for quiet-window bridges, and otherwise switch to a muted fallback. Unknown transition modes also fail closed to silence. This was chosen because avoiding stray interviewer/next-question speech and sound bursts is more important than preserving every soft handle crossfade. Status: approved and implemented.
 
 ## 2026-05-07 - Keep the HDR MOV master and add a Plex MP4 companion
 Phase 1 still renders the approved HDR `MOV` master first, then optionally packages a second Plex-friendly `MP4` companion by remuxing the finished master with TV-style metadata and per-question chapters. This was chosen so Plex support does not redefine or risk the protected master export contract. Status: approved.
@@ -27,8 +39,14 @@ Phase 1 still renders the approved HDR `MOV` master first, then optionally packa
 ## 2026-05-07 - Default Title Case and default-on Plex metadata for sidecar-backed projects
 Question title casing is now a display/render treatment stored in the sidecar and defaults on for both new and older projects, while Plex companion export also defaults on and blocks export until its required metadata fields are filled or the feature is turned off. This was chosen to make the new presentation and library behavior explicit in-project instead of hidden in transient UI state. Status: approved.
 
+## 2026-09-16 - Keep the Phase 1 Plex default separate from package-backed Phase 2
+The default-on Plex companion decision applies to sidecar-backed Phase 1 projects, whose UI exposes the companion toggle and metadata fields. New package-backed Phase 2 projects default the optional companion off until that workflow exposes equivalent configuration, so an invisible empty companion cannot block the protected master. Existing writable packages are repaired on open only when they contain the exact accidental default state (enabled with every Plex field empty); the repair is idempotent, recorded in migration history, and leaves explicit/non-empty settings as blockers. Status: approved and implemented in the current checkout.
+
+## 2026-09-16 - Treat Phase 2 publication builds as ephemeral derived cache
+Package-backed answer clips and manifests are built under the canonical cache only for the duration of lock or final-render consumption. Partial builds are removed on failure or cancellation, successful builds are removed after their consumer finishes, and a cross-process project lease permits pruning stale UUID builds before the next run. Source recordings in ImportStaging remain outside this cleanup boundary. Status: approved and implemented in the current checkout.
+
 ## 2026-05-07 - Use temp storage for success-path render work and persist diagnostics only on failure or opt-in
-Renderer intermediates now live in an app-scoped system temp folder and are cleaned up on success or cancel, while persistent diagnostics are kept only for failures or when the user explicitly asks to preserve a successful run. This was chosen to stop filling Application Support with throwaway work products while keeping useful failure evidence. Status: approved.
+Renderer intermediates now live in an app-scoped system temp folder and are cleaned up on success or cancel, while persistent diagnostics are kept only for failures or when the user explicitly asks to preserve a successful run. Failure diagnostics retain only the render plan and redacted command log; generated media and graphics remain rebuildable temp artifacts and are never copied into Application Support. This was chosen to stop filling Application Support with throwaway work products while keeping useful failure evidence. Status: approved.
 
 ## 2026-07-31 - Keep GPL FFmpeg for now while deferring a replacement investigation
 Interview Studio will continue using the working GPL-enabled FFmpeg path for the current Phase 1 workflow. Replacing GPL FFmpeg entirely remains a future investigation for licensing, packaging, and distribution reasons, but it is deliberately out of scope while the current renderer remains useful and functional. Status: approved.

@@ -166,6 +166,10 @@ public struct InterviewStudioPackageStore: Sendable {
         rootURL.appendingPathComponent("Publication History", isDirectory: true).appendingPathComponent("\(id.uuidString).json")
     }
 
+    public func migrationHistoryURL(for id: UUID) -> URL {
+        rootURL.appendingPathComponent("Migration History", isDirectory: true).appendingPathComponent("\(id.uuidString).json")
+    }
+
     public static func create(project: InterviewStudioProject, at rootURL: URL) throws -> InterviewStudioPackageStore {
         let root = rootURL.standardizedFileURL
         var isDirectory: ObjCBool = false
@@ -300,6 +304,10 @@ public struct InterviewStudioPackageStore: Sendable {
 
     public func writePublication(_ publication: PublicationRecord) throws {
         try writeJSON(publication, to: publicationHistoryURL(for: publication.id))
+    }
+
+    public func writeMigrationRecord(_ record: MigrationRecord) throws {
+        try writeJSON(record, to: migrationHistoryURL(for: record.id))
     }
 
     public func readPublication(id: UUID) throws -> PublicationRecord {

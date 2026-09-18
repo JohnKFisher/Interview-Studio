@@ -91,6 +91,9 @@ public struct CandidatePublicationTimeline: Codable, Hashable, Sendable {
 }
 
 public enum RecordingFirstWorkflow {
+    public static let defaultHandleDurationUS: Int64 = 2_000_000
+    public static let maximumReviewHandleDurationUS: Int64 = 3_000_000
+
     public static func normalizedAge(value: Double) -> NormalizedAge? {
         guard value.isFinite, value >= 0 else { return nil }
         let rounded = (value * 100).rounded() / 100
@@ -99,7 +102,17 @@ public enum RecordingFirstWorkflow {
             .trimmingCharacters(in: CharacterSet(charactersIn: "0"))
             .trimmingCharacters(in: CharacterSet(charactersIn: "."))
         let stableDisplay = keyDisplay.isEmpty ? "0" : keyDisplay
-        return NormalizedAge(key: "age_\(stableDisplay)", label: "Age \(display)", sortValue: rounded)
+        let unit = display == "1" ? "Year" : "Years"
+        return NormalizedAge(key: "age_\(stableDisplay)", label: "\(display) \(unit) Old", sortValue: rounded)
+    }
+
+    /// Returns the presentation label for a recording-first age entry.
+    /// Older entries may still persist the pre-normalization form, such as
+    /// "Age 10"; publication must not carry that legacy wording into the
+    /// on-screen overlay.
+    public static func displayAgeLabel(for session: InterviewSession) -> String {
+        guard session.workflowKind == .recordingFirstV1 else { return session.ageLabel }
+        return session.normalizedAge().label
     }
 
     public static func sameAge(_ session: InterviewSession, normalized: NormalizedAge) -> Bool {
@@ -110,6 +123,51 @@ public enum RecordingFirstWorkflow {
 
     public static func makeCandidate(segment: CandidateSegment, recording: SourceRecording, clipNumber: Int, sourceOrder: Int = 0, now: Date = Date()) -> AnswerCandidate {
         AnswerCandidate(sourceRecordingID: recording.id, recordingNumber: recording.recordingNumber, clipNumber: clipNumber, sourceOrder: sourceOrder, rawMarkers: RawAnswerMarkers(answerStart: segment.start, answerEnd: segment.end), retainedSegments: [segment], createdAt: now, updatedAt: now)
+    }
+
+    /// Creates the recording-first review range from explicit In/Out marks.
+    /// Handles are deterministic: two seconds by default, clamped to the
+    /// recording and bounded to three seconds when adjusted in Review.
+    public static func reviewBoundaries(
+        visible: CandidateSegment,
+        sourceDurationUS: Int64,
+        leadingStartUS: Int64? = nil,
+        trailingEndUS: Int64? = nil,
+        manualOverride: Bool = false
+    ) -> RefinedBoundaries? {
+        guard visible.isValid,
+              visible.start.microseconds >= 0,
+              sourceDurationUS >= visible.end.microseconds else { return nil }
+
+        let visibleStartUS = visible.start.microseconds
+        let visibleEndUS = visible.end.microseconds
+        let defaultLeadingStartUS = max(0, visibleStartUS - defaultHandleDurationUS)
+        let defaultTrailingEndUS = min(sourceDurationUS, visibleEndUS + defaultHandleDurationUS)
+        let minimumLeadingStartUS = max(0, visibleStartUS - maximumReviewHandleDurationUS)
+        let maximumTrailingEndUS = min(sourceDurationUS, visibleEndUS + maximumReviewHandleDurationUS)
+        let safeLeadingStartUS = min(max(leadingStartUS ?? defaultLeadingStartUS, minimumLeadingStartUS), visibleStartUS)
+        let safeTrailingEndUS = min(max(trailingEndUS ?? defaultTrailingEndUS, visibleEndUS), maximumTrailingEndUS)
+
+        return RefinedBoundaries(
+            visibleStart: visible.start,
+            visibleEnd: visible.end,
+            safeLeadingStart: .microseconds(safeLeadingStartUS),
+            safeTrailingEnd: .microseconds(safeTrailingEndUS),
+            confidence: manualOverride ? 1 : 0.4,
+            reasons: [manualOverride ? "Adjusted manually in Review." : "Fixed 2-second handles around In/Out marks."],
+            algorithmIdentifier: manualOverride ? "recording-first-manual-boundaries" : "recording-first-io-default",
+            algorithmVersion: "1.0",
+            manualOverride: manualOverride
+        )
+    }
+
+    public static func reviewViewport(for visible: CandidateSegment, sourceDurationUS: Int64) -> CandidateSegment? {
+        guard visible.isValid,
+              visible.start.microseconds >= 0,
+              sourceDurationUS >= visible.end.microseconds else { return nil }
+        let startUS = max(0, visible.start.microseconds - maximumReviewHandleDurationUS)
+        let endUS = min(sourceDurationUS, visible.end.microseconds + maximumReviewHandleDurationUS)
+        return CandidateSegment(start: .microseconds(startUS), end: .microseconds(endUS))
     }
 
     public static func compare(current: AnswerCandidate, proposed: AnswerCandidate) -> CandidateComparison { CandidateComparison(current: current, proposed: proposed) }

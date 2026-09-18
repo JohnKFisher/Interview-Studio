@@ -17,6 +17,7 @@ final class InterviewStudioDocument: NSDocument {
     var project: InterviewStudioProject
     var sessions: [InterviewSession]
     private var pendingPublicationRecords: [PublicationRecord]
+    private var pendingMigrationRecords: [MigrationRecord]
     private var pendingRecordingImports: [StagedRecordingImport]
     private var cachedPackageStore: InterviewStudioPackageStore?
     private(set) var consolidationRecoveryMessage: String?
@@ -43,6 +44,7 @@ final class InterviewStudioDocument: NSDocument {
         project = InterviewStudioProject(person: InterviewPerson(readableKey: "person", displayName: "Person"))
         sessions = []
         pendingPublicationRecords = []
+        pendingMigrationRecords = []
         pendingRecordingImports = []
         cachedPackageStore = nil
         consolidationRecoveryMessage = nil
@@ -54,6 +56,7 @@ final class InterviewStudioDocument: NSDocument {
         project = InterviewStudioProject(person: InterviewPerson(readableKey: "person", displayName: "Person"))
         sessions = []
         pendingPublicationRecords = []
+        pendingMigrationRecords = []
         pendingRecordingImports = []
         cachedPackageStore = nil
         consolidationRecoveryMessage = nil
@@ -75,6 +78,17 @@ final class InterviewStudioDocument: NSDocument {
            let rows = try? JSONDecoder.interviewStudio.decode([ManifestRow].self, from: data) {
             let restorer = LegacyRangeRestorer()
             sessions = sessions.map { restorer.repair(session: $0, rows: rows) }
+        }
+        let canMigrateProject = project.compatibility.isWritable && sessions.allSatisfy { $0.compatibility.isWritable }
+        let migrationResult: (project: InterviewStudioProject, migrationRecord: MigrationRecord?)
+        if canMigrateProject {
+            migrationResult = InterviewStudioPackageMigration.repairAccidentalEmptyPlexCompanion(
+                in: project,
+                sourcePathDescription: url.lastPathComponent
+            )
+            project = migrationResult.project
+        } else {
+            migrationResult = (project, nil)
         }
         let recoveryJournal: RecordingConsolidationJournal?
         do {
@@ -104,9 +118,10 @@ final class InterviewStudioDocument: NSDocument {
             self.project = project
             self.sessions = sessions
             self.pendingPublicationRecords = []
+            self.pendingMigrationRecords = migrationResult.migrationRecord.map { [$0] } ?? []
             self.pendingRecordingImports = recoveredImports
             self.isPackageReadOnly = !project.compatibility.isWritable || sessions.contains { !$0.compatibility.isWritable }
-            self.needsSaveAfterOpen = (didNormalizeQuestionOrder || !recoveredImports.isEmpty || recoveryJournal != nil) && project.compatibility.isWritable
+            self.needsSaveAfterOpen = (didNormalizeQuestionOrder || migrationResult.migrationRecord != nil || !recoveredImports.isEmpty || recoveryJournal != nil) && project.compatibility.isWritable
             self.consolidationRecoveryMessage = recoveryJournal.map {
                 "The previous recording import did not finish committing. \($0.entries.count) recording(s) remain in recovery and will not be discarded automatically."
             }
@@ -115,7 +130,7 @@ final class InterviewStudioDocument: NSDocument {
 
     nonisolated override func write(to url: URL, ofType typeName: String) throws {
         let snapshot = MainActor.assumeIsolated {
-            (isPackageReadOnly, project, sessions, pendingPublicationRecords, pendingRecordingImports, packageStore)
+            (isPackageReadOnly, project, sessions, pendingPublicationRecords, pendingRecordingImports, packageStore, pendingMigrationRecords)
         }
         guard !snapshot.0 else {
             throw InterviewStudioPackageError.incompatible(snapshot.1.compatibility)
@@ -230,6 +245,13 @@ final class InterviewStudioDocument: NSDocument {
                 sha256: stagedCommit.imported.imported.recording.mediaSignature.sha256,
                 kind: .authoritative
             ))
+        }
+        // Write the audit record before the repaired project JSON. If the
+        // save is interrupted between files, reopening sees the exact
+        // accidental state and retries the same stable migration record.
+        for migration in snapshot.6 {
+            try store.writeMigrationRecord(migration)
+            changedInventoryPaths.insert("Migration History/\(migration.id.uuidString).json")
         }
         try store.writeProject(snapshot.1)
         changedInventoryPaths.insert(InterviewStudioPackageStore.projectFilename)

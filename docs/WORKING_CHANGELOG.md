@@ -22,6 +22,12 @@ Internal notes for building public-facing changelogs. Keep entries understandabl
 
 - Existing native answer outputs and FFmpeg render outputs are no longer silently overwritten.
 - Generated Phase 2 answer names sanitize project identifiers before constructing output paths.
+- Phase 2 derived publication builds now clean up after success, failure, cancellation, and retry, with a project-scoped cross-process lease protecting active consumers.
+- Failed Phase 1 renders now persist only the render plan and redacted command log; large ProRes intermediates and generated graphics are discarded with the temporary workspace.
+- Phase 1 now prefers hardware HEVC Main10 (`hevc_videotoolbox`, `p010le`) for compressed segments and approximately 60-second chunks, avoiding the multi-gigabyte ProRes scratch path and software `libx265` assembly bottleneck. `libx265` remains the preflight-selected fallback when hardware HEVC is unavailable.
+- Phase 1 derives every segment, transition, chunk, and final assembly from one export frame/audio-sample clock, eliminating progressive A/V drift from fractional per-segment durations; chunk stream durations are validated before source segments are removed.
+- Transition audio now rejects short loud transients from full crossfades, avoids loudness normalization on tiny transition slices, reduces quiet-bridge gain, and fails closed to a silence gap when no safe seam is available.
+- Phase 1 removes validated source segments after each chunk and stream-copies the chunk video into the final master; existing output, HDR/color, audio, timing, and final-contract validation remains fail-closed.
 - Recording imports use app-owned staging, checksum verification, atomic promotion, package-local recovery journaling, and inventory updates.
 - Archived age entries are excluded from future renders without deleting source media; restoring an archive preserves the same identity.
 

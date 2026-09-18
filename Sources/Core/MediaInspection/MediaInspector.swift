@@ -34,25 +34,39 @@ public struct FFmpegBinarySet: Sendable {
     public var sourceDescription: String
 }
 
+public enum PhaseOneVideoEncoder: String, Sendable {
+    case hevcVideoToolbox = "hevc_videotoolbox"
+    case libx265
+}
+
 public struct FFmpegCapabilities: Sendable {
     public var hasZscale: Bool
     public var hasXfade: Bool
     public var hasAcrossfade: Bool
     public var hasOverlay: Bool
     public var hasLibx265: Bool
+    public var hasHevcVideoToolbox: Bool
 
     public init(
         hasZscale: Bool,
         hasXfade: Bool,
         hasAcrossfade: Bool,
         hasOverlay: Bool,
-        hasLibx265: Bool
+        hasLibx265: Bool,
+        hasHevcVideoToolbox: Bool = false
     ) {
         self.hasZscale = hasZscale
         self.hasXfade = hasXfade
         self.hasAcrossfade = hasAcrossfade
         self.hasOverlay = hasOverlay
         self.hasLibx265 = hasLibx265
+        self.hasHevcVideoToolbox = hasHevcVideoToolbox
+    }
+
+    public var preferredPhaseOneVideoEncoder: PhaseOneVideoEncoder? {
+        if hasHevcVideoToolbox { return .hevcVideoToolbox }
+        if hasLibx265 { return .libx265 }
+        return nil
     }
 
     public var missingPhaseOneCapabilities: [String] {
@@ -61,7 +75,7 @@ public struct FFmpegCapabilities: Sendable {
         if !hasXfade { missing.append("xfade") }
         if !hasAcrossfade { missing.append("acrossfade") }
         if !hasOverlay { missing.append("overlay") }
-        if !hasLibx265 { missing.append("libx265") }
+        if preferredPhaseOneVideoEncoder == nil { missing.append("libx265 or hevc_videotoolbox") }
         return missing
     }
 
@@ -78,6 +92,10 @@ public struct FFmpegPreflightResult: Sendable {
 public struct MediaInspectionResult: Sendable, Hashable {
     public var url: URL
     public var durationSeconds: Double
+    public var videoDurationSeconds: Double?
+    public var audioDurationSeconds: Double?
+    public var videoFrameCount: Int?
+    public var audioDurationTicks: Int64?
     public var width: Int
     public var height: Int
     public var frameRate: Double
@@ -90,10 +108,25 @@ public struct MediaInspectionResult: Sendable, Hashable {
     public var colorInfo: ColorInfo
     public var codecName: String?
     public var formatName: String?
+    public var videoProfile: String?
+    public var videoLevel: Int?
+    public var videoCodecTag: String?
+    public var videoTimeBase: String?
+    public var sampleAspectRatio: String?
+    public var audioCodecName: String?
+    public var audioSampleRate: Int?
+    public var audioSampleFormat: String?
+    public var audioChannelLayout: String?
+    public var audioTimeBase: String?
+    public var streamCount: Int
 
     public init(
         url: URL,
         durationSeconds: Double,
+        videoDurationSeconds: Double? = nil,
+        audioDurationSeconds: Double? = nil,
+        videoFrameCount: Int? = nil,
+        audioDurationTicks: Int64? = nil,
         width: Int,
         height: Int,
         frameRate: Double,
@@ -105,10 +138,25 @@ public struct MediaInspectionResult: Sendable, Hashable {
         audioChannels: Int,
         colorInfo: ColorInfo,
         codecName: String? = nil,
-        formatName: String? = nil
+        formatName: String? = nil,
+        videoProfile: String? = nil,
+        videoLevel: Int? = nil,
+        videoCodecTag: String? = nil,
+        videoTimeBase: String? = nil,
+        sampleAspectRatio: String? = nil,
+        audioCodecName: String? = nil,
+        audioSampleRate: Int? = nil,
+        audioSampleFormat: String? = nil,
+        audioChannelLayout: String? = nil,
+        audioTimeBase: String? = nil,
+        streamCount: Int = 0
     ) {
         self.url = url
         self.durationSeconds = durationSeconds
+        self.videoDurationSeconds = videoDurationSeconds
+        self.audioDurationSeconds = audioDurationSeconds
+        self.videoFrameCount = videoFrameCount
+        self.audioDurationTicks = audioDurationTicks
         self.width = width
         self.height = height
         self.frameRate = frameRate
@@ -121,6 +169,17 @@ public struct MediaInspectionResult: Sendable, Hashable {
         self.colorInfo = colorInfo
         self.codecName = codecName
         self.formatName = formatName
+        self.videoProfile = videoProfile
+        self.videoLevel = videoLevel
+        self.videoCodecTag = videoCodecTag
+        self.videoTimeBase = videoTimeBase
+        self.sampleAspectRatio = sampleAspectRatio
+        self.audioCodecName = audioCodecName
+        self.audioSampleRate = audioSampleRate
+        self.audioSampleFormat = audioSampleFormat
+        self.audioChannelLayout = audioChannelLayout
+        self.audioTimeBase = audioTimeBase
+        self.streamCount = streamCount
     }
 }
 
@@ -221,7 +280,8 @@ public struct FFmpegPreflight {
             hasXfade: normalizedFilters.contains("xfade"),
             hasAcrossfade: normalizedFilters.contains("acrossfade"),
             hasOverlay: normalizedFilters.contains("overlay"),
-            hasLibx265: normalizedEncoders.contains("libx265")
+            hasLibx265: normalizedEncoders.contains("libx265"),
+            hasHevcVideoToolbox: normalizedEncoders.contains("hevc_videotoolbox")
         )
         return FFmpegPreflightResult(binaries: binaries, capabilities: capabilities)
     }
@@ -277,6 +337,10 @@ public struct MediaInspector {
         return MediaInspectionResult(
             url: url,
             durationSeconds: duration,
+            videoDurationSeconds: Double(video.duration ?? ""),
+            audioDurationSeconds: audio.flatMap { Double($0.duration ?? "") },
+            videoFrameCount: Int(video.nbFrames ?? ""),
+            audioDurationTicks: audio?.durationTS,
             width: width,
             height: height,
             frameRate: frameRate,
@@ -294,7 +358,18 @@ public struct MediaInspector {
                 isDisplayP3Like: isDisplayP3Like
             ),
             codecName: video.codecName,
-            formatName: decoded.format?.formatName
+            formatName: decoded.format?.formatName,
+            videoProfile: video.profile,
+            videoLevel: video.level,
+            videoCodecTag: video.codecTagString,
+            videoTimeBase: video.timeBase,
+            sampleAspectRatio: video.sampleAspectRatio,
+            audioCodecName: audio?.codecName,
+            audioSampleRate: audio.flatMap { Int($0.sampleRate ?? "") },
+            audioSampleFormat: audio?.sampleFormat,
+            audioChannelLayout: audio?.channelLayout,
+            audioTimeBase: audio?.timeBase,
+            streamCount: decoded.streams.count
         )
     }
 
@@ -320,6 +395,17 @@ private struct FFprobeEnvelope: Decodable {
         var colorPrimaries: String?
         var rFrameRate: String?
         var channels: Int?
+        var profile: String?
+        var level: Int?
+        var codecTagString: String?
+        var timeBase: String?
+        var sampleAspectRatio: String?
+        var sampleRate: String?
+        var sampleFormat: String?
+        var channelLayout: String?
+        var duration: String?
+        var nbFrames: String?
+        var durationTS: Int64?
 
         enum CodingKeys: String, CodingKey {
             case codecType = "codec_type"
@@ -332,6 +418,17 @@ private struct FFprobeEnvelope: Decodable {
             case colorPrimaries = "color_primaries"
             case rFrameRate = "r_frame_rate"
             case channels
+            case profile
+            case level
+            case codecTagString = "codec_tag_string"
+            case timeBase = "time_base"
+            case sampleAspectRatio = "sample_aspect_ratio"
+            case sampleRate = "sample_rate"
+            case sampleFormat = "sample_fmt"
+            case channelLayout = "channel_layout"
+            case duration
+            case nbFrames = "nb_frames"
+            case durationTS = "duration_ts"
         }
     }
 
@@ -365,7 +462,14 @@ public enum MediaInspectionError: LocalizedError, Sendable {
 public struct RenderOutputValidator: Sendable {
     public init() {}
 
-    public func validate(_ inspection: MediaInspectionResult, against profile: ExportProfile, expectedDurationSeconds: Double? = nil) throws {
+    public func validate(
+        _ inspection: MediaInspectionResult,
+        against profile: ExportProfile,
+        expectedDurationSeconds: Double? = nil,
+        expectedVideoFrameCount: Int? = nil,
+        expectedAudioSampleCount: Int? = nil,
+        requireFinalOutputContract: Bool = false
+    ) throws {
         let codec = inspection.codecName?.lowercased() ?? ""
         guard codec.contains("hevc") || codec.contains("h265") else {
             throw RenderOutputValidationError.mismatch(field: "codec", expected: "HEVC", observed: inspection.codecName ?? "missing")
@@ -391,6 +495,76 @@ public struct RenderOutputValidator: Sendable {
         }
         guard inspection.hasAudio, inspection.audioChannels > 0 else {
             throw RenderOutputValidationError.mismatch(field: "audio", expected: "an audio stream", observed: "missing or empty")
+        }
+        if let videoDuration = inspection.videoDurationSeconds,
+           let audioDuration = inspection.audioDurationSeconds {
+            let syncTolerance = max(1.0 / profile.frameRate, 2.0 / 48_000.0)
+            guard abs(videoDuration - audioDuration) <= syncTolerance else {
+                throw RenderOutputValidationError.mismatch(
+                    field: "audio/video sync",
+                    expected: "stream durations within \(syncTolerance) s",
+                    observed: "video \(videoDuration) s, audio \(audioDuration) s"
+                )
+            }
+        } else if requireFinalOutputContract {
+            throw RenderOutputValidationError.mismatch(
+                field: "audio/video sync",
+                expected: "both video and audio stream durations",
+                observed: "missing stream duration metadata"
+            )
+        }
+        if let expectedVideoFrameCount {
+            guard let videoFrameCount = inspection.videoFrameCount else {
+                throw RenderOutputValidationError.mismatch(
+                    field: "video frame count",
+                    expected: String(expectedVideoFrameCount),
+                    observed: "missing metadata"
+                )
+            }
+            guard videoFrameCount == expectedVideoFrameCount else {
+                throw RenderOutputValidationError.mismatch(
+                    field: "video frame count",
+                    expected: String(expectedVideoFrameCount),
+                    observed: String(videoFrameCount)
+                )
+            }
+        }
+        if let expectedAudioSampleCount {
+            guard let audioDurationTicks = inspection.audioDurationTicks,
+                  inspection.audioSampleRate == 48_000 else {
+                throw RenderOutputValidationError.mismatch(
+                    field: "audio sample count",
+                    expected: String(expectedAudioSampleCount),
+                    observed: "missing 48 kHz duration ticks"
+                )
+            }
+            guard audioDurationTicks == Int64(expectedAudioSampleCount) else {
+                throw RenderOutputValidationError.mismatch(
+                    field: "audio sample count",
+                    expected: String(expectedAudioSampleCount),
+                    observed: String(audioDurationTicks)
+                )
+            }
+        }
+        if requireFinalOutputContract {
+            guard inspection.formatName?.lowercased().contains("mov") == true else {
+                throw RenderOutputValidationError.mismatch(field: "container", expected: "MOV", observed: inspection.formatName ?? "missing")
+            }
+            guard inspection.videoCodecTag?.lowercased() == "hvc1" else {
+                throw RenderOutputValidationError.mismatch(field: "video tag", expected: "hvc1", observed: inspection.videoCodecTag ?? "missing")
+            }
+            guard inspection.videoProfile?.lowercased().contains("main 10") == true || inspection.videoProfile?.lowercased().contains("main10") == true else {
+                throw RenderOutputValidationError.mismatch(field: "video profile", expected: "HEVC Main 10", observed: inspection.videoProfile ?? "missing")
+            }
+            guard inspection.audioCodecName?.lowercased() == "aac" else {
+                throw RenderOutputValidationError.mismatch(field: "audio codec", expected: "AAC", observed: inspection.audioCodecName ?? "missing")
+            }
+            guard inspection.audioSampleRate == 48_000 else {
+                throw RenderOutputValidationError.mismatch(field: "audio sample rate", expected: "48000 Hz", observed: inspection.audioSampleRate.map(String.init) ?? "missing")
+            }
+            guard inspection.audioChannels == 2, inspection.streamCount == 2 else {
+                throw RenderOutputValidationError.mismatch(field: "stream layout", expected: "one video stream and one stereo audio stream", observed: "\(inspection.streamCount) streams, \(inspection.audioChannels) audio channels")
+            }
         }
         if let expectedDurationSeconds {
             let tolerance = max(0.25, 4.0 / profile.frameRate)

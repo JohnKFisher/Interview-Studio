@@ -65,7 +65,11 @@ public struct AssemblySettings: Codable, Hashable, Sendable {
 
     public init(
         renderSettings: RenderSettings = .default,
-        plexMetadata: PlexMetadataInput = .init(),
+        // The companion is optional in the package-backed workflow. Keep
+        // Phase 1's sidecar default unchanged; Phase 2 has no Plex settings
+        // surface yet, so an enabled-but-empty companion must not block the
+        // primary master publication.
+        plexMetadata: PlexMetadataInput = .init(isEnabled: false),
         openingTitle: String = "",
         closingTitle: String = "",
         extensions: [String: JSONValue] = [:]
@@ -816,5 +820,38 @@ public struct MigrationRecord: Codable, Hashable, Sendable, Identifiable {
         self.sourcePathDescription = sourcePathDescription
         self.importedManifestSHA256 = importedManifestSHA256
         self.decisionSummary = decisionSummary
+    }
+}
+
+public enum InterviewStudioPackageMigration {
+    /// Stable identity for the repair of packages created while the Phase 2
+    /// AssemblySettings default accidentally enabled an empty Plex companion.
+    public static let accidentalEmptyPlexCompanionDefaultID = UUID(uuidString: "D6FC4F3D-4BC1-4C24-A3A6-2B0F0A0E0E42")!
+
+    public static func repairAccidentalEmptyPlexCompanion(
+        in project: InterviewStudioProject,
+        sourcePathDescription: String,
+        date: Date = Date()
+    ) -> (project: InterviewStudioProject, migrationRecord: MigrationRecord?) {
+        guard project.assemblySettings.plexMetadata == PlexMetadataInput() else {
+            return (project, nil)
+        }
+
+        var repaired = project
+        repaired.assemblySettings.plexMetadata.isEnabled = false
+        repaired.updatedAt = date
+        if !repaired.migrationHistoryIDs.contains(accidentalEmptyPlexCompanionDefaultID) {
+            repaired.migrationHistoryIDs.append(accidentalEmptyPlexCompanionDefaultID)
+        }
+        let record = MigrationRecord(
+            id: accidentalEmptyPlexCompanionDefaultID,
+            date: date,
+            sourcePathDescription: sourcePathDescription,
+            decisionSummary: [
+                "Disabled the accidental empty Plex companion default in an existing package-backed Phase 2 project.",
+                "Only assemblySettings.plexMetadata.isEnabled changed; source media, answers, render settings, and titles were preserved."
+            ]
+        )
+        return (repaired, record)
     }
 }

@@ -11,6 +11,8 @@ struct WaveformData: Sendable, Hashable {
 }
 
 struct SelectedTimelineRange: Sendable, Hashable {
+    static let reviewContextUS: Int64 = 3_000_000
+
     let durationUS: Int64
     let visibleStartUS: Int64
     let visibleEndUS: Int64
@@ -18,6 +20,12 @@ struct SelectedTimelineRange: Sendable, Hashable {
     let safeTrailingEndUS: Int64?
 
     var hasPreciseBuffers: Bool { safeLeadingStartUS != nil && safeTrailingEndUS != nil }
+
+    var reviewViewportUS: ClosedRange<Int64> {
+        let startUS = max(0, visibleStartUS - Self.reviewContextUS)
+        let endUS = min(durationUS, visibleEndUS + Self.reviewContextUS)
+        return startUS...max(startUS, endUS)
+    }
 }
 
 enum MediaAnalysisError: LocalizedError, Sendable {
@@ -94,7 +102,7 @@ struct MediaAudioExtractor: Sendable {
 }
 
 struct AudioWaveformAnalyzer: Sendable {
-    func analyze(url: URL, bucketCount: Int = 240, cacheKey: String? = nil) async throws -> WaveformData {
+    func analyze(url: URL, bucketCount: Int = 12_000, cacheKey: String? = nil) async throws -> WaveformData {
         let audioURL = try await MediaAudioExtractor().extract(from: url, cacheKey: cacheKey)
         defer {
             if cacheKey == nil { try? FileManager.default.removeItem(at: audioURL) }
@@ -384,31 +392,98 @@ private final class RecognitionState: @unchecked Sendable {
     var finished = false
 }
 
+enum WaveformHandle: Hashable {
+    case visibleLeading
+    case visibleTrailing
+    case leading
+    case trailing
+}
+
 struct WaveformView: View {
     let waveform: WaveformData
     let timeline: SelectedTimelineRange?
     let currentTimeUS: Int64
+    let displayRangeUS: ClosedRange<Int64>?
+    let selectionRangeUS: ClosedRange<Int64>?
+    let cutRangesUS: [ClosedRange<Int64>]
+    let onHandleChange: ((WaveformHandle, Int64) -> Void)?
     let onSeek: (Int64) -> Void
+    @State private var activeHandle: WaveformHandle?
+
+    init(
+        waveform: WaveformData,
+        timeline: SelectedTimelineRange?,
+        currentTimeUS: Int64,
+        displayRangeUS: ClosedRange<Int64>? = nil,
+        selectionRangeUS: ClosedRange<Int64>? = nil,
+        cutRangesUS: [ClosedRange<Int64>] = [],
+        onHandleChange: ((WaveformHandle, Int64) -> Void)? = nil,
+        onSeek: @escaping (Int64) -> Void
+    ) {
+        self.waveform = waveform
+        self.timeline = timeline
+        self.currentTimeUS = currentTimeUS
+        self.displayRangeUS = displayRangeUS
+        self.selectionRangeUS = selectionRangeUS
+        self.cutRangesUS = cutRangesUS
+        self.onHandleChange = onHandleChange
+        self.onSeek = onSeek
+    }
 
     var body: some View {
         GeometryReader { geometry in
             Canvas { context, size in
                 let peaks = waveform.peaks
                 guard !peaks.isEmpty else { return }
-                let step = size.width / CGFloat(peaks.count)
+                let (windowStartUS, windowEndUS) = windowBounds(for: waveform.durationUS)
+                let windowDurationUS = max(windowEndUS - windowStartUS, 1)
+                let sourceDurationUS = max(waveform.durationUS, 1)
+                let startIndex = min(
+                    max(Int((Double(windowStartUS) / Double(sourceDurationUS) * Double(peaks.count)).rounded(.down)), 0),
+                    peaks.count - 1
+                )
+                let endIndex = min(
+                    max(Int((Double(windowEndUS) / Double(sourceDurationUS) * Double(peaks.count)).rounded(.up)), startIndex + 1),
+                    peaks.count
+                )
+                let visiblePeaks = Array(peaks[startIndex..<endIndex])
+                let step = size.width / CGFloat(max(visiblePeaks.count, 1))
                 let midpoint = size.height / 2
                 let playedFraction = waveform.durationUS > 0
-                    ? min(max(Double(currentTimeUS) / Double(waveform.durationUS), 0), 1)
+                    ? min(max(Double(currentTimeUS - windowStartUS) / Double(windowDurationUS), 0), 1)
                     : 0
 
-                for (index, peak) in peaks.enumerated() {
+                func xPosition(for timeUS: Int64) -> CGFloat {
+                    size.width * CGFloat(min(max(Double(timeUS - windowStartUS) / Double(windowDurationUS), 0), 1))
+                }
+
+                func drawRange(_ range: ClosedRange<Int64>, fill: Color) {
+                    let startUS = max(range.lowerBound, windowStartUS)
+                    let endUS = min(range.upperBound, windowEndUS)
+                    guard endUS >= startUS else { return }
+                    let startX = xPosition(for: startUS)
+                    let endX = xPosition(for: endUS)
+                    let rect = CGRect(x: startX, y: 0, width: max(2, endX - startX), height: size.height)
+                    context.fill(Path(rect), with: .color(fill))
+                }
+
+                // Red ranges are already removed from the answer. A purple
+                // range is the current, not-yet-applied cut selection.
+                for range in cutRangesUS {
+                    drawRange(range, fill: Color.red.opacity(0.24))
+                }
+                if let selectionRangeUS, selectionRangeUS.lowerBound < selectionRangeUS.upperBound {
+                    drawRange(selectionRangeUS, fill: Color.purple.opacity(0.24))
+                }
+
+                for (index, peak) in visiblePeaks.enumerated() {
                     let x = step * (CGFloat(index) + 0.5)
                     let height = max(2, CGFloat(peak) * size.height * 0.86)
                     var path = Path()
                     path.move(to: CGPoint(x: x, y: midpoint - height / 2))
                     path.addLine(to: CGPoint(x: x, y: midpoint + height / 2))
-                    let fraction = Double(index) / Double(max(peaks.count - 1, 1))
-                    let timeUS = Int64(Double(waveform.durationUS) * fraction)
+                    let fraction = Double(index) / Double(max(visiblePeaks.count - 1, 1))
+                    let timeUS = windowStartUS + Int64(Double(windowDurationUS) * fraction)
                     let inVisible = timeline.map { timeUS >= $0.visibleStartUS && timeUS <= $0.visibleEndUS } ?? false
                     let inSafe = timeline.flatMap { range in
                         guard let start = range.safeLeadingStartUS, let end = range.safeTrailingEndUS else { return nil }
@@ -426,18 +501,34 @@ struct WaveformView: View {
                 }
 
                 if let timeline {
-                    func drawMarker(_ timeUS: Int64, color: Color) {
-                        let x = size.width * CGFloat(min(max(Double(timeUS) / Double(max(waveform.durationUS, 1)), 0), 1))
+                    func drawMarker(_ timeUS: Int64, color: Color, isHandle: Bool = false) {
+                        guard timeUS >= windowStartUS, timeUS <= windowEndUS else { return }
+                        let x = xPosition(for: timeUS)
                         var marker = Path()
                         marker.move(to: CGPoint(x: x, y: 0))
                         marker.addLine(to: CGPoint(x: x, y: size.height))
-                        context.stroke(marker, with: .color(color), lineWidth: 2)
+                        context.stroke(marker, with: .color(color), lineWidth: isHandle ? 3 : 2)
+                        if isHandle {
+                            var grip = Path()
+                            grip.move(to: CGPoint(x: x - 7, y: 0))
+                            grip.addLine(to: CGPoint(x: x + 7, y: 0))
+                            grip.addLine(to: CGPoint(x: x, y: 8))
+                            grip.closeSubpath()
+                            context.fill(grip, with: .color(color))
+                        }
                     }
-                    drawMarker(timeline.visibleStartUS, color: .green)
-                    drawMarker(timeline.visibleEndUS, color: .green)
+                    drawMarker(timeline.visibleStartUS, color: .green, isHandle: true)
+                    drawMarker(timeline.visibleEndUS, color: .green, isHandle: true)
                     if let safeStart = timeline.safeLeadingStartUS, let safeEnd = timeline.safeTrailingEndUS {
-                        drawMarker(safeStart, color: .orange)
-                        drawMarker(safeEnd, color: .orange)
+                        drawMarker(safeStart, color: .orange, isHandle: true)
+                        drawMarker(safeEnd, color: .orange, isHandle: true)
+                    }
+                    if let selectionStartUS = selectionRangeUS?.lowerBound {
+                        drawMarker(selectionStartUS, color: .purple, isHandle: true)
+                    }
+                    if let selectionRangeUS,
+                       selectionRangeUS.upperBound != selectionRangeUS.lowerBound {
+                        drawMarker(selectionRangeUS.upperBound, color: .purple, isHandle: true)
                     }
                 }
 
@@ -451,24 +542,71 @@ struct WaveformView: View {
             }
             .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
             .contentShape(Rectangle())
-            .gesture(DragGesture(minimumDistance: 0).onChanged { value in
-                let fraction = min(max(value.location.x / max(geometry.size.width, 1), 0), 1)
-                onSeek(Int64((Double(waveform.durationUS) * fraction).rounded()))
-            })
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { value in
+                        let timeUS = time(at: value.location.x, width: geometry.size.width, durationUS: waveform.durationUS)
+                        if let onHandleChange {
+                            if activeHandle == nil {
+                                activeHandle = nearestHandle(at: value.location.x, width: geometry.size.width, durationUS: waveform.durationUS)
+                            }
+                            if let activeHandle {
+                                onHandleChange(activeHandle, timeUS)
+                                return
+                            }
+                        }
+                        onSeek(timeUS)
+                    }
+                    .onEnded { _ in activeHandle = nil }
+            )
             .accessibilityElement()
             .accessibilityLabel(timeline.map { range in
                 range.hasPreciseBuffers ? "Audio waveform with answer and buffer ranges" : "Audio waveform with answer marker range"
             } ?? "Audio waveform")
             .accessibilityValue(timeline.map { range in
                 let answer = AccessibilityValueFormatter.range(startUS: range.visibleStartUS, endUS: range.visibleEndUS)
+                let cutCount = cutRangesUS.count
+                let cuts = cutCount == 0 ? "" : "; " + String(cutCount) + " internal cut" + (cutCount == 1 ? "" : "s") + " shown in red"
                 if let safeStart = range.safeLeadingStartUS, let safeEnd = range.safeTrailingEndUS {
-                    return "Answer \(answer); buffer range \(AccessibilityValueFormatter.range(startUS: safeStart, endUS: safeEnd)); \(AccessibilityValueFormatter.position(currentTimeUS: currentTimeUS, durationUS: waveform.durationUS))"
+                    return "Answer \(answer); buffer range \(AccessibilityValueFormatter.range(startUS: safeStart, endUS: safeEnd))\(cuts); \(AccessibilityValueFormatter.position(currentTimeUS: currentTimeUS, durationUS: waveform.durationUS))"
                 }
-                return "Answer markers \(answer); buffer range unavailable; \(AccessibilityValueFormatter.position(currentTimeUS: currentTimeUS, durationUS: waveform.durationUS))"
+                return "Answer markers \(answer); buffer range unavailable\(cuts); \(AccessibilityValueFormatter.position(currentTimeUS: currentTimeUS, durationUS: waveform.durationUS))"
             } ?? AccessibilityValueFormatter.position(currentTimeUS: currentTimeUS, durationUS: waveform.durationUS))
-            .accessibilityHint("Click or drag to move playback position")
+            .accessibilityHint(onHandleChange == nil ? "Click or drag to move playback position" : "Click or drag to move playback position. Drag a green answer boundary or orange transition handle to adjust it. Red ranges are removed; purple ranges are pending internal cuts.")
         }
         .frame(height: 110)
+    }
+
+    private func windowBounds(for durationUS: Int64) -> (start: Int64, end: Int64) {
+        let duration = max(durationUS, 1)
+        let start = min(max(displayRangeUS?.lowerBound ?? 0, 0), duration)
+        let end = max(start, min(displayRangeUS?.upperBound ?? duration, duration))
+        return (start, end)
+    }
+
+    private func time(at x: CGFloat, width: CGFloat, durationUS: Int64) -> Int64 {
+        let bounds = windowBounds(for: durationUS)
+        let fraction = min(max(x / max(width, 1), 0), 1)
+        return bounds.start + Int64((Double(bounds.end - bounds.start) * Double(fraction)).rounded())
+    }
+
+    private func nearestHandle(at x: CGFloat, width: CGFloat, durationUS: Int64) -> WaveformHandle? {
+        guard let timeline else { return nil }
+        let bounds = windowBounds(for: durationUS)
+        let windowDuration = max(bounds.end - bounds.start, 1)
+        var positions: [(WaveformHandle, CGFloat)] = [
+            (.visibleLeading, CGFloat(Double(timeline.visibleStartUS - bounds.start) / Double(windowDuration)) * width),
+            (.visibleTrailing, CGFloat(Double(timeline.visibleEndUS - bounds.start) / Double(windowDuration)) * width)
+        ]
+        if let safeStart = timeline.safeLeadingStartUS {
+            positions.append((.leading, CGFloat(Double(safeStart - bounds.start) / Double(windowDuration)) * width))
+        }
+        if let safeEnd = timeline.safeTrailingEndUS {
+            positions.append((.trailing, CGFloat(Double(safeEnd - bounds.start) / Double(windowDuration)) * width))
+        }
+        positions = positions.filter { $0.1 >= 0 && $0.1 <= width }
+        let hitRadius = max(16, min(26, width * 0.04))
+        return positions.min { abs($0.1 - x) < abs($1.1 - x) }.flatMap { abs($0.1 - x) <= hitRadius ? $0.0 : nil }
     }
 }
 

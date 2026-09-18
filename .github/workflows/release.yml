@@ -1,0 +1,142 @@
+name: macOS CI
+
+on:
+  push:
+    branches:
+      - '**'
+    tags:
+      - 'v*'
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build and test macOS app
+    runs-on: macos-26
+    outputs:
+      artifact: ${{ steps.package.outputs.artifact }}
+      artifact_name: ${{ steps.package.outputs.artifact_name }}
+      version: ${{ steps.package.outputs.version }}
+      build_number: ${{ steps.package.outputs.build_number }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v5
+
+      - name: Validate version tag
+        if: ${{ github.ref_type == 'tag' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected_tag="v$(tr -d '[:space:]' < VERSION)"
+          if [[ "$GITHUB_REF_NAME" != "$expected_tag" ]]; then
+            echo "::error::Release tag $GITHUB_REF_NAME does not match $expected_tag from VERSION."
+            exit 1
+          fi
+
+      - name: Install FFmpeg tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v ffmpeg >/dev/null 2>&1 || ! command -v ffprobe >/dev/null 2>&1; then
+            brew install ffmpeg
+          fi
+          command -v ffmpeg
+          command -v ffprobe
+          ffmpeg -version | sed -n '1p'
+          ffprobe -version | sed -n '1p'
+
+      - name: Run release test suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          YEARLY_INTERVIEW_STUDIO_FFMPEG="$(command -v ffmpeg)" \
+          YEARLY_INTERVIEW_STUDIO_FFPROBE="$(command -v ffprobe)" \
+            swift test --configuration release --scratch-path "$RUNNER_TEMP/interview-studio-tests"
+
+      - name: Build app bundle
+        id: package
+        shell: bash
+        env:
+          OUTPUT_DIR: ${{ runner.temp }}/interview-studio-package
+          BUILD_CONFIGURATION: release
+          PRESERVE_BUILD_NUMBER: '1'
+          BUNDLE_HOST_TOOLS: '1'
+          SIGNING_IDENTITY: '-'
+        run: |
+          set -euo pipefail
+          ./script/build_and_run.sh build
+
+          app="$OUTPUT_DIR/Yearly Interview Studio.app"
+          if [[ ! -d "$app" ]]; then
+            echo "::error::Expected app bundle was not produced at $app"
+            exit 1
+          fi
+          if [[ ! -x "$app/Contents/Resources/BundledTools/ffmpeg" || ! -x "$app/Contents/Resources/BundledTools/ffprobe" ]]; then
+            echo "::error::The CI app is missing its bundled FFmpeg/FFprobe pair."
+            exit 1
+          fi
+          codesign --verify --deep --strict "$app"
+          codesign -dvvv "$app" 2>&1 | grep -E 'Identifier=|Signature=adhoc'
+
+          version="$(tr -d '[:space:]' < VERSION)"
+          build_number="$(tr -d '[:space:]' < BUILD_NUMBER)"
+          artifact_name="interview-studio-${version}-build-${build_number}"
+          zip_path="$RUNNER_TEMP/${artifact_name}.zip"
+          ditto -c -k --keepParent "$app" "$zip_path"
+          echo "artifact=$zip_path" >> "$GITHUB_OUTPUT"
+          echo "artifact_name=$artifact_name" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "build_number=$build_number" >> "$GITHUB_OUTPUT"
+
+      - name: Upload app artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ steps.package.outputs.artifact_name }}
+          path: ${{ steps.package.outputs.artifact }}
+          if-no-files-found: error
+          retention-days: 14
+
+  publish-tagged-build:
+    name: Publish tagged developer preview
+    if: ${{ github.event_name == 'push' && github.ref_type == 'tag' }}
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download app artifact
+        uses: actions/download-artifact@v6
+        with:
+          name: ${{ needs.build.outputs.artifact_name }}
+          path: release-asset
+
+      - name: Create unsigned GitHub prerelease
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ needs.build.outputs.version }}
+          RELEASE_BUILD_NUMBER: ${{ needs.build.outputs.build_number }}
+        run: |
+          set -euo pipefail
+          asset="$(find release-asset -maxdepth 1 -type f -name '*.zip' -print -quit)"
+          if [[ -z "$asset" ]]; then
+            echo "::error::The app ZIP was not downloaded."
+            exit 1
+          fi
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::Release $GITHUB_REF_NAME already exists; refusing to overwrite it."
+            exit 1
+          fi
+          gh release create "$GITHUB_REF_NAME" "$asset" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --prerelease \
+            --generate-notes \
+            --title "Interview Studio $RELEASE_VERSION (build $RELEASE_BUILD_NUMBER, unsigned)"
