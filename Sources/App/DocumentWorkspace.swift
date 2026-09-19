@@ -27,6 +27,10 @@ private func cleanupDerivedBuildOffMain(at buildURL: URL, in buildRoot: URL, for
     }.value
 }
 
+private struct RecordingImportWorkerResult: Sendable {
+    let stagedImports: [StagedRecordingImport]
+}
+
 @MainActor
 final class InterviewStudioWorkspaceModel: ObservableObject {
     @Published var project: InterviewStudioProject
@@ -71,6 +75,9 @@ final class InterviewStudioWorkspaceModel: ObservableObject {
     private var bulkTranscriptionTask: Task<Void, Never>?
     private var boundaryRefinementTask: Task<Void, Never>?
     private var boundaryRefinementRequestID: UUID?
+    private var activeRecordingImportID: UUID?
+    private var activeRecordingImportTask: Task<Void, Never>?
+    private var activeRecordingImportWorker: Task<RecordingImportWorkerResult, Error>?
     private var waveformCache: [String: WaveformData] = [:]
     private var loadedPlayerURL: URL?
     private var loadedPlayerAnalysisID: String?
@@ -168,8 +175,179 @@ final class InterviewStudioWorkspaceModel: ObservableObject {
         }
     }
 
+    var canEditSelectedAnswer: Bool {
+        guard let session = selectedSession else { return false }
+        return !isRecordingImportInFlight && session.isActive && session.compatibility.isWritable && session.lifecycle == .open && document?.isPackageReadOnly != true
+    }
+
+    var isRecordingImportInFlight: Bool {
+        activeRecordingImportID != nil || document?.isCloseReviewInProgress == true
+    }
+
     func flushToDocument() {
         document?.apply(project: project, sessions: sessions)
+    }
+
+    /// Starts an import whose worker owns only provisional staging. The live
+    /// session is rebased and appended to on the main actor after the worker
+    /// finishes; the worker never returns a replacement session snapshot.
+    func beginRecordingImport(urls: [URL], for session: InterviewSession, store: InterviewStudioPackageStore) {
+        guard !urls.isEmpty,
+              activeRecordingImportID == nil,
+              document?.isCloseReviewInProgress != true else { return }
+
+        let operationID = UUID()
+        let stagingRoot = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
+            .appendingPathComponent("YearlyInterviewStudio/ImportStaging", isDirectory: true)
+            .appendingPathComponent(operationID.uuidString, isDirectory: true)
+        let worker = Task.detached(priority: .userInitiated) { () throws -> RecordingImportWorkerResult in
+            var stagedImports: [StagedRecordingImport] = []
+            var knownHashes = Set(session.recordings.map { $0.mediaSignature.sha256 }.filter { !$0.isEmpty })
+            for url in urls {
+                try Task.checkCancellation()
+                let sourceHash = sha256(fileURL: url)
+                try Task.checkCancellation()
+                if !sourceHash.isEmpty && knownHashes.contains(sourceHash) { continue }
+                let staged = try await store.stageRecordingImport(
+                    from: url,
+                    ageKey: session.ageKey,
+                    ageLabel: session.ageLabel,
+                    source: .finder,
+                    stagingRoot: stagingRoot,
+                    order: session.recordings.count + stagedImports.count,
+                    recordingNumber: session.nextRecordingNumber + stagedImports.count
+                )
+                try Task.checkCancellation()
+                if staged.imported.duplicateOf == nil {
+                    stagedImports.append(staged)
+                    let hash = staged.imported.recording.mediaSignature.sha256
+                    if !hash.isEmpty { knownHashes.insert(hash) }
+                }
+            }
+            try Task.checkCancellation()
+            return RecordingImportWorkerResult(stagedImports: stagedImports)
+        }
+
+        activeRecordingImportID = operationID
+        activeRecordingImportWorker = worker
+        isBusy = true
+        progressMessage = "Staging \(urls.count) recording(s)…"
+
+        let completionTask = Task { @MainActor [weak self, worker, stagingRoot] in
+            var transferredToDocument = false
+            defer {
+                if !transferredToDocument {
+                    Self.removeRecordingImportStaging(at: stagingRoot)
+                }
+                if let self, self.activeRecordingImportID == operationID {
+                    self.activeRecordingImportID = nil
+                    self.activeRecordingImportTask = nil
+                    self.activeRecordingImportWorker = nil
+                    self.isBusy = false
+                }
+            }
+
+            do {
+                let result = try await withTaskCancellationHandler(operation: {
+                    try await worker.value
+                }, onCancel: {
+                    worker.cancel()
+                })
+                try Task.checkCancellation()
+                guard let self, self.activeRecordingImportID == operationID else { return }
+                guard let document = self.document else {
+                    self.errorMessage = "The project document is no longer available."
+                    return
+                }
+                guard let currentIndex = self.sessions.firstIndex(where: { $0.id == session.id }) else {
+                    self.errorMessage = "The target age entry no longer exists; the recording import was canceled."
+                    return
+                }
+                guard self.sessions[currentIndex].isActive,
+                      self.sessions[currentIndex].compatibility.isWritable,
+                      self.sessions[currentIndex].lifecycle == .open else {
+                    self.errorMessage = "The target age entry is no longer editable; the recording import was canceled."
+                    return
+                }
+
+                let acceptedImports = self.mergeRecordingImports(
+                    result.stagedImports,
+                    intoSessionAt: currentIndex,
+                    baseRevision: session.revision
+                )
+                guard !acceptedImports.isEmpty else {
+                    self.progressMessage = "Those recordings are already in this project."
+                    return
+                }
+                document.stage(recordingImports: acceptedImports)
+                self.selectedRecordingID = self.selectedRecordingID.flatMap { selectedID in
+                    self.sessions[currentIndex].recordings.contains(where: { $0.id == selectedID }) ? selectedID : nil
+                } ?? self.sessions[currentIndex].recordings.last?.id
+                self.progressMessage = "Recording(s) ready. Save the project to finish importing them."
+                self.flushToDocument()
+                transferredToDocument = true
+            } catch is CancellationError {
+                return
+            } catch {
+                guard let self, self.activeRecordingImportID == operationID else { return }
+                self.errorMessage = error.localizedDescription
+                self.progressMessage = nil
+            }
+        }
+        activeRecordingImportTask = completionTask
+    }
+
+    private func mergeRecordingImports(
+        _ stagedImports: [StagedRecordingImport],
+        intoSessionAt sessionIndex: Int,
+        baseRevision: Int
+    ) -> [StagedRecordingImport] {
+        var session = sessions[sessionIndex]
+        let mergeResult = session.mergeImportedRecordings(
+            stagedImports.map { $0.imported.recording },
+            importedAtRevision: baseRevision
+        )
+        let acceptedIDs = Set(mergeResult.addedRecordings.map(\.id))
+        for stagedImport in stagedImports where !acceptedIDs.contains(stagedImport.imported.recording.id) {
+            Self.removeRecordingImportStagingFile(at: stagedImport.stagedURL)
+        }
+        guard !mergeResult.addedRecordings.isEmpty else { return [] }
+        sessions[sessionIndex] = session
+        let stagedByID = Dictionary(uniqueKeysWithValues: stagedImports.map { ($0.imported.recording.id, $0) })
+        return mergeResult.addedRecordings.compactMap { recording in
+            guard let stagedImport = stagedByID[recording.id] else { return nil }
+            return StagedRecordingImport(imported: ImportedRecording(recording: recording), stagedURL: stagedImport.stagedURL)
+        }
+    }
+
+    func cancelActiveRecordingImportForDocumentClose() {
+        guard activeRecordingImportID != nil else { return }
+        // Keep the operation token and busy state until the canceled wrapper
+        // drains. AppKit's close review/autosave is asynchronous; clearing
+        // ownership here would allow a new import to start during that save
+        // window. The completion defer releases the token after cleanup.
+        activeRecordingImportTask?.cancel()
+        activeRecordingImportWorker?.cancel()
+        progressMessage = "Canceling the recording import…"
+    }
+
+    private static func removeRecordingImportStaging(at root: URL) {
+        let cacheRoot = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
+            .appendingPathComponent("YearlyInterviewStudio/ImportStaging", isDirectory: true)
+            .standardizedFileURL
+        let candidate = root.standardizedFileURL
+        guard candidate.path.hasPrefix(cacheRoot.path + "/") else { return }
+        try? FileManager.default.removeItem(at: candidate)
+    }
+
+    private static func removeRecordingImportStagingFile(at file: URL?) {
+        guard let file else { return }
+        let cacheRoot = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
+            .appendingPathComponent("YearlyInterviewStudio/ImportStaging", isDirectory: true)
+            .standardizedFileURL
+        let candidate = file.standardizedFileURL
+        guard candidate.path.hasPrefix(cacheRoot.path + "/") else { return }
+        try? FileManager.default.removeItem(at: candidate)
     }
 
     func prepareMediaAnalysis() async {
@@ -845,60 +1023,77 @@ final class InterviewStudioWorkspaceModel: ObservableObject {
             errorMessage = "Save the project before importing source recordings."
             return
         }
-        let stagingRoot = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
-            .appendingPathComponent("YearlyInterviewStudio/ImportStaging", isDirectory: true)
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        guard let currentSession = sessions.first(where: { $0.id == session.id }) else {
+            isBusy = false
+            progressMessage = nil
+            errorMessage = "The target interview year is no longer available."
+            return
+        }
         progressMessage = "Staging \(recordingURLs.count) recording(s)…"
-        let importTask = Task.detached(priority: .userInitiated) {
-            var completed = false
-            defer {
-                if !completed {
-                    try? FileManager.default.removeItem(at: stagingRoot)
-                }
-            }
-            var updated = session
-            var stagedImports: [StagedRecordingImport] = []
-            for (index, url) in recordingURLs.enumerated() {
-                let stagedImport = try await store.stageRecordingImport(
-                    from: url,
-                    ageKey: session.ageKey,
-                    ageLabel: session.ageLabel,
-                    source: .finder,
-                    stagingRoot: stagingRoot,
-                    order: updated.recordings.count + index
-                )
-                if stagedImport.imported.duplicateOf == nil {
-                    updated.recordings.append(stagedImport.imported.recording)
-                    stagedImports.append(stagedImport)
-                }
-            }
-            completed = true
-            return (updated, stagedImports)
-        }
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            do {
-                let importResult = try await importTask.value
-                let updated = importResult.0
-                guard let currentIndex = self.sessions.firstIndex(where: { $0.id == session.id }) else { return }
-                self.sessions[currentIndex] = updated
-                self.selectedRecordingID = updated.recordings.first?.id
-                self.progressMessage = "Recording ready. Save the project to persist it."
-                self.isBusy = false
-                self.document?.stage(recordingImports: importResult.1)
-                self.flushToDocument()
-            } catch {
-                self.errorMessage = error.localizedDescription
-                self.progressMessage = nil
-                self.isBusy = false
-            }
-        }
+        beginRecordingImport(urls: recordingURLs, for: currentSession, store: store)
     }
 
     func markStart() { updateSelectedAnswer(marker: .start) }
     func markEnd() { updateSelectedAnswer(marker: .end) }
     func markResume() { updateSelectedAnswer(marker: .resume) }
     func markNoResume() { updateSelectedAnswer(marker: .noResume) }
+
+    func setSelectedAnswerBoundary(handle: WaveformHandle, timeUS: Int64) {
+        guard canEditSelectedAnswer,
+              let questionKey = selectedQuestionKey,
+              let recordingID = selectedRecording?.id,
+              let sessionIndex = sessions.firstIndex(where: { $0.id == selectedSessionID }),
+              var answer = sessions[sessionIndex].answers[questionKey],
+              let takeIndex = answer.takes.firstIndex(where: { $0.id == answer.selectedTakeID }),
+              let partIndex = answer.takes[takeIndex].parts.firstIndex(where: { $0.sourceRecordingID == recordingID }),
+              let durationUS = waveform?.durationUS ?? selectedRecording?.mediaSignature.durationMicroseconds,
+              durationUS > 0 else { return }
+
+        var part = answer.takes[takeIndex].parts[partIndex]
+        let existing = part.refinedBoundaries
+        let visibleStartUS = min(max(existing?.visibleStart.microseconds ?? part.rawMarkers.answerStart?.microseconds ?? 0, 0), durationUS)
+        let visibleEndUS = min(max(existing?.visibleEnd.microseconds ?? part.rawMarkers.answerEnd?.microseconds ?? durationUS, visibleStartUS), durationUS)
+        let safeLeadingStartUS = min(max(existing?.safeLeadingStart.microseconds ?? visibleStartUS, 0), visibleStartUS)
+        let safeTrailingEndUS = min(max(existing?.safeTrailingEnd.microseconds ?? visibleEndUS, visibleEndUS), durationUS)
+        let clampedTimeUS = min(max(timeUS, 0), durationUS)
+        guard visibleEndUS > visibleStartUS else { return }
+
+        var newVisibleStartUS = visibleStartUS
+        var newVisibleEndUS = visibleEndUS
+        var newSafeLeadingStartUS = safeLeadingStartUS
+        var newSafeTrailingEndUS = safeTrailingEndUS
+
+        switch handle {
+        case .visibleLeading:
+            newVisibleStartUS = min(clampedTimeUS, max(0, visibleEndUS - 1))
+            newSafeLeadingStartUS = min(safeLeadingStartUS, newVisibleStartUS)
+            part.rawMarkers.answerStart = .microseconds(newVisibleStartUS)
+        case .visibleTrailing:
+            newVisibleEndUS = max(clampedTimeUS, min(durationUS, visibleStartUS + 1))
+            newSafeTrailingEndUS = max(safeTrailingEndUS, newVisibleEndUS)
+            part.rawMarkers.answerEnd = .microseconds(newVisibleEndUS)
+        case .leading:
+            newSafeLeadingStartUS = min(clampedTimeUS, newVisibleStartUS)
+        case .trailing:
+            newSafeTrailingEndUS = max(clampedTimeUS, newVisibleEndUS)
+        }
+
+        part.refinedBoundaries = RefinedBoundaries(
+            visibleStart: .microseconds(newVisibleStartUS),
+            visibleEnd: .microseconds(newVisibleEndUS),
+            safeLeadingStart: .microseconds(newSafeLeadingStartUS),
+            safeTrailingEnd: .microseconds(newSafeTrailingEndUS),
+            confidence: 1,
+            reasons: ["Adjusted manually on the legacy timeline."],
+            algorithmIdentifier: "legacy-manual-boundaries",
+            algorithmVersion: "1.0",
+            manualOverride: true
+        )
+        answer.takes[takeIndex].parts[partIndex] = part
+        answer.state = .inProgress
+        sessions[sessionIndex].answers[questionKey] = answer
+        flushToDocument()
+    }
 
     func completeSelectedAnswer() {
         guard let questionKey = selectedQuestionKey, let recordingID = selectedRecording?.id, let sessionIndex = sessions.firstIndex(where: { $0.id == selectedSessionID }), var answer = sessions[sessionIndex].answers[questionKey], let takeIndex = answer.takes.firstIndex(where: { $0.id == answer.selectedTakeID }) else {
@@ -1442,9 +1637,16 @@ struct NewInterviewYearSheet: View {
                     ProgressView("Building waveform…")
                         .controlSize(.small)
                 } else if let waveform = model.waveform {
-                    WaveformView(waveform: waveform, timeline: model.selectedTimelineRange, currentTimeUS: model.currentTimeUS) { timeUS in
-                        model.seek(to: timeUS)
-                    }
+                    WaveformView(
+                        waveform: waveform,
+                        timeline: model.selectedTimelineRange,
+                        currentTimeUS: model.currentTimeUS,
+                        onHandleChange: { handle, timeUS in
+                            model.setSelectedAnswerBoundary(handle: handle, timeUS: timeUS)
+                        },
+                        onSeek: { timeUS in model.seek(to: timeUS) }
+                    )
+                    .disabled(!model.canEditSelectedAnswer)
                     if let range = model.selectedTimelineRange {
                         Text(timelineSummary(range))
                             .font(.caption.monospaced())

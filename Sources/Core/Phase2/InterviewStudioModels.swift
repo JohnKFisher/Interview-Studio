@@ -652,6 +652,57 @@ public struct InterviewSession: Codable, Hashable, Sendable, Identifiable {
     public var nextRecordingNumber: Int { (recordings.map(\.recordingNumber).max() ?? 0) + 1 }
     public func nextClipNumber(for recordingID: UUID) -> Int { (candidates.filter { $0.sourceRecordingID == recordingID }.map(\.clipNumber).max() ?? 0) + 1 }
     public func normalizedAge() -> NormalizedAge { AgeNormalization.normalize(key: ageKey, label: ageLabel, sortValue: ageSortValue) }
+
+    public mutating func mergeImportedRecordings(
+        _ importedRecordings: [SourceRecording],
+        importedAtRevision: Int
+    ) -> RecordingImportMergeResult {
+        let previousRevision = revision
+        var knownIDs = Set(recordings.map(\.id))
+        var knownHashes = Set(recordings.map { $0.mediaSignature.sha256 }.filter { !$0.isEmpty })
+        var nextOrder = (recordings.map(\.order).max() ?? -1) + 1
+        var nextRecordingNumber = self.nextRecordingNumber
+        var addedRecordings: [SourceRecording] = []
+
+        for original in importedRecordings {
+            let hash = original.mediaSignature.sha256
+            guard knownIDs.insert(original.id).inserted,
+                  hash.isEmpty || knownHashes.insert(hash).inserted else { continue }
+
+            var recording = original
+            recording.ageKey = ageKey
+            recording.ageLabel = ageLabel
+            recording.order = nextOrder
+            recording.recordingNumber = nextRecordingNumber
+            nextOrder += 1
+            nextRecordingNumber += 1
+            recordings.append(recording)
+            addedRecordings.append(recording)
+        }
+
+        guard !addedRecordings.isEmpty else {
+            return RecordingImportMergeResult(
+                addedRecordings: [],
+                importedAtRevision: importedAtRevision,
+                previousRevision: previousRevision,
+                resultingRevision: previousRevision
+            )
+        }
+
+        revision += 1
+        publicationFingerprint = nil
+        let detail = previousRevision == importedAtRevision
+            ? "Imported \(addedRecordings.count) recording(s) at revision \(revision)."
+            : "Merged \(addedRecordings.count) recording(s) onto revision \(previousRevision) after concurrent edits from revision \(importedAtRevision)."
+        appendAudit("recordings_imported", detail: detail)
+        return RecordingImportMergeResult(
+            addedRecordings: addedRecordings,
+            importedAtRevision: importedAtRevision,
+            previousRevision: previousRevision,
+            resultingRevision: revision
+        )
+    }
+
     public mutating func changeAge(key: String, label: String, sortValue: Double? = nil) throws {
         guard compatibility.isWritable else { throw InterviewStudioCompatibilityError.readOnly("The session uses an unsupported schema or workflow.") }
         guard isActive else { throw InterviewStudioCompatibilityError.invalid("Restore the archived session before changing its age.") }
@@ -730,6 +781,22 @@ public struct InterviewSession: Codable, Hashable, Sendable, Identifiable {
         revision += 1
         appendAudit("lock", detail: "Locked revision \(revision).")
     }
+}
+
+public struct RecordingImportMergeResult: Codable, Hashable, Sendable {
+    public var addedRecordings: [SourceRecording]
+    public var importedAtRevision: Int
+    public var previousRevision: Int
+    public var resultingRevision: Int
+
+    public init(addedRecordings: [SourceRecording], importedAtRevision: Int, previousRevision: Int, resultingRevision: Int) {
+        self.addedRecordings = addedRecordings
+        self.importedAtRevision = importedAtRevision
+        self.previousRevision = previousRevision
+        self.resultingRevision = resultingRevision
+    }
+
+    public var wasRebased: Bool { importedAtRevision != previousRevision }
 }
 
 public struct PublicationRecord: Codable, Hashable, Sendable, Identifiable {

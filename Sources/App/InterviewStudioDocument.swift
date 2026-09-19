@@ -1,6 +1,7 @@
 import AppKit
 import Core
 import Darwin
+import DocumentCloseBridge
 import SwiftUI
 
 private struct StagedRecordingCommit {
@@ -13,6 +14,49 @@ private func stagedFileByteCount(_ url: URL) -> Int64 {
     ((try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? NSNumber)?.int64Value) ?? 0
 }
 
+private final class DocumentCloseReviewProxy: NSObject {
+    weak var document: InterviewStudioDocument?
+    let generation: UUID
+    private let originalDelegate: AnyObject?
+    private let originalSelector: Selector?
+    private let originalContextInfo: UnsafeMutableRawPointer?
+
+    init(
+        document: InterviewStudioDocument,
+        generation: UUID,
+        originalDelegate: AnyObject?,
+        originalSelector: Selector?,
+        originalContextInfo: UnsafeMutableRawPointer?
+    ) {
+        self.document = document
+        self.generation = generation
+        self.originalDelegate = originalDelegate
+        self.originalSelector = originalSelector
+        self.originalContextInfo = originalContextInfo
+        super.init()
+    }
+
+    @MainActor @objc func document(_ document: NSDocument, shouldClose: Bool, contextInfo: UnsafeMutableRawPointer?) {
+        // AppKit does not promise to retain the delegate for the lifetime of
+        // the asynchronous close review. Keep this proxy alive across the
+        // forwarded callback; the original delegate may synchronously call
+        // close(), which must not release the proxy before this method returns.
+        withExtendedLifetime(self) {
+            let owningDocument = self.document
+            if let originalDelegate, let originalSelector {
+                ISInvokeDocumentCloseCallback(
+                    originalDelegate,
+                    originalSelector,
+                    document,
+                    shouldClose,
+                    originalContextInfo
+                )
+            }
+            owningDocument?.completeCloseReview(shouldClose: shouldClose, generation: generation)
+        }
+    }
+}
+
 final class InterviewStudioDocument: NSDocument {
     var project: InterviewStudioProject
     var sessions: [InterviewSession]
@@ -21,6 +65,8 @@ final class InterviewStudioDocument: NSDocument {
     private var pendingRecordingImports: [StagedRecordingImport]
     private var cachedPackageStore: InterviewStudioPackageStore?
     private(set) var consolidationRecoveryMessage: String?
+    private var closeReviewProxies: [UUID: DocumentCloseReviewProxy]
+    private(set) var isCloseReviewInProgress = false
     var packageStore: InterviewStudioPackageStore? {
         get {
             guard let fileURL else { return cachedPackageStore }
@@ -48,6 +94,7 @@ final class InterviewStudioDocument: NSDocument {
         pendingRecordingImports = []
         cachedPackageStore = nil
         consolidationRecoveryMessage = nil
+        closeReviewProxies = [:]
         super.init()
         hasUndoManager = true
     }
@@ -60,6 +107,7 @@ final class InterviewStudioDocument: NSDocument {
         pendingRecordingImports = []
         cachedPackageStore = nil
         consolidationRecoveryMessage = nil
+        closeReviewProxies = [:]
         super.init()
     }
 
@@ -323,9 +371,41 @@ final class InterviewStudioDocument: NSDocument {
         addWindowController(NSWindowController(window: window))
     }
 
+    override func canClose(withDelegate delegate: Any?, shouldClose shouldCloseSelector: Selector?, contextInfo: UnsafeMutableRawPointer?) {
+        // AppKit performs autosave/close review through this callback before
+        // it invokes close(). Invalidate the import operation here so a
+        // completion cannot stage new files after the save snapshot.
+        workspaceModel?.cancelActiveRecordingImportForDocumentClose()
+        workspaceModel?.flushToDocument()
+        let generation = UUID()
+        let proxy = DocumentCloseReviewProxy(
+            document: self,
+            generation: generation,
+            originalDelegate: delegate as AnyObject?,
+            originalSelector: shouldCloseSelector,
+            originalContextInfo: contextInfo
+        )
+        closeReviewProxies[generation] = proxy
+        isCloseReviewInProgress = true
+        super.canClose(
+            withDelegate: proxy,
+            shouldClose: #selector(DocumentCloseReviewProxy.document(_:shouldClose:contextInfo:)),
+            contextInfo: nil
+        )
+    }
+
     override func close() {
+        isCloseReviewInProgress = false
+        workspaceModel?.cancelActiveRecordingImportForDocumentClose()
         workspaceModel?.flushToDocument()
         super.close()
+    }
+
+    fileprivate func completeCloseReview(shouldClose _: Bool, generation: UUID) {
+        guard closeReviewProxies.removeValue(forKey: generation) != nil else { return }
+        if isCloseReviewInProgress {
+            isCloseReviewInProgress = !closeReviewProxies.isEmpty
+        }
     }
 
     func apply(project: InterviewStudioProject, sessions: [InterviewSession]) {

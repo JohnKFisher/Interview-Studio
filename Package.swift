@@ -16,9 +16,14 @@ let package = Package(
             name: "Core",
             path: "Sources/Core"
         ),
+        .target(
+            name: "DocumentCloseBridge",
+            path: "Sources/DocumentCloseBridge",
+            publicHeadersPath: "include"
+        ),
         .executableTarget(
             name: "YearlyInterviewStudioApp",
-            dependencies: ["Core"],
+            dependencies: ["Core", "DocumentCloseBridge"],
             path: "Sources/App",
             resources: [
                 .process("Resources")

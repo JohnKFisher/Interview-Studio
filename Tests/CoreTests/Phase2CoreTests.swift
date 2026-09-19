@@ -148,6 +148,67 @@ final class Phase2CoreTests: XCTestCase {
         XCTAssertThrowsError(try store.readConsolidationJournal())
     }
 
+    func testRecordingImportMergeRebasesOntoConcurrentEdits() {
+        let existingID = UUID()
+        let existing = SourceRecording(
+            id: existingID,
+            ageKey: "age_5",
+            ageLabel: "5 Years Old",
+            packageRelativePath: "Source Recordings/age_5/existing.mov",
+            originalFilename: "existing.mov",
+            importSource: .finder,
+            order: 4,
+            recordingNumber: 9,
+            mediaSignature: .init(byteCount: 10, sha256: "existing")
+        )
+        var session = InterviewSession(
+            workflowKind: .recordingFirstV1,
+            ageKey: "age_5",
+            ageLabel: "5 Years Old",
+            ageSortValue: 5,
+            recordings: [existing]
+        )
+        session.revision = 7
+        session.publicationFingerprint = "published-before-edit"
+        session.answers["favorite_memory"] = InterviewAnswer(questionKey: "favorite_memory", state: .inProgress)
+        session.revision = 8
+
+        let imported = SourceRecording(
+            id: UUID(),
+            ageKey: "stale-age",
+            ageLabel: "Stale Age",
+            packageRelativePath: "Source Recordings/stale-age/imported.mov",
+            originalFilename: "imported.mov",
+            importSource: .finder,
+            order: 0,
+            recordingNumber: 1,
+            mediaSignature: .init(byteCount: 11, sha256: "imported")
+        )
+        let duplicate = SourceRecording(
+            id: UUID(),
+            ageKey: "age_5",
+            ageLabel: "5 Years Old",
+            packageRelativePath: "Source Recordings/age_5/duplicate.mov",
+            originalFilename: "duplicate.mov",
+            importSource: .finder,
+            mediaSignature: .init(byteCount: 10, sha256: "existing")
+        )
+
+        let result = session.mergeImportedRecordings([imported, duplicate], importedAtRevision: 7)
+
+        XCTAssertTrue(result.wasRebased)
+        XCTAssertEqual(result.previousRevision, 8)
+        XCTAssertEqual(result.resultingRevision, 9)
+        XCTAssertEqual(result.addedRecordings.count, 1)
+        XCTAssertEqual(session.recordings.count, 2)
+        XCTAssertEqual(session.recordings.last?.ageKey, "age_5")
+        XCTAssertEqual(session.recordings.last?.order, 5)
+        XCTAssertEqual(session.recordings.last?.recordingNumber, 10)
+        XCTAssertEqual(session.answers["favorite_memory"]?.state, .inProgress)
+        XCTAssertNil(session.publicationFingerprint)
+        XCTAssertTrue(session.auditEvents.contains { $0.action == "recordings_imported" && $0.detail.contains("concurrent edits") })
+    }
+
     func testLockGateRequiresCompleteOrSkippedAnswers() throws {
         var session = InterviewSession(ageKey: "age_6", ageLabel: "6 Years Old", ageSortValue: 6)
         session.answers["favorite_memory"] = InterviewAnswer(questionKey: "favorite_memory", state: .inProgress)
@@ -491,6 +552,43 @@ final class Phase2CoreTests: XCTestCase {
             "real_media_start_in_output_us": .number(500_000),
             "real_media_end_in_output_us": .number(4_500_000)
         ]))
+    }
+
+    func testLegacyRangeRestorerPreservesManualTimelineEdits() {
+        let recordingID = UUID()
+        let manualBoundaries = RefinedBoundaries(
+            visibleStart: .microseconds(1_250_000),
+            visibleEnd: .microseconds(3_750_000),
+            safeLeadingStart: .microseconds(750_000),
+            safeTrailingEnd: .microseconds(4_250_000),
+            confidence: 1,
+            reasons: ["Adjusted manually on the legacy timeline."],
+            algorithmIdentifier: "legacy-manual-boundaries",
+            manualOverride: true
+        )
+        var session = InterviewSession(ageKey: "age_5", ageLabel: "5 Years Old", ageSortValue: 5)
+        let part = AnswerPart(
+            sourceRecordingID: recordingID,
+            rawMarkers: .init(answerStart: .microseconds(1_250_000), answerEnd: .microseconds(3_750_000)),
+            refinedBoundaries: manualBoundaries,
+            extensions: ["legacy_manifest_row": .object(["clip_number": .string("7"), "output_file": .string("clip.mov")])]
+        )
+        let take = AnswerTake(parts: [part])
+        session.answers["memory"] = InterviewAnswer(questionKey: "memory", selectedTakeID: take.id, takes: [take], state: .inProgress)
+        session.recordings = [SourceRecording(id: recordingID, ageKey: "age_5", ageLabel: "5 Years Old", packageRelativePath: "Legacy Published Media/clip.mov", originalFilename: "clip.mov", importSource: .legacy, mediaSignature: .init(byteCount: 1, sha256: "x", durationMicroseconds: 5_000_000))]
+
+        let row = ManifestRow(
+            clipNumber: "7", person: "Ellie", personKey: "ellie", question: "Memory", questionKey: "memory",
+            age: "5 Years Old", ageKey: "age_5", outputFile: "clip.mov",
+            realMediaStartInOutputUS: 500_000, realMediaEndInOutputUS: 4_500_000,
+            answerStartInOutputUS: 1_000_000, answerEndInOutputUS: 4_000_000
+        )
+
+        let repaired = LegacyRangeRestorer().repair(session: session, rows: [row])
+        let repairedPart = repaired.answers["memory"]?.selectedTake?.parts.first
+        XCTAssertEqual(repairedPart?.rawMarkers.answerStart?.microseconds, 1_250_000)
+        XCTAssertEqual(repairedPart?.rawMarkers.answerEnd?.microseconds, 3_750_000)
+        XCTAssertEqual(repairedPart?.refinedBoundaries, manualBoundaries)
     }
 
     func testRecordingFirstCaptureUsesDirectTimestampsAndCommitsProvisionalPair() throws {

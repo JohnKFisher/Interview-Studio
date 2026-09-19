@@ -380,7 +380,9 @@ public struct InterviewStudioPackageStore: Sendable {
             throw InterviewStudioPackageError.invalidPackage("Only a readable local video file can be imported: \(sourceURL.path)")
         }
 
+        try Task.checkCancellation()
         let sourceHash = sha256(fileURL: sourceURL)
+        try Task.checkCancellation()
         if let duplicate = try existingRecording(withSHA256: sourceHash) {
             return StagedRecordingImport(imported: ImportedRecording(recording: duplicate, duplicateOf: duplicate))
         }
@@ -394,6 +396,7 @@ public struct InterviewStudioPackageStore: Sendable {
             throw InterviewStudioPackageError.unsafeRelativePath(relativePath)
         }
         try FileManager.default.createDirectory(at: stagedURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Task.checkCancellation()
         try FileManager.default.copyItem(at: sourceURL, to: stagedURL)
         var keepStagedFile = false
         defer {
@@ -401,10 +404,13 @@ public struct InterviewStudioPackageStore: Sendable {
                 try? FileManager.default.removeItem(at: stagedURL)
             }
         }
+        try Task.checkCancellation()
         guard sha256(fileURL: stagedURL) == sourceHash else { throw InterviewStudioPackageError.checksumMismatch(sourceURL) }
+        try Task.checkCancellation()
 
         var signature = MediaSignature(byteCount: fileByteCount(stagedURL), sha256: sourceHash)
-        if let inspection = try? await NativeMediaInspector().inspect(url: stagedURL) {
+        do {
+            let inspection = try await NativeMediaInspector().inspect(url: stagedURL)
             signature.durationMicroseconds = inspection.duration.microseconds
             signature.width = inspection.width
             signature.height = inspection.height
@@ -414,7 +420,13 @@ public struct InterviewStudioPackageStore: Sendable {
             signature.colorPrimaries = inspection.colorPrimaries
             signature.colorTransfer = inspection.colorTransfer
             signature.colorMatrix = inspection.colorMatrix
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            // Media inspection is best effort; the byte-verified staged file
+            // remains importable when AVFoundation cannot inspect it.
         }
+        try Task.checkCancellation()
 
         let recording = SourceRecording(
             id: recordingID,

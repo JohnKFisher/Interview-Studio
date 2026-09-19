@@ -69,6 +69,10 @@ private extension InterviewStudioWorkspaceModel {
 
     @discardableResult
     func requireRecordingFirstEditingSession() -> Bool {
+        guard !isRecordingImportInFlight else {
+            errorMessage = "Wait for the recording import to finish before editing this age entry."
+            return false
+        }
         guard let session = recordingFirstSession, session.isActive, session.compatibility.isWritable else {
             errorMessage = "This age entry is read-only. Restore it or open a compatible project before editing."
             return false
@@ -86,7 +90,7 @@ private extension InterviewStudioWorkspaceModel {
 
     var recordingFirstCanEdit: Bool {
         guard let session = recordingFirstSession else { return false }
-        return session.isActive && session.compatibility.isWritable && session.lifecycle == .open && document?.isPackageReadOnly != true
+        return !isRecordingImportInFlight && session.isActive && session.compatibility.isWritable && session.lifecycle == .open && document?.isPackageReadOnly != true
     }
 
     var recordingFirstRecording: SourceRecording? {
@@ -234,13 +238,22 @@ private extension InterviewStudioWorkspaceModel {
         player?.pause()
         recordingFirstCutStartUS = nil
         recordingFirstCutEndUS = nil
-        if let url = document?.recordingURL(for: recordingFirstSession?.recordings.first(where: { $0.id == candidate.sourceRecordingID }) ?? SourceRecording.placeholder(for: candidate)) {
-            replacePlayer(with: url)
-            recordingFirstPreviewSourceRecordingID = candidate.sourceRecordingID
-        }
+        _ = recordingFirstPreparePreviewSource(for: candidate)
         if let start = candidate.visibleRange?.start.microseconds {
             seek(to: start)
         }
+    }
+
+    @discardableResult
+    func recordingFirstPreparePreviewSource(for candidate: AnswerCandidate) -> URL? {
+        guard let recording = recordingFirstSession?.recordings.first(where: { $0.id == candidate.sourceRecordingID }),
+              let sourceURL = document?.recordingURL(for: recording) else {
+            return nil
+        }
+        selectedRecordingID = recording.id
+        replacePlayer(with: sourceURL)
+        recordingFirstPreviewSourceRecordingID = recording.id
+        return sourceURL
     }
 
     func recordingFirstPlayerTimestamp() -> Int64? {
@@ -364,8 +377,8 @@ private extension InterviewStudioWorkspaceModel {
 
     func recordingFirstPlaySelectedCandidate(withBuffers: Bool) {
         guard let candidate = recordingFirstSelectedCandidate else { return }
-        guard recordingFirstPreviewSourceRecordingID == candidate.sourceRecordingID, player != nil else {
-            errorMessage = "This clip's source is not available for preview. Select it again or recover the recording."
+        guard let sourceURL = recordingFirstPreparePreviewSource(for: candidate), player != nil else {
+            errorMessage = "The source recording is not available for preview. Select the recording again or recover it."
             return
         }
         let segments = RecordingFirstWorkflow.previewSegments(for: candidate, withBuffers: withBuffers)
@@ -375,11 +388,6 @@ private extension InterviewStudioWorkspaceModel {
         }
         if segments.count == 1 {
             playRange(startUS: first.start.microseconds, endUS: first.end.microseconds)
-            return
-        }
-        guard let recording = recordingFirstSession?.recordings.first(where: { $0.id == candidate.sourceRecordingID }),
-              let sourceURL = document?.recordingURL(for: recording) else {
-            errorMessage = "The source recording is not available for preview."
             return
         }
         let candidateID = candidate.id
@@ -775,6 +783,10 @@ private extension InterviewStudioWorkspaceModel {
     }
 
     func recordingFirstUnlock() {
+        guard !isRecordingImportInFlight else {
+            errorMessage = "Wait for the recording import to finish before editing this age entry."
+            return
+        }
         guard let session = recordingFirstSession, session.isActive, session.compatibility.isWritable else {
             errorMessage = "This age entry is read-only. Restore it or open a compatible project before editing."
             return
@@ -800,6 +812,10 @@ private extension InterviewStudioWorkspaceModel {
     }
 
     func recordingFirstRestoreAge(_ sessionID: UUID) {
+        guard !isRecordingImportInFlight else {
+            errorMessage = "Wait for the recording import to finish before editing this age entry."
+            return
+        }
         guard let sessionIndex = sessions.firstIndex(where: { $0.id == sessionID }) else { return }
         guard sessions[sessionIndex].compatibility.isWritable else {
             errorMessage = "This age entry is read-only because its workflow or package format is unsupported."
@@ -899,53 +915,7 @@ private extension InterviewStudioWorkspaceModel {
         }
         isBusy = true
         progressMessage = "Staging \(urls.count) recording(s)…"
-        let stagingRoot = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
-            .appendingPathComponent("YearlyInterviewStudio/ImportStaging", isDirectory: true)
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        let importTask = Task.detached(priority: .userInitiated) {
-            var updated = session
-            var stagedImports: [StagedRecordingImport] = []
-            var knownHashes = Set(updated.recordings.map { $0.mediaSignature.sha256 })
-            for (index, url) in urls.enumerated() {
-                let sourceHash = sha256(fileURL: url)
-                if !sourceHash.isEmpty && knownHashes.contains(sourceHash) { continue }
-                let staged = try await store.stageRecordingImport(
-                    from: url,
-                    ageKey: session.ageKey,
-                    ageLabel: session.ageLabel,
-                    source: .finder,
-                    stagingRoot: stagingRoot,
-                    order: updated.recordings.count + index,
-                    recordingNumber: updated.nextRecordingNumber + index
-                )
-                if staged.imported.duplicateOf == nil {
-                    updated.recordings.append(staged.imported.recording)
-                    stagedImports.append(staged)
-                    knownHashes.insert(staged.imported.recording.mediaSignature.sha256)
-                }
-            }
-            return (updated, stagedImports)
-        }
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            do {
-                let result = try await importTask.value
-                guard let currentIndex = self.sessions.firstIndex(where: { $0.id == session.id }) else { return }
-                self.sessions[currentIndex] = result.0
-                if self.selectedRecordingID == nil || !result.0.recordings.contains(where: { $0.id == self.selectedRecordingID }) {
-                    self.selectedRecordingID = result.0.recordings.first?.id
-                }
-                self.document?.stage(recordingImports: result.1)
-                self.progressMessage = result.1.isEmpty ? "Those recordings are already in this project." : "Recording(s) ready. Save the project to finish importing them."
-                self.isBusy = false
-                self.flushToDocument()
-            } catch {
-                self.errorMessage = error.localizedDescription
-                self.progressMessage = nil
-                self.isBusy = false
-                try? FileManager.default.removeItem(at: stagingRoot)
-            }
-        }
+        beginRecordingImport(urls: urls, for: session, store: store)
     }
 
     func recordingFirstAddQuestion(_ text: String) {
@@ -1515,8 +1485,22 @@ private struct RecordingFirstRefineView: View {
            let url = model.document?.recordingURL(for: recording) {
             RecordingFirstPlayerContainer(player: model.player)
                 .frame(minHeight: 300)
-                .onAppear { model.replacePlayer(with: url) }
-                .onChange(of: url) { _, newURL in model.replacePlayer(with: newURL) }
+                .onAppear {
+                    if let candidate = model.recordingFirstSelectedCandidate,
+                       candidate.sourceRecordingID == recording.id {
+                        _ = model.recordingFirstPreparePreviewSource(for: candidate)
+                    } else {
+                        model.replacePlayer(with: url)
+                    }
+                }
+                .onChange(of: url) { _, newURL in
+                    if let candidate = model.recordingFirstSelectedCandidate,
+                       candidate.sourceRecordingID == recording.id {
+                        _ = model.recordingFirstPreparePreviewSource(for: candidate)
+                    } else {
+                        model.replacePlayer(with: newURL)
+                    }
+                }
             if model.isLoadingWaveform {
                 ProgressView("Building waveform…")
                     .controlSize(.small)

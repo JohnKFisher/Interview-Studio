@@ -115,6 +115,11 @@ public struct LegacyRangeRestorer: Sendable {
                           case .string(let clipNumber) = values["clip_number"],
                           case .string(let outputFile) = values["output_file"],
                           let row = rowsByIdentity["\(clipNumber)|\(outputFile)"] else { continue }
+                    // A user-adjusted legacy timeline is authoritative. The
+                    // manifest row remains the original import source, so it
+                    // must not overwrite a manual edit when the package is
+                    // reopened.
+                    if part.refinedBoundaries?.manualOverride == true { continue }
                     let inspectedDuration = repaired.recordings.first(where: { $0.id == part.sourceRecordingID })?.mediaSignature.durationMicroseconds
                     let duration = effectiveDurationUS(for: row, inspectedDurationUS: inspectedDuration)
                     let restoredBoundaries = boundaries(for: row, durationUS: duration)
